@@ -15,8 +15,8 @@ import urllib.parse
 import urllib.request
 
 
-DEFAULT_PROFILE_ROOT = "/srv/hermes"
-DEFAULT_ALERT_STATE = "/srv/hermes/data/xianbao_filter/alert_state.json"
+DEFAULT_PROFILE_ROOT = "/srv/pylon/profiles/default"
+DEFAULT_ALERT_STATE = "/srv/pylon/profiles/default/data/xianbao_filter/alert_state.json"
 
 
 def load_env_file(path: Path) -> None:
@@ -117,6 +117,10 @@ def cron_job_tail(profile_root: Path, job_id: str, lines: int) -> str:
 
 
 def send_telegram(text: str) -> None:
+    from pylon import events
+    if events.enabled():
+        events.publish(text, profile="default")
+        return
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("XIANBAO_TELEGRAM_ALERT_CHAT_ID", "").strip() or os.getenv("TELEGRAM_HOME_CHANNEL", "").strip()
     if not token:

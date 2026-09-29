@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from pylon import events
 import html
 import http.client
 import json
@@ -4299,6 +4300,7 @@ def run_once(*, dry_run: bool = False) -> str:
     if not dry_run:
         queued_message = _pop_next_queued_delivery(state, config)
         if queued_message:
+            events.publish(queued_message)
             save_state(state)
             return queued_message
     posts, meta = collect_recent_posts(state, config, deadline=deadline)
@@ -4316,6 +4318,9 @@ def run_once(*, dry_run: bool = False) -> str:
     message = _pop_next_queued_delivery(state, config)
     topic_id = _topic_id_from_message(message)
     append_decision_log_entries(audit, delivered_topic_ids={topic_id} if topic_id else set())
+    events.publish(message)
+    if meta.get("fetch_error"):
+        events.result("failed", str(meta["fetch_error"]))
     save_state(state)
     return message or output.wake_agent_false()
 

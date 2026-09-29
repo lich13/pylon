@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-export HERMES_HOME="${HERMES_HOME:-/srv/hermes}"
+export HERMES_HOME="${HERMES_HOME:-/srv/pylon/profiles/default}"
 ENV_FILE="$HERMES_HOME/config/xianbao-filter.env"
 DATA_DIR="$HERMES_HOME/data/xianbao_filter"
 WORKER="$HERMES_HOME/scripts/xianbao_hermes_worker.py"
@@ -24,7 +24,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-/usr/bin/python3 "$WORKER" --once >"$OUT_FILE" 2>"$ERR_FILE"
+/srv/pylon/venv/bin/python "$WORKER" --once >"$OUT_FILE" 2>"$ERR_FILE"
 RC=$?
 
 if [[ "$RC" -eq 0 ]]; then
@@ -55,7 +55,7 @@ if [[ "$THRESHOLD" -gt 0 && "$COUNT" -ge "$THRESHOLD" && -f "$ALERT_SCRIPT" ]]; 
   if [[ -z "$DETAIL" ]]; then
     DETAIL="$(tail -n 1 "$OUT_FILE" | cut -c1-600)"
   fi
-  /usr/bin/python3 "$ALERT_SCRIPT" \
+  /srv/pylon/venv/bin/python "$ALERT_SCRIPT" \
     --kind runtime-error \
     --unit xianbao-hermes-poll \
     --journal-lines 0 \

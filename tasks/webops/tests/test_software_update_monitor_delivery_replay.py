@@ -1,4 +1,6 @@
 import itertools
+import os
+from pylon.outbox import Outbox
 import json
 import tempfile
 import unittest
@@ -61,6 +63,8 @@ class SoftwareUpdateMonitorDeliveryReplayTests(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmpdir.name) / "webops"
         self.root.mkdir()
+        self.env = mock.patch.dict(os.environ, {"PYLON_OUTBOX": str(self.root / "outbox.sqlite3")})
+        self.env.start()
         self.replay.PROFILE_ROOT = self.root
         self.replay.AGENT_ROOT = self.root / "hermes-agent"
         self.replay.HERMES_PYTHON = self.replay.AGENT_ROOT / "venv" / "bin" / "python"
@@ -76,7 +80,13 @@ class SoftwareUpdateMonitorDeliveryReplayTests(unittest.TestCase):
         self.replay.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):
+        self.env.stop()
         self.tmpdir.cleanup()
+
+    def queued_text(self):
+        with Outbox().connect() as db:
+            rows = db.execute("SELECT payload FROM events ORDER BY created_at").fetchall()
+        return "\n".join(json.loads(row[0])["text"] for row in rows)
 
     def write_jobs(self, deliver="telegram:-1001234567890"):
         self.replay.JOBS_FILE.write_text(
@@ -302,53 +312,30 @@ class SoftwareUpdateMonitorDeliveryReplayTests(unittest.TestCase):
         self.assertTrue(self.replay.was_replayed(state, candidate))
         self.assertFalse(self.replay.was_replayed({"replayed": {}}, candidate))
 
-    def test_send_candidate_uses_webops_home_and_hermes_send(self):
-        self.write_jobs()
+    def test_send_candidate_persists_before_marking_replayed(self):
         alert = self.replay.OUTPUT_DIR / "2026-06-08_09-47-21.md"
         alert.write_text(ALERT_TEXT, encoding="utf-8")
-        candidate = self.replay.ReplayCandidate(
-            path=alert,
-            content=ALERT_TEXT,
+        candidate = self.replay.ReplayCandidate(path=alert, content=ALERT_TEXT,
             digest=self.replay.sha256_text(ALERT_TEXT),
-            error_time=datetime(2026, 6, 8, 9, 47, 32, tzinfo=timezone.utc),
-            error_message="delivery error",
-        )
-
-        with mock.patch.object(self.replay.subprocess, "run") as run:
-            run.return_value = mock.Mock(returncode=0, stdout='{"ok":true}', stderr="")
-            result = self.replay.send_candidate(candidate, target="telegram:-1001234567890")
-
+            error_time=datetime(2026, 6, 8, 9, 47, 32, tzinfo=timezone.utc), error_message="delivery error")
+        result = self.replay.send_candidate(candidate, target="telegram:-1001234567890")
         self.assertTrue(result.ok)
-        args = run.call_args.args[0]
-        self.assertEqual(args[:5], [str(self.replay.HERMES_PYTHON), "-m", "hermes_cli.main", "send", "--to"])
-        self.assertEqual(args[5], "telegram:-1001234567890")
-        self.assertIn("--file", args)
-        self.assertIn("--json", args)
-        self.assertEqual(run.call_args.kwargs["input"].splitlines()[0], "【补发】软件更新监控投递失败后重放")
-        self.assertEqual(run.call_args.kwargs["env"]["HERMES_HOME"], str(self.root))
+        self.assertTrue(result.stdout.startswith("queued:"))
+        self.assertIn("【补发】", self.queued_text())
+        self.assertEqual(Outbox().counts(), {"pending": 1})
 
-    def test_run_replay_records_state_after_successful_send(self):
+    def test_periodic_replay_checks_outbox_and_never_resends_legacy_logs(self):
         self.write_jobs()
-        self.replay.LOG_FILE.write_text(
-            "2026-06-08 09:47:32,951 ERROR cron.scheduler: Job 'fa27c561ded6': delivery error: Telegram send failed\n",
-            encoding="utf-8",
-        )
-        alert = self.replay.OUTPUT_DIR / "2026-06-08_09-47-21.md"
-        alert.write_text(ALERT_TEXT, encoding="utf-8")
-
-        with mock.patch.object(self.replay.subprocess, "run") as run:
-            run.return_value = mock.Mock(returncode=0, stdout='{"ok":true}', stderr="")
-            summary = self.replay.run_replay()
-
-        self.assertEqual(summary["sent"], 1)
-        state = json.loads(self.replay.STATE_FILE.read_text(encoding="utf-8"))
-        self.assertIn(str(alert), state["replayed"])
-
-        with mock.patch.object(self.replay.subprocess, "run") as second_run:
-            second = self.replay.run_replay()
-
-        self.assertEqual(second["sent"], 0)
-        second_run.assert_not_called()
+        self.replay.LOG_FILE.write_text("2026-06-08 09:47:32,951 ERROR cron.scheduler: Job 'fa27c561ded6': delivery error: timeout\n")
+        (self.replay.OUTPUT_DIR / "2026-06-08_09-47-21.md").write_text(ALERT_TEXT)
+        self.assertTrue(self.replay.run_replay()["ok"])
+        box = Outbox()
+        event = box.enqueue(profile="webops", job_id=self.replay.MONITOR_JOB_ID, kind="text", payload={"text":"new"}, key="new")
+        self.assertFalse(self.replay.run_replay()["ok"])
+        self.assertEqual(box.counts(), {"pending": 1})
+        box.finish(event, "delivered", receipt={"message_id":1})
+        self.assertTrue(self.replay.run_replay()["ok"])
+        self.assertEqual(box.counts(), {"delivered": 1})
 
     def test_raw_item_replay_finds_and_formats_codex_changelog_item(self):
         self.write_raw_item()
@@ -447,13 +434,9 @@ class SoftwareUpdateMonitorDeliveryReplayTests(unittest.TestCase):
 
         self.assertTrue(send_summary["ok"])
         self.assertEqual(send_summary["sent"], 1)
-        args = send.call_args.args[0]
-        self.assertEqual(args[:5], [str(self.replay.HERMES_PYTHON), "-m", "hermes_cli.main", "send", "--to"])
-        self.assertEqual(args[5], "telegram:-1001234567890")
-        self.assertEqual(args[-3:], ["--file", "-", "--json"])
-        self.assertEqual(send.call_args.kwargs["env"]["HERMES_HOME"], str(self.root))
-        self.assertEqual(send.call_args.kwargs["input"].splitlines()[0], "【补发】软件更新监控历史条目重放")
-        self.assertIn("ZH:0.139.0", send.call_args.kwargs["input"])
+        self.assertEqual(Outbox().counts(), {"pending": 1})
+        self.assertEqual(self.queued_text().splitlines()[0], "【补发】软件更新监控历史条目重放")
+        self.assertIn("ZH:0.139.0", self.queued_text())
 
         state = json.loads(self.replay.STATE_FILE.read_text(encoding="utf-8"))
         self.assertIn(
@@ -507,13 +490,9 @@ class SoftwareUpdateMonitorDeliveryReplayTests(unittest.TestCase):
             )
 
         self.assertEqual(summary["sent"], 1)
-        args = run.call_args.args[0]
-        self.assertEqual(args[:5], [str(self.replay.HERMES_PYTHON), "-m", "hermes_cli.main", "send", "--to"])
-        self.assertEqual(args[5], "telegram:-1001234567890")
-        self.assertEqual(args[-3:], ["--file", "-", "--json"])
-        self.assertEqual(run.call_args.kwargs["input"].splitlines()[0], "【补发】软件更新监控历史条目重放")
-        self.assertIn("ZH:Codex CLI Release: 0.137.0", run.call_args.kwargs["input"])
-        self.assertEqual(run.call_args.kwargs["env"]["HERMES_HOME"], str(self.root))
+        self.assertEqual(Outbox().counts(), {"pending": 1})
+        self.assertEqual(self.queued_text().splitlines()[0], "【补发】软件更新监控历史条目重放")
+        self.assertIn("ZH:Codex CLI Release: 0.137.0", self.queued_text())
 
         state = json.loads(self.replay.STATE_FILE.read_text(encoding="utf-8"))
         self.assertIn(

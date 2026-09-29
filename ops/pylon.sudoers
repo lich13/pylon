@@ -1,0 +1,2 @@
+pylon ALL=(root) NOPASSWD: /usr/local/sbin/chiphell-proxyctl pause, /usr/local/sbin/chiphell-proxyctl resume
+pylon ALL=(root) NOPASSWD: /usr/bin/systemctl stop chiphell-fid26-poller.service

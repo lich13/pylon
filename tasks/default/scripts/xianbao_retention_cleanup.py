@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-PROFILE_ROOT = Path(os.environ.get("HERMES_HOME", "/srv/hermes"))
+PROFILE_ROOT = Path(os.environ.get("HERMES_HOME", "/srv/pylon/profiles/default"))
 DEFAULT_SILENT_OUTPUT_RETENTION_DAYS = int(os.environ.get("XIANBAO_SILENT_OUTPUT_RETENTION_DAYS", "1"))
 DEFAULT_TMP_RETENTION_DAYS = int(os.environ.get("XIANBAO_TMP_RETENTION_DAYS", "1"))
 SILENT_STATUS_MARKERS = (

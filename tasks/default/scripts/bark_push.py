@@ -20,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--level", choices=sorted(VALID_LEVELS), default="active")
     ap.add_argument("--volume", type=int, default=5)
     ap.add_argument("--critical", action="store_true", help="Shortcut for --level critical --volume 10.")
-    ap.add_argument("--secret-name", help="Secret filename under /srv/hermes/secrets/.")
+    ap.add_argument("--secret-name", help="Secret filename under /srv/pylon/profiles/default/secrets/.")
     ap.add_argument("--key-file", type=Path, help="Explicit Bark device-key file path.")
     ap.add_argument("--api-base", help="Override Bark API base; useful for mock tests.")
     ap.add_argument("--timeout-seconds", type=int, default=10)

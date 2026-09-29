@@ -1,0 +1,25 @@
+[Unit]
+Description=pylon scheduler and dashboard
+After=network-online.target pylon-bot.service
+Wants=network-online.target
+
+[Service]
+User=pylon
+Group=pylon
+UMask=0077
+WorkingDirectory=/srv/pylon
+Environment=HOME=/srv/pylon/home
+Environment=PYLON_HOME=/srv/pylon
+Environment=DAGU_HOME=/srv/pylon/dagu
+Environment=TZ=Asia/Shanghai
+ExecStart=/srv/pylon/bin/dagu start-all --dagu-home /srv/pylon/dagu --config /srv/pylon/dagu/config.yaml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+KillMode=control-group
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

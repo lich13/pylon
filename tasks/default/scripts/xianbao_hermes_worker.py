@@ -38,9 +38,9 @@ from typing import Any
 from xianbao_value_rules import is_poor_mobile_topup_discount, mobile_topup_discount_profile
 
 
-DEFAULT_RULES = "/srv/hermes/config/xianbao-hermes-rules.json"
-DEFAULT_STATE = "/srv/hermes/data/xianbao_filter/state.sqlite3"
-DEFAULT_DATA_DIR = "/srv/hermes/data/xianbao_filter"
+DEFAULT_RULES = "/srv/pylon/profiles/default/config/xianbao-hermes-rules.json"
+DEFAULT_STATE = "/srv/pylon/profiles/default/data/xianbao_filter/state.sqlite3"
+DEFAULT_DATA_DIR = "/srv/pylon/profiles/default/data/xianbao_filter"
 BASE_URL = "https://new.xianbao.fun"
 DEFAULT_BODY_CACHE_TTL_SECONDS = 86400
 DEFAULT_BODY_ERROR_CACHE_TTL_SECONDS = 3600
@@ -3290,7 +3290,7 @@ def push(post: dict[str, Any], decision: Decision, dry_run: bool) -> None:
         return
 
     if os.getenv("XIANBAO_USE_WEBOPS_BARK") == "1":
-        profile_root = Path(os.getenv("HERMES_HOME", "/srv/hermes"))
+        profile_root = Path(os.getenv("HERMES_HOME", "/srv/pylon/profiles/default"))
         sys.path.insert(0, str(profile_root))
         from lib.webops.bark import send_push
 
@@ -3347,7 +3347,7 @@ def validate_runtime_config(dry_run: bool) -> tuple[list[str], list[str]]:
     if dry_run and not push_targets:
         warnings.append("dry-run mode has no push target configured")
     if webops_bark:
-        profile_root = Path(os.getenv("HERMES_HOME", "/srv/hermes"))
+        profile_root = Path(os.getenv("HERMES_HOME", "/srv/pylon/profiles/default"))
         bark_helper = profile_root / "lib" / "webops" / "bark.py"
         if not bark_helper.exists():
             errors.append(f"missing WebOps Bark helper: {bark_helper}")
@@ -3461,7 +3461,7 @@ def alert_runtime_error(exc: Exception, consecutive_errors: int) -> None:
     now = int(time.time())
     if cooldown > 0 and now - LAST_ERROR_ALERT_AT < cooldown:
         return
-    script = Path(os.getenv("XIANBAO_ALERT_SCRIPT", "/srv/hermes/scripts/xianbao_alert.py"))
+    script = Path(os.getenv("XIANBAO_ALERT_SCRIPT", "/srv/pylon/profiles/default/scripts/xianbao_alert.py"))
     if not script.exists():
         print(f"alert script missing: {script}", file=sys.stderr, flush=True)
         LAST_ERROR_ALERT_AT = now
@@ -3662,8 +3662,9 @@ def process_once(
         kept += int(decision.keep)
         review_candidates += int(decision.review_candidate)
         logged_decisions += int(log_decision(data_dir, post, decision))
-        mark_seen_post(db, post, decision, rules_key, seen_fp)
-        record_activity_observation(db, post, decision, pushed=bool(should_push and not dry_run))
+        if not should_push:
+            mark_seen_post(db, post, decision, rules_key, seen_fp)
+            record_activity_observation(db, post, decision, pushed=False)
         if should_push:
             try:
                 push(post, decision, dry_run)
@@ -3675,6 +3676,8 @@ def process_once(
                 continue
             if dry_run:
                 continue
+            mark_seen_post(db, post, decision, rules_key, seen_fp)
+            record_activity_observation(db, post, decision, pushed=True)
             db.execute(
                 "insert or replace into sent_posts(id, fingerprint, title, url, tier, score, sent_at) values (?, ?, ?, ?, ?, ?, ?)",
                 (

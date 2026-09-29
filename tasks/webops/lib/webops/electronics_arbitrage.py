@@ -784,6 +784,7 @@ def replace_quotes(
     snapshot_hash: str | None = None,
     protect_removed_categories: bool = False,
     category_absence_confirmations: int = 2,
+    before_commit=None,
 ) -> dict[str, Any]:
     ts = now_iso()
     existing_rows = list(
@@ -935,6 +936,8 @@ def replace_quotes(
                 "INSERT INTO meta(key,value) VALUES('quotes_snapshot_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (snapshot_hash,),
             )
+        if before_commit is not None:
+            before_commit(stats)
     return stats
 
 
@@ -1481,13 +1484,15 @@ def send_bark_arbitrage_burst_alert(title: str, url: str, match: dict[str, Any],
     count, interval = bark_burst_settings()
     last_result: BarkResult | None = None
     for i in range(count):
-        last_result = send_bark_arbitrage_alert(
-            title,
-            url,
-            match,
-            repeat=i > 0,
-            contact_note=contact_note,
-        )
+        previous_key = os.environ.get("PYLON_BARK_KEY")
+        os.environ["PYLON_BARK_KEY"] = f"arbitrage:{url}:{match.get('product_name')}:{int(time.time()) // 900}:{i}"
+        try:
+            last_result = send_bark_arbitrage_alert(title, url, match, repeat=i > 0, contact_note=contact_note)
+        finally:
+            if previous_key is None:
+                os.environ.pop("PYLON_BARK_KEY", None)
+            else:
+                os.environ["PYLON_BARK_KEY"] = previous_key
         if i < count - 1 and interval > 0:
             time.sleep(interval)
     assert last_result is not None
@@ -1513,6 +1518,7 @@ def _record_arbitrage_if_match_conn(
     contact_note = format_contact_note(f"{title}\n{body}")
     message = make_alert_message(title, url, match, repeat=False, contact_note=contact_note)
     ts = now_iso()
+    send_bark_arbitrage_burst_alert(title, url, match, contact_note=contact_note)
     with conn:
         conn.execute(
             """
@@ -1541,7 +1547,6 @@ def _record_arbitrage_if_match_conn(
                 message,
             ),
         )
-    send_bark_arbitrage_burst_alert(title, url, match, contact_note=contact_note)
     return message
 
 

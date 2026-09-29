@@ -1,11 +1,11 @@
-#!/srv/hermes/venvs/google-workspace/bin/python
+#!/srv/pylon/venv/bin/python
 import importlib.util
 import json
 from pathlib import Path
 
-SCRIPT_PATH = "/srv/hermes/scripts/gmail_cleanup_delete.py"
-JSON_PATH = Path("/srv/hermes/cache/reports/gmail_cleanup_preview.json")
-MD_PATH = Path("/srv/hermes/cache/reports/gmail_cleanup_preview.md")
+SCRIPT_PATH = "/srv/pylon/profiles/default/scripts/gmail_cleanup_delete.py"
+JSON_PATH = Path("/srv/pylon/profiles/default/cache/reports/gmail_cleanup_preview.json")
+MD_PATH = Path("/srv/pylon/profiles/default/cache/reports/gmail_cleanup_preview.md")
 
 
 def load_cleanup_module():

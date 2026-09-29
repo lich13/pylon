@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "xianbao_retention_cleanup.py"
-JOBS_PATH = Path("/srv/hermes/cron/jobs.json")
+JOBS_PATH = Path(__file__).resolve().parents[3] / "jobs.json"
 
 
 def load_cleanup_module(testcase):
@@ -128,17 +128,10 @@ class XianbaoRetentionCleanupTests(unittest.TestCase):
 
     def test_xianbao_retention_cron_job_contract(self):
         payload = json.loads(JOBS_PATH.read_text(encoding="utf-8"))
-        jobs = {job["id"]: job for job in payload["jobs"]}
-
-        job = jobs["xianbao-retention-cleanup"]
-        self.assertTrue(job["enabled"])
-        self.assertTrue(job["no_agent"])
-        self.assertFalse(job["wrap_response"])
-        self.assertTrue(job["compact_failure_delivery"])
-        self.assertEqual(job["deliver"], "local")
+        job = payload["xianbao-retention-cleanup"]
+        self.assertFalse(job["deliver"])
         self.assertEqual(job["script"], "xianbao_retention_cleanup.sh")
-        self.assertEqual(job["schedule"]["kind"], "cron")
-        self.assertEqual(job["schedule"]["expr"], "15 4 * * *")
+        self.assertEqual(job["schedule"], "15 4 * * *")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-#!/srv/hermes/hermes-agent/venv/bin/python
+#!/srv/pylon/venv/bin/python
 from __future__ import annotations
 
 import argparse
@@ -14,8 +14,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterator
 
-SCRIPT_DIR = Path("/srv/hermes/profiles/webops/scripts")
-DATA_ROOT = Path("/srv/hermes/profiles/webops/data/chiphell_fid26")
+SCRIPT_DIR = Path("/srv/pylon/profiles/webops/scripts")
+DATA_ROOT = Path("/srv/pylon/profiles/webops/data/chiphell_fid26")
 PROFILE_DIR = DATA_ROOT / "browser-profile"
 CANDIDATE_PROFILE_DIR = DATA_ROOT / ".browser-profile.import"
 ROLLBACK_PROFILE_DIR = DATA_ROOT / ".browser-profile.rollback"
@@ -28,8 +28,7 @@ STATE_PATH = DATA_ROOT / "state.json"
 POLLER = SCRIPT_DIR / "chiphell_fid26_proxy_poller.py"
 SERVICE = "chiphell-fid26-poller.service"
 CRON_ID = "63c6ab6c4af3"
-HERMES = "/srv/hermes/hermes-agent/venv/bin/hermes"
-HERMES_PYTHON = "/srv/hermes/hermes-agent/venv/bin/python"
+HERMES_PYTHON = "/srv/pylon/venv/bin/python"
 POLL_RECOVERY_TIMEOUT_SECONDS = 120
 
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -64,9 +63,14 @@ class CookieImportFailure(RuntimeError):
 
 def run(command: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
-    env["HERMES_HOME"] = "/srv/hermes/profiles/webops"
+    env["HERMES_HOME"] = "/srv/pylon/profiles/webops"
+    env["PYLON_PROFILE_ROOT"] = "/srv/pylon/profiles/webops"
+    env["PLAYWRIGHT_BROWSERS_PATH"] = "/srv/pylon/playwright-browsers"
+    env["PYTHONPATH"] = "/srv/pylon/profiles/webops:/srv/pylon/profiles/webops/scripts"
     env["CHIPHELL_PROXY_URL"] = "socks5://127.0.0.1:18080"
     env["CHIPHELL_REQUIRE_PROXY"] = "1"
+    if os.geteuid() == 0 and command and command[0] == HERMES_PYTHON:
+        command = ["runuser", "-u", "pylon", "--", *command]
     return subprocess.run(command, check=check, text=True, env=env, capture_output=capture)
 
 
@@ -75,7 +79,10 @@ def service_active() -> bool:
 
 
 def cron(action: str) -> None:
-    run([HERMES, "cron", action, CRON_ID])
+    from pylon.dagu import suspend
+    if action not in {"pause", "resume"}:
+        raise ValueError("unsupported scheduler action")
+    suspend(CRON_ID, action == "pause")
 
 
 def command_status() -> int:
@@ -96,8 +103,8 @@ def command_test() -> int:
 
 
 def command_pause() -> int:
-    run(["systemctl", "stop", SERVICE], check=False)
     cron("pause")
+    run(["systemctl", "stop", SERVICE])
     print("CHIPHELL_PAUSED")
     return 0
 
@@ -342,6 +349,12 @@ def validate_candidate_profile(cookies: list[dict[str, Any]]) -> dict[str, Any]:
             **{fid_key: fid_status},
             rows=rows,
         )
+    if os.geteuid() == 0:
+        import pwd
+        owner = pwd.getpwnam("pylon")
+        for parent, dirs, files in os.walk(CANDIDATE_PROFILE_DIR, followlinks=False):
+            for item in [Path(parent), *(Path(parent) / name for name in dirs + files)]:
+                os.chown(item, owner.pw_uid, owner.pw_gid, follow_symlinks=False)
     return {
         "count": len(cookies),
         "home": home_status,

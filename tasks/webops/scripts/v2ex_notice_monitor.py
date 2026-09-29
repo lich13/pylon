@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from pylon import events
 import copy
 import html
 import http.client
@@ -3101,6 +3102,8 @@ def run_once(*, dry_run: bool = False) -> int:
 
     pending_alert = pop_pending_instant_alert(state)
     if pending_alert:
+        if not dry_run:
+            events.publish(pending_alert)
         persist(state)
         print(pending_alert)
         return 0
@@ -3108,6 +3111,8 @@ def run_once(*, dry_run: bool = False) -> int:
     batch = normalize_agent_delivery_batch(state.get(AGENT_BATCH_STATE_KEY))
     if batch:
         final_response = _agent_batch_process_current(state, batch, now_iso)
+        if not dry_run:
+            events.publish(final_response)
         persist(state)
         print(final_response)
         return 0
@@ -3120,12 +3125,14 @@ def run_once(*, dry_run: bool = False) -> int:
         # No candidates means the cron agent does not need any structured context.
         # Keep the injected prompt tiny for the 1-minute monitoring loop.
         if meta.get("fetch_error"):
+            events.result("failed", str(meta["fetch_error"]))
             state["last_poll_meta"] = meta
             persist(state)
         print(output.wake_agent_false())
         return 0
 
     if meta.get("fetch_error") and not meta.get("hit_last_seen"):
+        events.result("failed", str(meta["fetch_error"]))
         state["last_poll_meta"] = meta
         persist(state)
         print(output.wake_agent_false())
@@ -3200,6 +3207,8 @@ def run_once(*, dry_run: bool = False) -> int:
         now_iso=now_iso,
     )
     final_response = _agent_batch_process_current(next_state, batch, now_iso)
+    if not dry_run:
+        events.publish(final_response)
     persist(next_state)
     print(final_response)
     return 0

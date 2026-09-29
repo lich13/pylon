@@ -1,4 +1,4 @@
-#!/srv/hermes/venvs/google-workspace/bin/python
+#!/srv/pylon/venv/bin/python
 import argparse
 import json
 import os
@@ -10,7 +10,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 
-HERMES_HOME = Path(os.getenv("HERMES_HOME", "/srv/hermes"))
+HERMES_HOME = Path(os.getenv("HERMES_HOME", "/srv/pylon/profiles/default"))
 CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
 TOKEN_PATH = HERMES_HOME / "google_token.json"
 PENDING_AUTH_PATH = HERMES_HOME / "gmail_cleanup_oauth_pending.json"

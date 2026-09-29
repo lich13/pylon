@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 
-PROFILE_ROOT = Path("/srv/hermes/profiles/webops")
-PYTHON = Path("/srv/hermes/hermes-agent/venv/bin/python")
+PROFILE_ROOT = Path(os.environ.get("PYLON_PROFILE_ROOT", "/srv/pylon/profiles/webops"))
+PYTHON = Path("/srv/pylon/venv/bin/python")
 MONITOR_SCRIPT = PROFILE_ROOT / "scripts" / "software_update_monitor.py"
 PENDING_PATH = PROFILE_ROOT / "cron_state" / "software_update_monitor_reply_pending.json"
 MAX_REPLY_CHARS = 3500
@@ -117,7 +117,10 @@ def handle_remove_number(source, number: str) -> str:
     if selected is None:
         return "编号无效，请回复列表中的数字"
 
-    result = run_monitor_json(["--remove-project", number, "--json"])
+    identity = str(selected.get("id") or selected.get("project_id") or "")
+    if not identity:
+        return "监控列表已过期，请重新发送：移除监控"
+    result = run_monitor_json(["--remove-project", identity, "--json"])
     validation: dict[str, Any] | None = None
     if is_success_result(result):
         validation = run_monitor_json(["--validate-config", "--json"]).data
@@ -358,9 +361,4 @@ def _home_chat_id() -> str:
     value = os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
     if value:
         return value
-    try:
-        from hermes_cli.config import get_env_value
-
-        return str(get_env_value("TELEGRAM_HOME_CHANNEL") or "").strip()
-    except Exception:
-        return ""
+    return ""

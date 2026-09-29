@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import json
 import subprocess
+from pylon import events
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -284,6 +285,9 @@ def record_sent(result: ReportArtifact, notified: dict[str, Any]) -> None:
 
 
 def send_html_report(result: ReportArtifact) -> dict[str, Any]:
+    if events.enabled():
+        event_id = events.publish_document(result.path, result.caption, key=f"chartoo:{result.release_date}:{result.content_hash}")
+        return {"ok": True, "queued": event_id}
     config = telegram_document.load_telegram_config(ENV_PATH)
     if not result.path:
         raise RuntimeError("report artifact path is missing")
@@ -291,6 +295,7 @@ def send_html_report(result: ReportArtifact) -> dict[str, Any]:
 
 
 def format_send_failure(release_date: str, exc: Exception) -> str:
+    events.result("failed", f"Chartoo {release_date}: {type(exc).__name__}")
     return f"Chartoo HTML 日报推送失败 — {release_date}\n\n原因：{exc}"
 
 
@@ -344,9 +349,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         payload = parse_json(stdout)
     except Exception:
+        events.result("failed", "Chartoo monitor 输出异常")
         print("Chartoo HTML 日报异常\n\n原因：monitor 输出无法解析。")
         return 0
     if payload.get("action") == "error":
+        events.result("failed", "Chartoo monitor 输出异常")
         print("Chartoo HTML 日报异常\n\n原因：monitor 执行失败。")
         return 0
     if payload.get("action") != "finalize":

@@ -10,7 +10,7 @@ def load_module():
 class ChiphellMonitorTests(unittest.TestCase):
     def test_default_url_uses_dateline_author_sort(self):
         m = load_module()
-        self.assertIn('fid=26', m.DEFAULT_URL)
+        self.assertIn('fid=328', m.DEFAULT_URL)
         self.assertIn('filter=author', m.DEFAULT_URL)
         self.assertIn('orderby=dateline', m.DEFAULT_URL)
 
@@ -91,7 +91,7 @@ class ChiphellMonitorTests(unittest.TestCase):
         self.assertIn('1. [测试标题](https://www.chiphell.com/thread-123-1-1.html) 摘要：这是首楼正文摘要，用于判断值不值得看。', msg)
         self.assertNotIn('\n\n1.', msg)
         self.assertNotIn('\n   摘要：', msg)
-        self.assertNotIn('/srv/hermes', msg)
+        self.assertNotIn('/srv/pylon/profiles/default', msg)
         self.assertNotIn('status', msg.lower())
     def test_should_notify_post_filters_excluded_device_deals(self):
         m = load_module()

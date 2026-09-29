@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pylon import events
 import os
 import re
 import urllib.error
@@ -82,7 +83,7 @@ def load_device_key(
     Lookup order:
     1. Environment variables in env_names.
     2. Explicit key_file, if provided.
-    3. Named secret file under /srv/hermes/profiles/webops/secrets/, if provided.
+    3. Named secret file under /srv/pylon/profiles/webops/secrets/, if provided.
     4. Generic WebOps Bark secret file.
     5. Legacy electronics-arbitrage secret file.
     """
@@ -177,6 +178,9 @@ def send_payload(
         return BarkResult(ok=True, http_status=0, code=0, message="dry-run")
 
     base = (api_base or os.environ.get("BARK_API_BASE") or DEFAULT_API_BASE).rstrip("/")
+    if events.enabled():
+        event_id = events.publish_bark(payload, base)
+        return BarkResult(ok=True, http_status=202, code=202, message="queued:" + str(event_id))
     endpoint = f"{base}/push"
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(

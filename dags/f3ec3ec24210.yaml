@@ -1,0 +1,7 @@
+description: "KDocs 报价刷新"
+schedule: "CRON_TZ=Asia/Shanghai 55 9,12,15,18 * * *"
+timeout_sec: 1890
+queue: kdocs-quotes
+steps:
+  - id: run
+    run: /srv/pylon/venv/bin/pylon run f3ec3ec24210

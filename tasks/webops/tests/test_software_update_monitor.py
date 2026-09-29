@@ -1107,7 +1107,7 @@ class SoftwareUpdateMonitorTests(unittest.TestCase):
         }
 
         def runner(command, **_kwargs):
-            self.assertEqual(command[:2], ['sudo', 'grok'])
+            self.assertEqual(command[0], 'grok')
             self.assertIn('--sandbox', command)
             self.assertIn('read-only', command)
             self.assertIn('--permission-mode', command)
@@ -1885,6 +1885,28 @@ class SoftwareUpdateMonitorTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
 
+
+    def test_more_than_one_batch_of_updates_is_not_marked_seen_and_lost(self):
+        source = {'id': 'overflow', 'name': 'Overflow', 'kind': 'rss', 'url': 'https://example.com/feed'}
+        state = {'sources': {'overflow': {'initialized': True, 'seen_ids': []}}}
+        items = [{'id': str(i), 'title': 'Release '+str(i), 'url': 'https://example.com/'+str(i)} for i in range(12)]
+        selected = self.monitor.select_new_items(state, source, items)
+        self.assertEqual(len(selected), 12)
+        self.assertEqual(set(state['sources']['overflow']['seen_ids']), {str(i) for i in range(12)})
+
+    def test_outbox_failure_does_not_advance_software_notification_state(self):
+        source = {'id': 'fixture', 'name': 'Fixture', 'kind': 'rss', 'url': 'https://example.com/feed'}
+        state = {'sources': {}, 'pending_events': [{'source': source, 'item': {'id': str(i)}} for i in range(9)]}
+        with mock.patch.object(self.monitor, 'load_state', return_value=state), \
+             mock.patch.object(self.monitor, 'load_sources', return_value=[source]), \
+             mock.patch.object(self.monitor, 'prune_inactive_source_runtime'), \
+             mock.patch.object(self.monitor, 'format_alerts', return_value='notification'), \
+             mock.patch.object(self.monitor.notification_events, 'publish', side_effect=OSError('disk full')), \
+             mock.patch.object(self.monitor, 'save_state') as save:
+            with self.assertRaises(OSError):
+                self.monitor.run_monitor()
+            save.assert_not_called()
+        self.assertEqual(len(state['pending_events']), 9)
 
 if __name__ == '__main__':
     unittest.main()

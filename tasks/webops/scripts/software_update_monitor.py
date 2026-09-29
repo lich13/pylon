@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from pylon import events as notification_events
 import fcntl
 import hashlib
 import html
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-PROFILE_ROOT = Path('/srv/hermes/profiles/webops')
+PROFILE_ROOT = Path(os.environ.get('PYLON_PROFILE_ROOT', '/srv/pylon/profiles/webops'))
 STATE_FILE = PROFILE_ROOT / 'cron_state' / 'software_update_monitor.json'
 DATA_ROOT = PROFILE_ROOT / 'data' / 'software_update_monitor'
 TRANSLATION_CACHE_FILE = DATA_ROOT / 'translation_cache.json'
@@ -45,7 +46,7 @@ TRANSLATE_RETRY_SLEEP_SECONDS = 0.5
 GROK_POLISH_TIMEOUT_SECONDS = 300
 GROK_POLISH_INPUT_CHARS = 2400
 GROK_POLISH_CWD = Path('/tmp/webops-software-update-translate')
-GROK_ENDPOINT_ENV = Path('/root/.grok/endpoint.env')
+GROK_ENDPOINT_ENV = Path(os.environ.get('PYLON_GROK_ENV', '/srv/pylon/secrets/grok.env'))
 GROK_POLISH_SCHEMA = json.dumps({
     'type': 'object',
     'additionalProperties': False,
@@ -1787,7 +1788,7 @@ def select_new_items(
     ) if isinstance(pending_checks, dict) else False
     if not has_stale_pending:
         current['last_error'] = None
-    return new_items[:MAX_EVENTS_PER_RUN]
+    return new_items
 
 
 def get_i_count(text: str) -> int:
@@ -2077,7 +2078,7 @@ def translate_readable_document(translator: DeepLWebTranslator, text: str) -> tu
 
 def grok_command_prefix() -> list[str]:
     binary = os.environ.get('GROK_BIN', '').strip() or 'grok'
-    return ['sudo', binary]
+    return [binary]
 
 
 def grok_subprocess_env() -> dict[str, str]:
@@ -2388,9 +2389,11 @@ def run_monitor(*, emit_existing: int = 0, dry_run: bool = False) -> str:
     state = load_state()
     sources = load_sources()
     prune_inactive_source_runtime(state, active_ids=active_source_ids(sources))
-    events: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = list(state.get('pending_events') or [])
     now = time.time()
     for source in monitor_poll_sources(sources):
+        if len(events) >= MAX_EVENTS_PER_RUN:
+            break
         current = source_state(state, source['id'])
         if not due_for_source(current, now):
             continue
@@ -2398,8 +2401,6 @@ def run_monitor(*, emit_existing: int = 0, dry_run: bool = False) -> str:
             raw = fetch_url(source['url'])
             new_items = collect_source_items(state, source, raw, emit_existing=emit_existing)
             for item in new_items:
-                if len(events) >= MAX_EVENTS_PER_RUN:
-                    break
                 save_raw_item(source, item)
                 events.append({'source': source, 'item': item})
             if len(events) >= MAX_EVENTS_PER_RUN:
@@ -2407,15 +2408,20 @@ def run_monitor(*, emit_existing: int = 0, dry_run: bool = False) -> str:
         except Exception as exc:
             mark_source_failure(current, repr(exc), now)
 
-    if not dry_run:
-        save_state(state)
+    failed = [s['name'] for s in sources if int(source_state(state, s['id']).get('consecutive_failures') or 0) > 0]
+    if failed and not dry_run:
+        notification_events.result('failed', '订阅源抓取失败：' + '、'.join(failed))
 
     if not events:
+        if not dry_run:
+            save_state(state)
         return WAKE_AGENT_FALSE
 
     translator = DeepLWebTranslator(cache_path=TRANSLATION_CACHE_FILE, translation_state=state.setdefault('translation', {}))
-    alert = format_alerts(events, translator=translator)
+    alert = format_alerts(events[:MAX_EVENTS_PER_RUN], translator=translator)
     if not dry_run:
+        notification_events.publish(alert)
+        state['pending_events'] = events[MAX_EVENTS_PER_RUN:]
         save_state(state)
     return alert or WAKE_AGENT_FALSE
 

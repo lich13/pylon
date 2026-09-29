@@ -34,7 +34,7 @@ PROFILE_ROOT = paths.PROFILE_ROOT.resolve()
 DEFAULT_PROFILE_ROOT = PROFILE_ROOT
 STATE_DB = PROFILE_ROOT / 'state.db'
 SESSIONS_DIR = PROFILE_ROOT / 'sessions'
-LOCK_PATH = Path('/tmp/hermes_webops_retention_cleanup.lock')
+LOCK_PATH = Path('/tmp/pylon_webops_retention_cleanup.lock')
 CHARTOO_DATA_ROOT = paths.CHARTOO_DATA_ROOT
 CHARTOO_RELEASE_DATES_TO_KEEP = 2
 LINUXDO_DATA_ROOT = PROFILE_ROOT / 'data' / 'linuxdo_notice'
@@ -105,7 +105,8 @@ def parse_utc_datetime(value: Any) -> datetime | None:
 
 def safe_path(path: Path) -> Path:
     resolved = path.resolve()
-    if resolved == PROFILE_ROOT or PROFILE_ROOT not in resolved.parents:
+    root = PROFILE_ROOT.resolve()
+    if resolved == root or root not in resolved.parents:
         raise ValueError(f'unsafe cleanup path outside profile root: {resolved}')
     return resolved
 

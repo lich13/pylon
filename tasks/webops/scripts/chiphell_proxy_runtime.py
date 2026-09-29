@@ -7,6 +7,7 @@ import random
 import re
 import socket
 import sqlite3
+from pylon import events
 import subprocess
 import time
 from contextlib import closing
@@ -383,6 +384,8 @@ class DeliveryQueue:
                 (max(1, int(limit)),),
             ).fetchall()
             if rows:
+                for dedupe_key, payload in rows:
+                    events.publish(str(payload), key="chiphell:" + str(dedupe_key))
                 connection.executemany(
                     "UPDATE delivery_queue SET claimed_at = ? WHERE dedupe_key = ? AND claimed_at IS NULL",
                     [(int(now), row[0]) for row in rows],

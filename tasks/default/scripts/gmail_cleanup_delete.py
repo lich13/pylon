@@ -1,5 +1,6 @@
-#!/srv/hermes/venvs/google-workspace/bin/python
+#!/srv/pylon/venv/bin/python
 import argparse
+from pylon import events
 import datetime as dt
 import hashlib
 import json
@@ -14,7 +15,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-HERMES_HOME = Path(os.getenv("HERMES_HOME", "/srv/hermes"))
+HERMES_HOME = Path(os.getenv("HERMES_HOME", "/srv/pylon/profiles/default"))
 TOKEN_PATH = HERMES_HOME / "google_token.json"
 DATA_DIR = HERMES_HOME / "data" / "gmail_cleanup"
 EXTRA_RULES_PATH = DATA_DIR / "extra_rules.json"
@@ -664,6 +665,8 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def save_json(path: Path, data: Any) -> None:
+    if path == NEW_TYPE_STATE_PATH and events.defer_json(path, data):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1198,21 +1201,31 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     deleted_count = 0
+    operation_id = os.environ.get("PYLON_RUN_ID", "") + ":gmail-delete"
     if not args.dry_run and ordered_unique_ids:
+        if events.enabled():
+            events.Outbox().operation(operation_id, "gmail-delete", {"message_ids": ordered_unique_ids}, "started")
         deleted_count = batch_delete(service, ordered_unique_ids)
 
     if args.format == "text":
         new_candidates = list((candidate_report or {}).get("new_candidates") or [])
         if args.quiet_noop and not args.dry_run and not ordered_unique_ids and deleted_count == 0 and not new_candidates:
+            events.flush_deferred()
             return 0
-        print(format_text_report(
+        report_text = format_text_report(
             dry_run=args.dry_run,
             total_unique_matches=len(ordered_unique_ids),
             deleted_count=deleted_count,
             per_rule=per_rule,
             candidate_report=candidate_report,
             max_candidates=args.new_type_max_report,
-        ))
+        )
+        if not args.dry_run:
+            events.publish(report_text)
+            events.flush_deferred()
+            if events.enabled() and ordered_unique_ids:
+                events.Outbox().operation(operation_id, "gmail-delete", {"deleted_count": deleted_count}, "completed")
+        print(report_text)
         return 0
 
     result = {

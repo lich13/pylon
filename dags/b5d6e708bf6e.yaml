@@ -1,0 +1,7 @@
+description: "Gmail 自动清理"
+schedule: "CRON_TZ=Asia/Shanghai 0 1 * * *"
+timeout_sec: 990
+queue: b5d6e708bf6e
+steps:
+  - id: run
+    run: /srv/pylon/venv/bin/pylon run b5d6e708bf6e

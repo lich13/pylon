@@ -1,0 +1,7 @@
+description: "日港 iTunes 报告"
+schedule: "CRON_TZ=Asia/Shanghai 30 * * * *"
+timeout_sec: 1890
+queue: 7096dc039b73
+steps:
+  - id: run
+    run: /srv/pylon/venv/bin/pylon run 7096dc039b73

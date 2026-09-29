@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import Any
 
 
-PROFILE_ROOT = Path("/srv/hermes/profiles/webops")
-AGENT_ROOT = Path("/srv/hermes/hermes-agent")
+PROFILE_ROOT = Path(os.environ.get("PYLON_PROFILE_ROOT", "/srv/pylon/profiles/webops"))
+AGENT_ROOT = Path("/srv/pylon")
 HERMES_PYTHON = AGENT_ROOT / "venv" / "bin" / "python"
 MONITOR_JOB_ID = "fa27c561ded6"
 JOBS_FILE = PROFILE_ROOT / "cron" / "jobs.json"
@@ -237,6 +237,8 @@ def load_jobs(path: Path | None = None) -> list[dict[str, Any]]:
 
 
 def resolve_delivery_target(path: Path | None = None) -> str | None:
+    if path is None and os.environ.get("TELEGRAM_HOME_CHANNEL"):
+        return "telegram:" + os.environ["TELEGRAM_HOME_CHANNEL"]
     for job in load_jobs(path):
         if job.get("id") == MONITOR_JOB_ID:
             deliver = str(job.get("deliver") or "").strip()
@@ -249,33 +251,11 @@ def build_replay_message(candidate: ReplayCandidate) -> str:
 
 
 def send_text(message: str, *, target: str) -> SendResult:
-    env = os.environ.copy()
-    env["HERMES_HOME"] = str(PROFILE_ROOT)
-    args = [
-        str(HERMES_PYTHON),
-        "-m",
-        "hermes_cli.main",
-        "send",
-        "--to",
-        target,
-        "--file",
-        "-",
-        "--json",
-    ]
-    completed = subprocess.run(
-        args,
-        input=message,
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=60,
-    )
-    return SendResult(
-        ok=completed.returncode == 0,
-        stdout=completed.stdout,
-        stderr=completed.stderr,
-        returncode=completed.returncode,
-    )
+    from pylon.outbox import Outbox
+    from pylon.events import context
+    event_id = Outbox().enqueue(kind="text", payload={"text": message},
+                               key="software-replay:" + sha256_text(message), **context())
+    return SendResult(ok=True, stdout="queued:" + event_id, stderr="", returncode=0)
 
 
 def send_candidate(candidate: ReplayCandidate, *, target: str) -> SendResult:
@@ -567,49 +547,16 @@ def run_item_replay(
 
 
 def run_replay(*, dry_run: bool = False, window_seconds: int = DEFAULT_WINDOW_SECONDS) -> dict[str, Any]:
-    target = resolve_delivery_target()
-    if not target:
-        return {"ok": False, "sent": 0, "candidates": 0, "error": "monitor delivery target not found"}
-
-    state = load_state()
-    candidates = [
-        candidate
-        for candidate in find_replay_candidates(parse_delivery_errors(), window_seconds=window_seconds)
-        if not was_replayed(state, candidate)
-    ]
-    if dry_run:
-        return {
-            "ok": True,
-            "sent": 0,
-            "candidates": len(candidates),
-            "dry_run": True,
-            "paths": [str(candidate.path) for candidate in candidates],
-        }
-
-    sent = 0
-    errors: list[dict[str, Any]] = []
-    for candidate in candidates:
-        result = send_candidate(candidate, target=target)
-        if result.ok:
-            mark_replayed(state, candidate, result)
-            save_state(state)
-            sent += 1
-            continue
-        errors.append(
-            {
-                "path": str(candidate.path),
-                "returncode": result.returncode,
-                "stdout": result.stdout[-500:],
-                "stderr": result.stderr[-500:],
-            }
-        )
-
-    return {
-        "ok": not errors,
-        "sent": sent,
-        "candidates": len(candidates),
-        "errors": errors,
-    }
+    from pylon.outbox import Outbox
+    from pylon import events
+    box = Outbox()
+    with box.connect() as db:
+        rows = db.execute("SELECT status,count(*) n FROM events WHERE job_id=? AND status!='delivered' GROUP BY status", (MONITOR_JOB_ID,)).fetchall()
+    counts = {row["status"]: row["n"] for row in rows}
+    pending = sum(counts.values())
+    if pending and not dry_run:
+        events.result("failed", "软件更新通知待补发或核对回执：" + json.dumps(counts, ensure_ascii=False))
+    return {"ok": not pending, "sent": 0, "candidates": pending, "queue": counts, "dry_run": dry_run}
 
 
 def main(argv: list[str] | None = None) -> int:

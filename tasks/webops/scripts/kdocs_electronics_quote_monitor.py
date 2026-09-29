@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from pylon import events
 import datetime as dt
 import hashlib
 import json
@@ -287,6 +288,15 @@ def update_quotes(timeout_ms: int = 60000, min_entries: int = 20) -> dict[str, A
         raise RuntimeError(f"parsed too few quote entries: {len(entries)}")
     unknown_hash = hashlib.sha1(json.dumps(unknown_candidates, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest() if unknown_candidates else ""
     with connect(DB_PATH) as conn:
+        last_unknown_hash = get_meta(conn, "quotes_unknown_quote_candidate_hash", "")
+        unknown_should_notify = bool(unknown_candidates and unknown_hash != last_unknown_hash)
+
+        def persist_notice(stats):
+            if stats.get("should_notify") or unknown_should_notify:
+                notice = build_category_notice({"category_change": stats, "category_counts": stats.get("category_counts", {}),
+                    "unknown_quote_candidates": unknown_candidates if unknown_should_notify else []})
+                events.publish(notice)
+
         sync_stats = replace_quotes(
             conn,
             entries,
@@ -294,6 +304,7 @@ def update_quotes(timeout_ms: int = 60000, min_entries: int = 20) -> dict[str, A
             snapshot_hash=snapshot_hash,
             protect_removed_categories=True,
             category_absence_confirmations=2,
+            before_commit=persist_notice,
         )
         set_meta(conn, "quotes_parser_version", QUOTE_PARSER_VERSION)
         set_meta(conn, "quotes_svg_count", str(len(svg_entries)))
@@ -431,11 +442,13 @@ def main(argv: list[str] | None = None) -> int:
         mark_success(slot, args.mode, result)
         notice = result.get("category_notice") if isinstance(result, dict) else ""
         if notice:
+            events.publish(notice)
             print(notice)
         else:
             print(output.wake_agent_false())
         return 0
     except Exception as e:
+        events.result("failed", f"{type(e).__name__}: {e}")
         fail_count, notify = mark_failure(slot, args.mode, e)
         if notify:
             print(f"KDocs 报价抓取连续失败 {fail_count} 次：{type(e).__name__}: {e}。仍将每 15 分钟重试。")

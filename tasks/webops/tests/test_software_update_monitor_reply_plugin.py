@@ -222,7 +222,7 @@ class SoftwareUpdateMonitorReplyPluginTests(unittest.TestCase):
 
         def fake_run(args):
             calls.append(args)
-            if args == ["--remove-project", "2", "--json"]:
+            if args == ["--remove-project", "two", "--json"]:
                 return self.plugin.CommandResult(
                     returncode=0,
                     data={
@@ -243,7 +243,7 @@ class SoftwareUpdateMonitorReplyPluginTests(unittest.TestCase):
             result = self.plugin.handle_pre_gateway_dispatch(event=event, gateway=self.gateway())
 
         self.assertEqual(result, {"action": "skip", "reason": "software-update-monitor-reply handled"})
-        self.assertEqual(calls, [["--remove-project", "2", "--json"], ["--validate-config", "--json"]])
+        self.assertEqual(calls, [["--remove-project", "two", "--json"], ["--validate-config", "--json"]])
         self.assertIn("已移除监控: Two", sent[0])
         self.assertIn("two_releases", sent[0])
         self.assertIn("validate: OK", sent[0])

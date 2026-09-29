@@ -12,10 +12,10 @@ from lib.webops import locks, output, paths, playwright_env, state_json
 
 class WebOpsLibTests(unittest.TestCase):
     def test_paths_expose_current_profile_layout(self):
-        self.assertEqual(paths.PROFILE_ROOT, Path('/srv/hermes/profiles/webops'))
+        self.assertEqual(paths.PROFILE_ROOT, Path(os.environ.get('PYLON_PROFILE_ROOT', '/srv/pylon/profiles/webops')))
         self.assertEqual(paths.SCRIPTS_DIR, paths.PROFILE_ROOT / 'scripts')
         self.assertEqual(paths.CHARTOO_DATA_ROOT, paths.PROFILE_ROOT / 'data' / 'chartoo_itunes_daily')
-        self.assertEqual(paths.PLAYWRIGHT_BROWSERS_PATH, Path('/srv/hermes/playwright-browsers'))
+        self.assertEqual(paths.PLAYWRIGHT_BROWSERS_PATH, Path(os.environ.get('PYLON_HOME', '/srv/pylon')) / 'playwright-browsers')
 
     def test_output_helpers_preserve_cron_silent_contracts(self):
         self.assertEqual(output.wake_agent_false(), '{"wakeAgent": false}')

@@ -11,7 +11,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "hermes"))
+sys.path.insert(0, str(ROOT / "tasks/webops/scripts"))
 
 
 class JsonState:
@@ -36,7 +36,7 @@ sys.modules["chiphell_fid26_monitor"] = fake_base
 
 spec = importlib.util.spec_from_file_location(
     "chiphell_fid26_proxy_poller_for_tests",
-    ROOT / "hermes" / "chiphell_fid26_proxy_poller.py",
+    ROOT / "tasks/webops/scripts" / "chiphell_fid26_proxy_poller.py",
 )
 poller = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
