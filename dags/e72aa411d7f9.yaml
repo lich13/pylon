@@ -1,7 +1,0 @@
-description: "业务数据清理"
-schedule: "CRON_TZ=Asia/Shanghai 20 4 * * *"
-timeout_sec: 1890
-queue: e72aa411d7f9
-steps:
-  - id: run
-    run: /srv/pylon/venv/bin/pylon run e72aa411d7f9

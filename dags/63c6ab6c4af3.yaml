@@ -1,7 +1,0 @@
-description: "Chiphell 新帖投递"
-schedule: "CRON_TZ=Asia/Shanghai * * * * *"
-timeout_sec: 1890
-queue: 63c6ab6c4af3
-steps:
-  - id: run
-    run: /srv/pylon/venv/bin/pylon run 63c6ab6c4af3

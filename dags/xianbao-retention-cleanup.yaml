@@ -1,7 +1,0 @@
-description: "线报数据清理"
-schedule: "CRON_TZ=Asia/Shanghai 15 4 * * *"
-timeout_sec: 990
-queue: xianbao-retention-cleanup
-steps:
-  - id: run
-    run: /srv/pylon/venv/bin/pylon run xianbao-retention-cleanup

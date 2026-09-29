@@ -1,7 +1,0 @@
-description: "软件更新监控"
-schedule: "CRON_TZ=Asia/Shanghai * * * * *"
-timeout_sec: 1890
-queue: fa27c561ded6
-steps:
-  - id: run
-    run: /srv/pylon/venv/bin/pylon run fa27c561ded6

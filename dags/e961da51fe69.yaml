@@ -1,7 +1,0 @@
-description: "KDocs 失败重试"
-schedule: "CRON_TZ=Asia/Shanghai */15 * * * *"
-timeout_sec: 1890
-queue: kdocs-quotes
-steps:
-  - id: run
-    run: /srv/pylon/venv/bin/pylon run e961da51fe69

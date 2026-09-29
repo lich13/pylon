@@ -1,7 +1,0 @@
-description: "Linux.do 监控"
-schedule: "CRON_TZ=Asia/Shanghai * * * * *"
-timeout_sec: 1890
-queue: b7a84d1d9f21
-steps:
-  - id: run
-    run: /srv/pylon/venv/bin/pylon run b7a84d1d9f21

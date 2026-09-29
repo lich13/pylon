@@ -1,7 +1,0 @@
-description: "通知补发核对"
-schedule: "CRON_TZ=Asia/Shanghai */5 * * * *"
-timeout_sec: 1890
-queue: de91ae783a36
-steps:
-  - id: run
-    run: /srv/pylon/venv/bin/pylon run de91ae783a36

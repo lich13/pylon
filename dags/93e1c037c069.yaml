@@ -1,7 +1,0 @@
-description: "V2EX 监控"
-schedule: "CRON_TZ=Asia/Shanghai * * * * *"
-timeout_sec: 1890
-queue: 93e1c037c069
-steps:
-  - id: run
-    run: /srv/pylon/venv/bin/pylon run 93e1c037c069
