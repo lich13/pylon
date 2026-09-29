@@ -137,5 +137,13 @@
     "lock": "ssh-maintenance",
     "deliver": false,
     "timeout": 900
+  },
+  "software-maintenance": {
+    "name": "每周软件维护汇总",
+    "profile": "webops",
+    "schedule": "0 9 * * 1",
+    "deliver": false,
+    "timeout": 300,
+    "module": "pylon.tasks.software.maintenance"
   }
 }

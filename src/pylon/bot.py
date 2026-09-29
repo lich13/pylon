@@ -55,8 +55,10 @@ def command_once(box: Outbox) -> bool:
         db.execute("UPDATE updates SET status='running' WHERE profile=? AND update_id=?", (row['profile'], row['update_id']))
     message = json.loads(row['payload'])
     try:
+        env = os.environ.copy()
+        env['PYLON_COMMAND_ID'] = f"telegram:{row['profile']}:{row['update_id']}"
         proc = subprocess.run([str(home() / 'venv/bin/python'), '-m', 'pylon.commands', row['profile']],
-                              input=message['text'], capture_output=True, text=True, timeout=180)
+                              input=message['text'], capture_output=True, text=True, timeout=180, env=env)
         reply = proc.stdout.strip() or '操作失败，请查看 pylon 日志'
         status = 'done' if proc.returncode == 0 else 'failed'
     except Exception as exc:
@@ -126,6 +128,8 @@ def main():
     threads.append(threading.Thread(target=commands, daemon=True))
     threads.append(threading.Thread(target=control, daemon=True))
     threads.append(threading.Thread(target=synchronize_background, args=(stop,), daemon=True))
+    from .software_updates import synchronize_background as synchronize_updates
+    threads.append(threading.Thread(target=synchronize_updates, args=(stop,), daemon=True))
     for thread in threads:
         thread.start()
     with client() as http:

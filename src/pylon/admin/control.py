@@ -21,6 +21,9 @@ def main(args=None):
     args = list(sys.argv[1:] if args is None else args)
     if os.geteuid() != 0:
         raise PermissionError('root required')
+    if args and args[0] == 'software':
+        from .software import main as software_main
+        return software_main(args[1:])
     if args == ['chiphell-reconcile']:
         from .chiphell import main as chiphell_main
         return chiphell_main(['reconcile'])

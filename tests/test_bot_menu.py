@@ -15,8 +15,8 @@ from pylon.transport import DeliveryError
 
 
 def test_catalog_is_valid_chinese_and_has_detailed_help():
-    assert len(COMMANDS) == 21
-    assert len({row['command'] for row in menu_commands()}) == 21
+    assert len(COMMANDS) == 24
+    assert len({row['command'] for row in menu_commands()}) == 24
     for item in COMMANDS.values():
         assert re.fullmatch('[a-z0-9_]{1,32}', item.name)
         assert 1 <= len(item.description) <= 256
@@ -28,7 +28,7 @@ def test_catalog_is_valid_chinese_and_has_detailed_help():
     assert commands.handle('webops', '/help@back13bot run') == help_text('run')
 
 
-@pytest.mark.parametrize('name', [name for name, c in COMMANDS.items() if c.argument and c.route != 'help'])
+@pytest.mark.parametrize('name', [name for name, c in COMMANDS.items() if c.argument and not c.argument.startswith('[') and c.route != 'help'])
 def test_missing_arguments_only_return_specific_help(name, monkeypatch):
     for attr in ('start', 'suspend', 'admin', 'ssh', 'logs'):
         monkeypatch.setattr(scheduler, attr, Mock(side_effect=AssertionError('must not execute')))
@@ -42,6 +42,10 @@ def test_missing_arguments_only_return_specific_help(name, monkeypatch):
 @pytest.mark.parametrize('name', COMMANDS)
 def test_every_menu_entry_reaches_its_existing_operation(name, monkeypatch):
     item = COMMANDS[name]
+    from pylon import software_updates
+    inventory, update = Mock(return_value='清单'), Mock(return_value='已提交')
+    monkeypatch.setattr(software_updates, 'inventory_text', inventory)
+    monkeypatch.setattr(software_updates, 'request_update', update)
     calls = {}
     for method in ('status_text', 'outbox_text', 'control_task', 'ssh_text', 'chiphell_text', 'gmail_text', 'monitor_command'):
         calls[method] = Mock(return_value=method)
@@ -65,6 +69,10 @@ def test_every_menu_entry_reaches_its_existing_operation(name, monkeypatch):
     elif item.route == 'monitor':
         value = {'list': '/monitors', 'add': '增加监控 owner/repo', 'remove': '移除监控'}[item.action]
         calls['monitor_command'].assert_called_once_with(value, '123')
+    elif item.route == 'updates':
+        inventory.assert_called_once_with(full=False)
+    elif item.route == 'software_update':
+        update.assert_called_once_with(item.action, 'default')
     elif item.route == 'help':
         assert result == help_text('status')
     else:
@@ -219,7 +227,7 @@ def test_background_honors_retry_after_without_repeating_successful_bot(monkeypa
         counts[profile] = counts.get(profile, 0) + 1
         if profile == 'default' and counts[profile] == 1:
             raise DeliveryError('pending', 'rate limit', 42)
-        return {'commands': 21, 'changed': 0}
+        return {'commands': 24, 'changed': 0}
     monkeypatch.setattr(bot_menu, 'synchronize', sync)
     stop = Mock(spec=threading.Event)
     stop.is_set.return_value = False

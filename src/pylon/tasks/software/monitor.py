@@ -78,6 +78,7 @@ GROK_BUILD_CHANGELOG_TEMPLATE = 'https://x.ai/cli/changelogs/{version}.external.
 GROK_BUILD_CHANGELOG_PAGE = 'https://x.ai/build/changelog'
 VERSION_TEXT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$')
 READINESS_INT_FIELDS = {'release_ready_after_seconds', 'release_stable_checks', 'release_min_body_chars'}
+SOURCE_INT_FIELDS = READINESS_INT_FIELDS | {'poll_interval_seconds'}
 READINESS_PATTERN_FIELDS = {'release_required_asset_patterns', 'release_required_content_patterns'}
 ITEM_TITLE_PATTERN_FIELDS = {'item_title_include_patterns', 'item_title_exclude_patterns'}
 READINESS_BOOL_FIELDS = {'release_exclude_prerelease'}
@@ -252,7 +253,7 @@ def normalize_source(source: Any) -> dict[str, Any] | None:
     changelog_url = str(source.get('changelog_url') or '').strip()
     if re.match(r'^https?://', changelog_url):
         normalized['changelog_url'] = changelog_url
-    for field in READINESS_INT_FIELDS:
+    for field in SOURCE_INT_FIELDS:
         if field not in source:
             continue
         try:
@@ -393,7 +394,7 @@ def validate_custom_sources_config() -> dict[str, Any]:
             continue
         if source['kind'] not in SOURCE_KINDS:
             warnings.append(f"source kind normalized for {source['id']}: {source['kind']}")
-        for field in READINESS_INT_FIELDS:
+        for field in SOURCE_INT_FIELDS:
             if field not in raw_source:
                 continue
             try:
@@ -2312,7 +2313,7 @@ def fetch_url(url: str, *, timeout: int = SOURCE_TIMEOUT_SECONDS) -> bytes:
 
 def due_for_source(current: dict[str, Any], now: float) -> bool:
     try:
-        return float(current.get('backoff_until') or 0) <= now
+        return max(float(current.get('backoff_until') or 0), float(current.get('next_poll_at') or 0)) <= now
     except Exception:
         return True
 
@@ -2336,6 +2337,7 @@ def baseline_sources(sources: list[dict[str, str]]) -> dict[str, Any]:
         try:
             raw = fetch_url(source['url'])
             collect_source_items(state, source, raw, emit_existing=0)
+            current['next_poll_at'] = now + source_int(source, 'poll_interval_seconds', 0)
             baselined += 1
         except Exception as exc:
             mark_source_failure(current, repr(exc), now)
@@ -2360,6 +2362,7 @@ def run_monitor(*, emit_existing: int = 0, dry_run: bool = False) -> str:
         try:
             raw = fetch_url(source['url'])
             new_items = collect_source_items(state, source, raw, emit_existing=emit_existing)
+            current['next_poll_at'] = now + source_int(source, 'poll_interval_seconds', 0)
             for item in new_items:
                 save_raw_item(source, item)
                 events.append({'source': source, 'item': item})

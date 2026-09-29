@@ -217,7 +217,7 @@ def handle(profile: str, text: str) -> str:
             return '没有这个命令。发送 /help 查看可用命令。'
         if item.route == 'help':
             return help_text(argument)
-        if item.argument and not argument:
+        if item.argument and not item.argument.startswith('[') and not argument:
             return help_text(name)
         if not item.argument and argument:
             raise ValueError('此操作不接受参数；用法：' + item.usage)
@@ -225,6 +225,14 @@ def handle(profile: str, text: str) -> str:
             return status_text()
         if item.route == 'outbox':
             return outbox_text()
+        if item.route == 'updates':
+            if argument not in {'', 'all'}:
+                return help_text(name)
+            from .software_updates import inventory_text
+            return inventory_text(full=argument == 'all')
+        if item.route == 'software_update':
+            from .software_updates import request_update
+            return request_update(item.action, profile)
         if item.route == 'task':
             key = 'all' if argument == 'all' and item.action in {'pause', 'resume'} else resolve_job(argument)
             if item.action in {'pause', 'resume'}:

@@ -14,11 +14,12 @@ UNITS = Path('/etc/systemd/system')
 
 def calendar(expression):
     minute, hour, day, month, weekday = expression.split()
-    if month != '*' or weekday != '*':
+    if month != '*' or weekday not in {'*', '0', '1', '2', '3', '4', '5', '6', '7'}:
         raise ValueError('unsupported schedule')
     def field(value):
         return '0/' + value[2:] if value.startswith('*/') else value
-    return f'*-*-{field(day)} {field(hour)}:{field(minute)}:00 Asia/Shanghai'
+    week = '' if weekday == '*' else ('Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')[int(weekday)] + ' '
+    return f'{week}*-*-{field(day)} {field(hour)}:{field(minute)}:00 Asia/Shanghai'
 
 
 def timer_text(key, job):
@@ -88,7 +89,7 @@ def main():
         path.write_text(content)
         os.chown(path, 0, 0)
         path.chmod(0o755)
-    for service in ['pylon-bot.service', 'pylon-ssh-load.service', 'chiphell-fid26-poller.service']:
+    for service in ['pylon-bot.service', 'pylon-ssh-load.service', 'chiphell-fid26-poller.service', 'pylon-update@.service']:
         install_file(ROOT / 'ops' / service, UNITS / service)
     (UNITS / 'pylon-task@.service').write_text(task_service('scheduled'))
     (UNITS / 'pylon-manual@.service').write_text(task_service('manual'))
