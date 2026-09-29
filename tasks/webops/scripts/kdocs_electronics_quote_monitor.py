@@ -440,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = update_quotes(timeout_ms=args.timeout_ms, min_entries=args.min_entries)
         mark_success(slot, args.mode, result)
+        events.result('ok', f'报价刷新完成，mode={args.mode}', changed=True)
         notice = result.get("category_notice") if isinstance(result, dict) else ""
         if notice:
             events.publish(notice)

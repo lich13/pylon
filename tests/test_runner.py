@@ -7,7 +7,7 @@ from pylon.runner import run
 def test_failed_business_result_with_zero_exit_and_repeat_run_id(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv('PYLON_HOME', str(tmp_path))
     monkeypatch.setenv('PYLON_OUTBOX', str(tmp_path / 'data/outbox.sqlite3'))
-    monkeypatch.setenv('DAG_RUN_ID', 'same-scheduled-run')
+    monkeypatch.setenv('INVOCATION_ID', 'same-scheduled-run')
     scripts = tmp_path / 'profiles/default/scripts'
     scripts.mkdir(parents=True)
     binary = tmp_path / 'venv/bin'
@@ -28,14 +28,15 @@ print('[SILENT]')
     assert 'upstream unavailable' in capsys.readouterr().out
 
 
-def test_panel_pause_also_stops_chiphell_poller(monkeypatch):
+def test_native_pause_also_stops_chiphell_poller(monkeypatch):
     from pylon import bot
     from types import SimpleNamespace
     calls=[]
-    monkeypatch.setattr(bot, 'request', lambda method, path: {'paused':True} if 'scheduler' in path else {'suspended':False})
+    monkeypatch.setattr(bot.scheduler, 'paused', lambda job: True)
+    monkeypatch.setattr(bot.scheduler, 'suspend', lambda job, paused: calls.append((job, paused)))
     monkeypatch.setattr(bot.subprocess, 'run', lambda args, **kwargs: calls.append(args) or SimpleNamespace(returncode=0))
     bot.synchronize_chiphell()
-    assert calls[-1] == ['sudo','-n','/usr/bin/systemctl','stop','chiphell-fid26-poller.service']
+    assert calls[-1] == ('63c6ab6c4af3', True)
 
 
 def test_cookie_import_prevents_controller_starting_poller(tmp_path, monkeypatch):
@@ -46,6 +47,6 @@ def test_cookie_import_prevents_controller_starting_poller(tmp_path, monkeypatch
     journal.write_text('{"stage":"VALIDATING"}')
     def unexpected(*args, **kwargs):
         raise AssertionError('controller must leave the importer in control')
-    monkeypatch.setattr(bot, 'request', unexpected)
+    monkeypatch.setattr(bot.scheduler, 'paused', unexpected)
     monkeypatch.setattr(bot.subprocess, 'run', unexpected)
     bot.synchronize_chiphell()

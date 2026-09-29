@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .config import home, jobs, profile_env, profile_root, redact
-from .dagu import request, suspend
+from . import scheduler
 from .outbox import Outbox
 from .runner import task_environment
 
@@ -37,14 +37,13 @@ def resolve_job(value: str) -> str:
 
 
 def control_task(job_id: str, paused: bool) -> str:
+    if job_id == 'all':
+        for key in jobs():
+            control_task(key, paused)
+        return '全部定时任务已' + ('暂停' if paused else '恢复')
     if job_id not in jobs():
         raise ValueError("任务不存在")
-    if job_id == "63c6ab6c4af3":
-        subprocess.run(["sudo", "-n", "/usr/local/sbin/chiphell-proxyctl", "pause" if paused else "resume"],
-                       check=True, capture_output=True, text=True, timeout=150)
-    else:
-        suspend(job_id, paused)
-    Outbox().put("paused:" + job_id, paused)
+    scheduler.suspend(job_id, paused)
     return f"{jobs()[job_id]['name']}已{'暂停' if paused else '恢复'}"
 
 
@@ -52,21 +51,26 @@ def status_text() -> str:
     box = Outbox()
     lines = []
     try:
-        remote = request("GET", "/dags")
-        paused = {row.get('dag', {}).get('name', row.get('fileName')): bool(row.get('suspended')) for row in remote.get('dags', [])}
-        if request("GET", "/services/scheduler/pause").get('paused'):
-            lines.append('全部定时任务已暂停')
-    except Exception:
-        paused = {}
+        timers = scheduler.states()
+    except Exception as exc:
+        timers = {}
+        lines.append('调度状态查询失败：' + redact(str(exc))[:200])
     names = {"ok": "正常", "no_change": "无变化", "running": "运行中", "failed": "业务失败",
              "delivery_pending": "待补发", "interrupted": "执行中断"}
     with box.connect() as db:
         for index, (key, job) in enumerate(jobs().items(), 1):
-            row = db.execute("SELECT status FROM runs WHERE job_id=? ORDER BY started_at DESC LIMIT 1", (key,)).fetchone()
+            row = db.execute("SELECT status,id FROM runs WHERE job_id=? ORDER BY started_at DESC LIMIT 1", (key,)).fetchone()
             state = names.get(row[0], row[0]) if row else "未执行"
-            if paused.get(key, box.get("paused:" + key, False)):
+            if row and row[0] == 'delivery_pending' and all(e['status'] == 'delivered' for e in box.run_events(row[1])):
+                state = '正常'
+            timer = timers.get(key, {})
+            if timer.get('running'):
+                state = '运行中'
+            if timer.get('paused'):
                 state = "已暂停 / " + state
             lines.append(f"{index}. {job['name']}：{state}")
+            if timer.get('next') and not timer.get('paused'):
+                lines.append('   下次 ' + timer['next'])
     counts = box.counts()
     unresolved = sum(counts.get(s, 0) for s in ('pending', 'sending', 'uncertain', 'failed'))
     lines.append(f"待处理通知 {unresolved}；回执不确定 {counts.get('uncertain', 0)}")
@@ -118,7 +122,22 @@ def handle(profile: str, text: str) -> str:
         return status_text()
     control = re.fullmatch(r"/(pause|resume)\s+(.+)", value)
     if control:
-        return control_task(resolve_job(control[2].strip()), control[1] == "pause")
+        target = control[2].strip()
+        return control_task('all' if target == 'all' else resolve_job(target), control[1] == "pause")
+    execution = re.fullmatch(r'/(run|logs)\s+(.+)', value)
+    if execution:
+        key = resolve_job(execution[2].strip())
+        if execution[1] == 'logs':
+            return scheduler.logs(key)[-12000:]
+        return jobs()[key]['name'] + '：' + scheduler.start(key)
+    ssh_command = re.fullmatch(r'/ssh(?:\s+(status|check|sync|refresh)(?:\s+(\S+))?)?', value)
+    if ssh_command:
+        action = ssh_command[1] or 'status'
+        if action in {'sync', 'refresh'}:
+            if ssh_command[2]:
+                raise ValueError('此操作不接受参数')
+            return scheduler.start('ssh-admin-sync' if action == 'sync' else 'ssh-beijing-refresh')
+        return json.dumps(scheduler.ssh(action, ssh_command[2]), ensure_ascii=False, indent=2)
     gmail = re.fullmatch(r"/gmail(?:\s+(list|accept|ignore)(?:\s+(gmail-nt-[A-Za-z0-9_-]+))?)?", value)
     if gmail:
         action, candidate = gmail[1] or "list", gmail[2]
@@ -133,7 +152,8 @@ def handle(profile: str, text: str) -> str:
     result = monitor_command(value, profile_env(profile)["TELEGRAM_HOME_CHANNEL"])
     if result is not None:
         return result
-    return ("/status\n/pause 任务编号\n/resume 任务编号\n/gmail list\n/gmail accept 候选ID\n/gmail ignore 候选ID\n"
+    return ("/status\n/run 任务编号\n/pause 任务编号或all\n/resume 任务编号或all\n/logs 任务编号\n"
+            "/ssh status\n/ssh check IP\n/ssh sync\n/ssh refresh\n/gmail list\n/gmail accept 候选ID\n/gmail ignore 候选ID\n"
             "增加监控 URL\n加监控 owner/repo\n移除监控 → 回复编号")
 
 

@@ -8,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from pylon import events
 
 
 PROFILE_ROOT = Path(os.environ.get("HERMES_HOME", "/srv/pylon/profiles/default"))
@@ -191,6 +192,9 @@ def main(argv: list[str] | None = None) -> int:
         tmp_retention_days=args.tmp_retention_days,
         apply=bool(args.apply and not args.dry_run),
     )
+    events.result('failed' if result['errors'] else 'ok',
+                  f"{result['mode']}: deleted_files={result['deleted_files']}, deleted_bytes={result['deleted_bytes']}, errors={len(result['errors'])}",
+                  changed=bool(result['deleted_files']))
     if not args.quiet:
         if args.json:
             print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))

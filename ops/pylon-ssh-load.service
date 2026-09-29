@@ -1,0 +1,14 @@
+[Unit]
+Description=pylon SSH Beijing IPv4 set
+DefaultDependencies=no
+Before=ufw.service network-pre.target
+Wants=network-pre.target
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/pylon/ssh_admin.py load
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

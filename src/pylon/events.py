@@ -72,14 +72,14 @@ def publish_bark(payload: dict, api_base: str) -> str | None:
     return Outbox().enqueue(kind="bark", payload={"body": payload, "api_base": api_base}, key=key, **ctx)
 
 
-def result(status: str, detail: str = ""):
+def result(status: str, detail: str = "", *, changed: bool = False):
     target = os.environ.get("PYLON_RESULT_FILE")
     if target:
         path = Path(target)
         previous = json.loads(path.read_text()) if path.exists() else {}
         if previous.get("status") == "failed" and status != "failed":
             return
-        path.write_text(json.dumps({"status": status, "detail": detail}, ensure_ascii=False))
+        path.write_text(json.dumps({"status": status, "detail": detail, "changed": changed}, ensure_ascii=False))
 
 
 def defer_json(path: Path, value) -> bool:

@@ -29,6 +29,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lib.webops import locks, output, paths
+from pylon import events
 
 PROFILE_ROOT = paths.PROFILE_ROOT.resolve()
 DEFAULT_PROFILE_ROOT = PROFILE_ROOT
@@ -947,6 +948,9 @@ def main() -> int:
     parser.add_argument('--dry-run', action='store_true', help='show what would be deleted without deleting files')
     args = parser.parse_args()
     summary = run(dry_run=args.dry_run)
+    events.result('ok' if summary.get('status') in {'ok', 'locked'} else 'failed',
+                  f"dry_run={args.dry_run}, deleted_files={summary.get('total_deleted_files', 0)}, deleted_bytes={summary.get('total_deleted_bytes', 0)}, errors={summary.get('total_errors', 0)}",
+                  changed=not args.dry_run and bool(summary.get('total_deleted_files') or summary.get('total_deleted_bytes')))
     if not args.dry_run and summary.get('status') in {'ok', 'locked'}:
         # Normal scheduled cleanup is not user-visible and should not wake the cron agent.
         print(output.wake_agent_false())

@@ -10,7 +10,7 @@ import threading
 import time
 
 from .commands import authorized
-from .dagu import request
+from . import scheduler
 from .config import home, profile_env, redact
 from .outbox import Outbox
 from .transport import DeliveryError, client, drain, telegram_request
@@ -88,14 +88,12 @@ def synchronize_chiphell():
     # Leave recovery to the privileged importer while its journal exists.
     if (home() / 'profiles/webops/data/chiphell_fid26/.cookie-import-transaction.json').exists():
         return
-    task = request('GET', '/dags/63c6ab6c4af3')
-    scheduler = request('GET', '/services/scheduler/pause')
-    paused = bool(task.get('suspended') or scheduler.get('paused'))
+    paused = scheduler.paused('63c6ab6c4af3')
     active = subprocess.run(['systemctl', 'is-active', '--quiet', 'chiphell-fid26-poller.service']).returncode == 0
     if paused and active:
-        subprocess.run(['sudo', '-n', '/usr/bin/systemctl', 'stop', 'chiphell-fid26-poller.service'], check=True, timeout=60)
+        scheduler.suspend('63c6ab6c4af3', True)
     elif not paused and not active:
-        subprocess.run(['sudo', '-n', '/usr/local/sbin/chiphell-proxyctl', 'resume'], check=True, capture_output=True, timeout=150)
+        scheduler.suspend('63c6ab6c4af3', False)
 
 
 def main():

@@ -27,7 +27,7 @@ def task_environment(profile: str) -> dict[str, str]:
     return env
 
 
-def run(job_id: str) -> int:
+def run(job_id: str, trigger: str = "scheduled") -> int:
     job = jobs()[job_id]
     box = Outbox()
     lockdir = home() / "run"
@@ -39,7 +39,7 @@ def run(job_id: str) -> int:
         print("已有任务运行，跳过本次触发")
         lock.close()
         return 0
-    run_id = os.environ.get("DAG_RUN_ID") or os.environ.get("DAGU_RUN_ID") or uuid.uuid4().hex
+    run_id = os.environ.get("INVOCATION_ID") or uuid.uuid4().hex
     run_id = f"{job_id}:{run_id}"
     with box.connect() as db:
         previous = db.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
@@ -50,9 +50,13 @@ def run(job_id: str) -> int:
         db.execute("INSERT INTO runs(id,job_id,started_at,status) VALUES(?,?,?,'running')", (run_id, job_id, time.time()))
     result_file = lockdir / (uuid.uuid4().hex + ".json")
     env = task_environment(job["profile"])
-    env.update(PYLON_JOB_ID=job_id, PYLON_RUN_ID=run_id, PYLON_OUTBOX=str(box.path), PYLON_RESULT_FILE=str(result_file))
-    script = profile_root(job["profile"]) / "scripts" / job["script"]
-    interpreter = "/bin/bash" if script.suffix == ".sh" else str(home() / "venv/bin/python")
+    env.update(PYLON_JOB_ID=job_id, PYLON_RUN_ID=run_id, PYLON_OUTBOX=str(box.path), PYLON_RESULT_FILE=str(result_file), PYLON_TRIGGER=trigger)
+    if job.get('admin_action'):
+        argv = ['sudo', '-n', '/usr/local/sbin/pylon-admin', 'ssh', job['admin_action']]
+    else:
+        script = profile_root(job["profile"]) / "scripts" / job["script"]
+        interpreter = "/bin/bash" if script.suffix == ".sh" else str(home() / "venv/bin/python")
+        argv = [interpreter, str(script), *job.get('args', [])]
     started = time.time()
     process = None
     old_handlers = {}
@@ -64,7 +68,7 @@ def run(job_id: str) -> int:
         old_handlers[signum] = signal.signal(signum, interrupted)
     stdout, stderr, status, detail = "", "", "ok", ""
     try:
-        process = subprocess.Popen([interpreter, str(script)], cwd=profile_root(job["profile"]), env=env,
+        process = subprocess.Popen(argv, cwd=profile_root(job["profile"]), env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
             stdout, stderr = process.communicate(timeout=job["timeout"])
@@ -77,15 +81,24 @@ def run(job_id: str) -> int:
                 stdout, stderr = process.communicate()
             raise RuntimeError("任务执行超时")
         result = json.loads(result_file.read_text()) if result_file.exists() else {}
+        detail = redact(result.get('detail', ''))
         if process.returncode != 0 or result.get("status") == "failed":
             status = "failed"
             detail = result.get("detail") or redact(stderr[-1200:] or stdout[-1200:] or f"exit {process.returncode}")
+        if job.get('admin_action'):
+            if status == 'ok':
+                result = json.loads(stdout)
+                detail = json.dumps(result, ensure_ascii=False)
+                if box.get('failed:' + job_id, False):
+                    box.enqueue(profile=job['profile'], job_id=job_id, kind='text', payload={'text': job['name'] + '已恢复'},
+                                key='recovery:' + run_id, run_id=run_id)
+                box.put('failed:' + job_id, False)
         if not silent(stdout) and job.get("deliver") and not box.run_events(run_id, "text"):
             box.enqueue(profile=job["profile"], job_id=job_id, kind="text", payload={"text": stdout.strip()}, key=text_key(stdout.strip(), job_id), run_id=run_id)
-        if status == "failed" and job.get("failure_notify", True) and not box.run_events(run_id, "text"):
+        if status == "failed" and job.get("failure_notify", True) and not box.run_events(run_id, "text") and not (job.get('admin_action') and box.get('failed:' + job_id, False)):
             box.enqueue(profile=job["profile"], job_id=job_id, kind="text", payload={"text": f"{job['name']}失败\n{redact(detail)}"}, key=f"failure:{job_id}:{int(time.time()) // 21600}:{redact(detail)[:160]}", run_id=run_id)
         events = box.run_events(run_id)
-        if not events and status == "ok":
+        if not events and status == "ok" and not result.get('changed'):
             status = "no_change"
         elif events:
             deadline = time.time() + 55
@@ -100,10 +113,12 @@ def run(job_id: str) -> int:
                 status, detail = "delivery_pending", "通知已保存，等待补发或核对回执"
     except Exception as exc:
         status, detail = "failed", redact(f"{type(exc).__name__}: {exc}")
-        if job.get("failure_notify", True):
+        if job.get("failure_notify", True) and not (job.get('admin_action') and box.get('failed:' + job_id, False)):
             box.enqueue(profile=job["profile"], job_id=job_id, kind="text", payload={"text": f"{job['name']}失败\n{detail}"},
                         key=f"failure:{job_id}:{int(time.time()) // 21600}:{detail[:160]}", run_id=run_id)
     finally:
+        if job.get('admin_action') and status == 'failed':
+            box.put('failed:' + job_id, True)
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
         if process is not None and process.poll() is None:
@@ -125,4 +140,6 @@ def run(job_id: str) -> int:
     print(json.dumps({"task": job_id, "status": status, "duration_seconds": round(time.time() - started, 1), "detail": detail, "notifications": {s: sum(r['status'] == s for r in box.run_events(run_id)) for s in ['delivered', 'pending', 'sending', 'uncertain', 'failed']}}, ensure_ascii=False))
     if stderr.strip():
         print(redact(stderr[-3000:]))
+    if stdout.strip() and not silent(stdout):
+        print(redact(stdout[-8000:]))
     return 0 if status in {"ok", "no_change"} else 1

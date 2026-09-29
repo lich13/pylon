@@ -22,7 +22,11 @@
     "script": "xianbao_retention_cleanup.sh",
     "schedule": "15 4 * * *",
     "deliver": false,
-    "timeout": 900
+    "timeout": 900,
+    "args": [
+      "--apply",
+      "--json"
+    ]
   },
   "93e1c037c069": {
     "name": "V2EX 监控",
@@ -100,5 +104,25 @@
     "deliver": false,
     "timeout": 1800,
     "failure_notify": false
+  },
+  "ssh-admin-sync": {
+    "name": "SSH 可信登录 IP 同步",
+    "profile": "webops",
+    "admin_action": "sync",
+    "schedule": "*/5 * * * *",
+    "monotonic": true,
+    "lock": "ssh-maintenance",
+    "deliver": false,
+    "timeout": 180
+  },
+  "ssh-beijing-refresh": {
+    "name": "SSH 北京 IP 段更新",
+    "profile": "webops",
+    "admin_action": "refresh",
+    "schedule": "20 4 3 * *",
+    "jitter": true,
+    "lock": "ssh-maintenance",
+    "deliver": false,
+    "timeout": 900
   }
 }

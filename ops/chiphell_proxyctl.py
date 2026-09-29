@@ -1,4 +1,4 @@
-#!/srv/pylon/venv/bin/python
+#!/srv/pylon/venv/bin/python -I
 from __future__ import annotations
 
 import argparse
@@ -31,7 +31,7 @@ CRON_ID = "63c6ab6c4af3"
 HERMES_PYTHON = "/srv/pylon/venv/bin/python"
 POLL_RECOVERY_TIMEOUT_SECONDS = 120
 
-sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, '/usr/local/lib/pylon')
 from chiphell_proxy_runtime import (  # noqa: E402
     CHIPHELL_FID,
     CHIPHELL_FORUM_URL,
@@ -79,10 +79,9 @@ def service_active() -> bool:
 
 
 def cron(action: str) -> None:
-    from pylon.dagu import suspend
     if action not in {"pause", "resume"}:
         raise ValueError("unsupported scheduler action")
-    suspend(CRON_ID, action == "pause")
+    run(['/usr/bin/systemctl', 'disable' if action == 'pause' else 'enable', '--now', f'pylon-job-{CRON_ID}.timer'])
 
 
 def command_status() -> int:
