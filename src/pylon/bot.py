@@ -10,6 +10,7 @@ import threading
 import time
 
 from .commands import authorized
+from .bot_menu import synchronize_background
 from . import scheduler
 from .config import home, profile_env, redact
 from .outbox import Outbox
@@ -124,6 +125,7 @@ def main():
     threads = [threading.Thread(target=poll, args=(box, p, stop), daemon=True) for p in ('default', 'webops')]
     threads.append(threading.Thread(target=commands, daemon=True))
     threads.append(threading.Thread(target=control, daemon=True))
+    threads.append(threading.Thread(target=synchronize_background, args=(stop,), daemon=True))
     for thread in threads:
         thread.start()
     with client() as http:

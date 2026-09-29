@@ -12,9 +12,15 @@ pylon outbox
 pylon ssh status|sync|refresh
 pylon ssh check IP
 pylon chiphell status|test|baseline|pause|resume|import-cookies
+pylon bot-menu sync
+pylon bot-menu check
 ```
 
-Telegram 支持 `/status`、`/run`、`/pause`、`/resume`、`/logs`、`/ssh`、`/chiphell`、`/gmail list|accept|ignore`，以及“增加监控 URL”“加监控 owner/repo”“移除监控→回复编号”。仅接受配置的本人私聊。Gmail 接受候选只修改后续清理规则。
+两个 Telegram 机器人提供相同的 21 项中文菜单。`/help` 查看全部入口，`/help 命令` 查看参数、示例和操作影响。菜单包含任务管理、通知队列、软件监控、Gmail 候选、Chiphell 和 SSH 维护；仅接受配置的本人私聊。
+
+原 `/ssh`、`/chiphell`、`/gmail list|accept|ignore` 及“增加监控 URL”“加监控 owner/repo”“移除监控→回复编号”继续可用。`/monitors` 只查看列表，`/remove_monitor` 开启编号移除。Gmail 接受候选只修改后续清理规则。
+
+机器人启动时后台核对默认、所有私聊和本人会话的默认/中文/英文菜单，统一使用中文，自动替换旧命令并设置菜单按钮。网络失败或限流按退避策略重试，不阻塞消息收发。`bot-menu check` 只读核对，不一致时退出码为 1；`bot-menu sync` 仅更新差异并读回确认。命令定义统一维护在 `src/pylon/command_catalog.py`。
 
 任务按北京时间执行，同任务禁止重叠；报价刷新与重试共用锁。手动运行报价绕过时段限制。通知先入队再推进状态，投递失败只补发；回执不确定不会自动标为成功或盲目重发。
 

@@ -33,7 +33,7 @@ def test_add_validates_saved_configuration_and_reports_failure(monkeypatch):
     run = Mock(side_effect=[result({'ok': True, 'added': True}), result({'ok': False})])
     monkeypatch.setattr(commands, 'run_monitor_json', run)
     text = commands.handle_add('owner/repo')
-    assert '已添加' in text and 'FAIL' in text
+    assert '已添加' in text and '配置校验：失败' in text
     assert run.call_args_list[0].args[0] == ['--add-monitor-url', 'owner/repo', '--json']
     assert run.call_args_list[1].args[0] == ['--validate-config', '--json']
 

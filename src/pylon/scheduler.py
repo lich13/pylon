@@ -12,6 +12,13 @@ ADMIN = "/usr/local/sbin/pylon-admin"
 CHIPHELL = "63c6ab6c4af3"
 
 
+class AdminError(RuntimeError):
+    def __init__(self, result):
+        self.returncode = result.returncode
+        self.stdout = redact(result.stdout)
+        super().__init__(redact(result.stderr or result.stdout)[-1600:])
+
+
 def unit(job_id: str, kind: str = "timer") -> str:
     if job_id not in jobs():
         raise ValueError("任务不存在")
@@ -21,7 +28,7 @@ def unit(job_id: str, kind: str = "timer") -> str:
 def admin(*args: str, timeout: int = 160) -> str:
     result = subprocess.run(["sudo", "-n", ADMIN, *args], capture_output=True, text=True, timeout=timeout)
     if result.returncode:
-        raise RuntimeError(redact(result.stderr or result.stdout)[-1600:])
+        raise AdminError(result)
     return result.stdout.strip()
 
 

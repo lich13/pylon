@@ -75,6 +75,16 @@ def handle_remove_list(source) -> str:
     return format_project_list(projects)
 
 
+def handle_list() -> str:
+    result = run_monitor_json(["--list-projects", "--json"])
+    if not is_success_result(result):
+        return f"列出监控失败：{short_error(result)}"
+    projects = result.data.get('projects')
+    if not isinstance(projects, list) or not projects:
+        return '当前没有监控项目'
+    return format_project_list(projects, remove=False)
+
+
 def handle_remove_number(source, number: str) -> str:
     pending = load_pending(PENDING_PATH)
     key = source_key(source)
@@ -135,7 +145,8 @@ def format_add_reply(result: CommandResult, validation: dict[str, Any] | None) -
     names = source_names(data)
     lines = [f"{status}: {names or '软件更新监控源'}"]
     if data.get("classification"):
-        lines.append(f"classification: {data['classification']}")
+        names = {'github_software': 'GitHub 软件', 'rss': 'RSS 订阅', 'website': '网站'}
+        lines.append('类型：' + names.get(data['classification'], str(data['classification'])))
     lines.append(validate_line(validation))
     return "\n".join(lines)
 
@@ -155,13 +166,13 @@ def format_remove_reply(result: CommandResult, validation: dict[str, Any] | None
 
     lines = [f"已移除监控: {name}"]
     if source_ids:
-        lines.append("source_ids: " + ", ".join(dict.fromkeys(source_ids)))
+        lines.append("监控源 ID：" + ", ".join(dict.fromkeys(source_ids)))
     lines.append(validate_line(validation))
     return "\n".join(lines)
 
 
-def format_project_list(projects: list[Any]) -> str:
-    lines = ["当前监控项目，回复数字移除:"]
+def format_project_list(projects: list[Any], *, remove: bool = True) -> str:
+    lines = ["当前监控项目，回复数字移除：" if remove else '当前监控项目：']
     for project in projects:
         if not isinstance(project, dict):
             continue
@@ -173,8 +184,8 @@ def format_project_list(projects: list[Any]) -> str:
 
 def validate_line(validation: dict[str, Any] | None) -> str:
     if not isinstance(validation, dict):
-        return "validate: 未运行"
-    return "validate: OK" if validation.get("ok") else "validate: FAIL"
+        return "配置校验：未运行"
+    return "配置校验：通过" if validation.get("ok") else "配置校验：失败"
 
 
 def source_names(data: dict[str, Any]) -> str:

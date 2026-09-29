@@ -23,7 +23,12 @@ def main():
     ssh.add_argument('address', nargs='?')
     chiphell = sub.add_parser('chiphell')
     chiphell.add_argument('action', choices=['status', 'test', 'baseline', 'pause', 'resume', 'import-cookies'])
+    bot_menu = sub.add_parser('bot-menu', help='同步或核对两个机器人的中文菜单')
+    bot_menu.add_argument('action', choices=['sync', 'check'])
     args = parser.parse_args()
+    if args.command == 'bot-menu':
+        from .bot_menu import run
+        return run(args.action)
     if args.command == 'execute':
         from .runner import run
         return run(args.job_id, args.trigger)
