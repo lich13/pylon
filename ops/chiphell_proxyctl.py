@@ -305,9 +305,8 @@ def _playwright_error_code(error: Exception) -> str | None:
 
 
 def validate_candidate_profile(cookies: list[dict[str, Any]]) -> dict[str, Any]:
-    import chiphell_fid26_monitor as base
-
-    base.playwright_env.ensure()
+    # Privileged validation must not import code from the writable profile.
+    os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/srv/pylon/playwright-browsers'
     from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
     CANDIDATE_PROFILE_DIR.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -340,7 +339,7 @@ def validate_candidate_profile(cookies: list[dict[str, Any]]) -> dict[str, Any]:
             fid_response = page.goto(CHIPHELL_FORUM_URL, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(800)
             fid_status = classify_page(page.locator("body").inner_text(timeout=5000), page.title())
-            rows = page.locator(base.THREAD_ROW_SELECTOR).count()
+            rows = page.locator('tbody[id^="normalthread_"]').count()
             context.close()
             context = None
     except (PlaywrightError, PlaywrightTimeoutError) as error:
