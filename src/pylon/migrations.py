@@ -39,7 +39,8 @@ def migrate_profile(root: Path) -> None:
     if env_file.exists():
         lines = []
         for line in env_file.read_text().splitlines():
-            if line.strip().removeprefix('export ').startswith('XIANBAO_ALERT_SCRIPT='):
+            key = line.strip().removeprefix('export ').partition('=')[0].strip()
+            if key in {'XIANBAO_ALERT_SCRIPT', 'HERMES_HOME'}:
                 continue
             line = line.replace('xianbao-hermes-rules.json', 'xianbao-rules.json')
             line = line.replace(OLD_XIANBAO, NEW_XIANBAO)

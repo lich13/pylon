@@ -9,7 +9,8 @@ pylon pause 任务编号
 pylon resume 任务编号
 pylon logs 任务编号
 pylon outbox
-pylon ssh status|check|sync|refresh
+pylon ssh status|sync|refresh
+pylon ssh check IP
 pylon chiphell status|test|baseline|pause|resume|import-cookies
 ```
 
@@ -28,7 +29,7 @@ Telegram 支持 `/status`、`/run`、`/pause`、`/resume`、`/logs`、`/ssh`、`
 
 ## 安装与升级
 
-生产目录 `/srv/pylon`，Python 3.12，代码和虚拟环境由 root 持有，业务目录归 pylon。安装依赖与包：
+生产目录 `/srv/pylon`，Python 3.12，代码和虚拟环境由 root 持有，业务目录归 pylon。源码及虚拟环境不允许组或其他用户写入；从归档部署时使用 `tar --no-same-permissions`。安装依赖与包：
 
 ```sh
 python3 -m venv /srv/pylon/venv

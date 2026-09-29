@@ -40,11 +40,15 @@ def test_profile_rename_preserves_rule_bytes_and_refuses_conflict(tmp_path):
     old = folder / 'xianbao-hermes-rules.json'
     new = folder / 'xianbao-rules.json'
     old.write_bytes(original)
-    (folder / 'xianbao-filter.env').write_text('XIANBAO_RULES=/profiles/config/xianbao-hermes-rules.json\nKEEP=unchanged\n')
+    (folder / 'xianbao-filter.env').write_text(
+        'XIANBAO_RULES=/profiles/config/xianbao-hermes-rules.json\n'
+        'export HERMES_HOME=/old/profile\nXIANBAO_ALERT_SCRIPT=/old/alert.sh\nKEEP=unchanged\n')
     migrate_profile(tmp_path)
     migrate_profile(tmp_path)
     assert new.read_bytes() == original and not old.exists()
     assert 'KEEP=unchanged' in (folder / 'xianbao-filter.env').read_text()
+    assert 'HERMES_HOME' not in (folder / 'xianbao-filter.env').read_text()
+    assert 'XIANBAO_ALERT_SCRIPT' not in (folder / 'xianbao-filter.env').read_text()
     old.write_text('different')
     with pytest.raises(ValueError, match='different contents'):
         migrate_profile(tmp_path)
