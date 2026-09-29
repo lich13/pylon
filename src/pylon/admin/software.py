@@ -240,7 +240,7 @@ def inventory():
     }
     for key, argv in probes.items():
         try:
-            data['installed'][key] = {'version': version(capture(argv, timeout=8))}
+            data['installed'][key] = {'version': probe_version(key, capture(argv, timeout=8))}
         except Exception as exc:
             data['installed'][key] = {'error': redact(str(exc))[:160]}
     for key, container in [('sub2api', 'sub2api'), ('easy_proxies', 'easy_proxies')]:
@@ -259,6 +259,15 @@ def inventory():
     except Exception as exc:
         data['installed']['system-python'] = {'error': redact(str(exc))[:160]}
     return data
+
+
+def probe_version(target, output):
+    if target == 'openlist':
+        match = re.search(r'^Version:\s*(v?\d+\.\d+\.\d+)\s*$', output, re.MULTILINE)
+        if not match:
+            raise ValueError('OpenList 未返回应用 Version 字段')
+        return version(match.group(1))
+    return version(output)
 
 
 def main(args):

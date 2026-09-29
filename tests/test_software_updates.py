@@ -166,6 +166,13 @@ def test_process_check_ignores_browser_and_unrelated_services(tmp_path):
     assert admin.busy_processes('codex', tmp_path) == [23]
 
 
+def test_openlist_version_ignores_compiler_and_web_versions():
+    output = 'Built At: 2026-09-01\nGo Version: go1.27.0 linux/amd64\nVersion: v4.2.6\nWebVersion: v4.2.5\n'
+    assert admin.probe_version('openlist', output) == '4.2.6'
+    with pytest.raises(ValueError, match='应用 Version'):
+        admin.probe_version('openlist', 'Go Version: go1.27.0\nWebVersion: v4.2.5')
+
+
 def test_result_recovery_enqueues_once_before_ack(tmp_path, monkeypatch):
     box = Outbox(tmp_path / 'outbox.db')
     row = dict(id='run', request_id='one', profile='webops', target='codex', status='updated',
