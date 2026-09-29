@@ -68,8 +68,7 @@ def main():
         assert str(channel) == '-1001234567890'
         retained = {'TELEGRAM_BOT_TOKEN': env['TELEGRAM_BOT_TOKEN'], 'TELEGRAM_HOME_CHANNEL': str(channel)}
         if profile == 'webops':
-            retained['GROK_BIN'] = '/srv/pylon/bin/grok'
-            retained['GROK_HOME'] = '/srv/pylon/home/.grok'
+            retained['PYLON_GROK_MODEL'] = 'grok-4.7'
         target_env = target / '.env'
         target_env.write_text(''.join(f'{key}={value}\n' for key, value in retained.items()))
         target_env.chmod(0o640)

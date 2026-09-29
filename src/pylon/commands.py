@@ -54,6 +54,8 @@ def status_text() -> str:
     try:
         remote = request("GET", "/dags")
         paused = {row.get('dag', {}).get('name', row.get('fileName')): bool(row.get('suspended')) for row in remote.get('dags', [])}
+        if request("GET", "/services/scheduler/pause").get('paused'):
+            lines.append('全部定时任务已暂停')
     except Exception:
         paused = {}
     names = {"ok": "正常", "no_change": "无变化", "running": "运行中", "failed": "业务失败",

@@ -521,7 +521,8 @@ class SoftwareUpdateMonitorTests(unittest.TestCase):
 
         self.assertNotIn('api.github.com', script_text)
         self.assertNotIn('GITHUB_TOKEN', script_text)
-        self.assertNotIn('Authorization', script_text)
+        import inspect
+        self.assertNotIn('Authorization', inspect.getsource(self.monitor.fetch_url))
         self.assertNotIn('actions/checkout', script_text)
 
     def test_github_release_tag_only_page_stays_pending_without_seen(self):
@@ -1076,62 +1077,41 @@ class SoftwareUpdateMonitorTests(unittest.TestCase):
         self.assertEqual(translated, '你好')
         self.assertEqual(attempts['count'], 3)
 
-    def test_grok_polish_retries_three_times_and_deletes_each_session(self):
-        deleted = []
+    def grok_response(self, **values):
+        payload = {'summary': '- 修复了按钮。', 'translation': '修复了按钮。'} | values
+        return {'status': 'completed', 'output': [{'type': 'message', 'content': [
+            {'type': 'output_text', 'text': json.dumps(payload, ensure_ascii=False)}]}]}
 
-        def runner(command, **_kwargs):
-            self.assertIn('--session-id', command)
-            return mock.Mock(returncode=1, stdout='', stderr='boom')
+    def test_grok_polish_retries_three_times(self):
+        request = mock.Mock(side_effect=self.monitor.TranslationError('HTTP 503'))
+        with self.assertRaises(self.monitor.TranslationError):
+            self.monitor.polish_release_notes(source_name='Grok Build', title='1.0.41',
+                original='Fixed the button.', translated='修复了按钮。', request=request, sleep=lambda _: None)
+        self.assertEqual(request.call_count, 3)
 
-        def deleter(session_id):
-            deleted.append(session_id)
-
-        with mock.patch.object(self.monitor.time, 'sleep'), self.assertRaises(self.monitor.TranslationError):
-            self.monitor.polish_release_notes(
-                source_name='Grok Build',
-                title='1.0.41',
-                original='Fixed the button.',
-                translated='修复了按钮。',
-                runner=runner,
-                session_deleter=deleter,
-            )
-
-        self.assertEqual(len(deleted), 3)
-        self.assertEqual(len(set(deleted)), 3)
-
-    def test_grok_polish_returns_summary_and_deletes_thread(self):
-        deleted = []
-        payload = {
-            'text': json.dumps({'summary': '- 修复了按钮。', 'translation': '修复了按钮。'}, ensure_ascii=False),
-            'sessionId': 'returned-session',
-        }
-
-        def runner(command, **_kwargs):
-            self.assertEqual(command[0], 'grok')
-            self.assertIn('--sandbox', command)
-            self.assertIn('read-only', command)
-            self.assertIn('--permission-mode', command)
-            self.assertIn('dontAsk', command)
-            self.assertIn('--reasoning-effort', command)
-            self.assertIn('xhigh', command)
-            self.assertNotIn('low', command)
-            return mock.Mock(returncode=0, stdout=json.dumps(payload), stderr='')
-
-        def deleter(session_id):
-            deleted.append(session_id)
-
-        result = self.monitor.polish_release_notes(
-            source_name='Grok Build',
-            title='1.0.41',
-            original='Fixed the button.',
-            translated='修复了按钮。',
-            runner=runner,
-            session_deleter=deleter,
-        )
-
+    def test_grok_polish_preserves_structured_output_and_disables_tools_and_storage(self):
+        import httpx
+        seen = []
+        def handler(request):
+            seen.append(json.loads(request.content))
+            self.assertEqual(str(request.url), 'https://example.com/v1/responses')
+            event = {'type': 'response.completed', 'response': self.grok_response()}
+            return httpx.Response(200, text='data: ' + json.dumps(event) + '\n\n',
+                                  headers={'content-type': 'text/event-stream'})
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with mock.patch.object(self.monitor, 'read_env', return_value={
+                'GROK_MODELS_BASE_URL': 'https://example.com/v1', 'XAI_API_KEY': 'test-key'}), \
+             mock.patch.object(self.monitor.httpx, 'Client', return_value=client), \
+             mock.patch.dict(self.monitor.os.environ, {}, clear=True):
+            result = self.monitor.polish_release_notes(source_name='Grok Build', title='1.0.41',
+                original='Fixed the button.', translated='修复了按钮。')
         self.assertEqual(result['summary'], '- 修复了按钮。')
-        self.assertIn('returned-session', deleted)
-        self.assertGreaterEqual(len(deleted), 2)
+        self.assertEqual(seen[0]['model'], 'grok-4.7')
+        self.assertEqual(seen[0]['reasoning'], {'effort': 'xhigh'})
+        self.assertEqual(seen[0]['tools'], [])
+        self.assertFalse(seen[0]['store'])
+        self.assertTrue(seen[0]['stream'])
+        self.assertTrue(seen[0]['text']['format']['strict'])
 
     def test_grok_polish_prompt_limits_summary_and_keeps_terms(self):
         prompt = self.monitor.build_grok_polish_prompt('Grok Build', '1.0.41', 'Fixed `Ctrl+P`.', '修复了。')
@@ -1150,49 +1130,20 @@ class SoftwareUpdateMonitorTests(unittest.TestCase):
         self.assertEqual(notes, 'New Features\nAdded a button.')
 
     def test_grok_polish_omits_commit_dump(self):
-        seen = {}
-
-        def runner(command, **_kwargs):
-            seen['prompt'] = command[command.index('-p') + 1]
-            payload = {
-                'text': json.dumps({'summary': '- 修复了按钮。', 'translation': '修复了按钮。'}, ensure_ascii=False),
-                'sessionId': 'returned-session',
-            }
-            return mock.Mock(returncode=0, stdout=json.dumps(payload), stderr='')
-
-        self.monitor.polish_release_notes(
-            source_name='OpenAI Codex CLI Releases',
-            title='0.157.0',
+        request = mock.Mock(return_value=self.grok_response())
+        self.monitor.polish_release_notes(source_name='OpenAI Codex CLI Releases', title='0.157.0',
             original='New Features\nAdded a button.\n\nFull Changelog: a...b\n#47063 Do a thing',
-            translated='新功能\n添加了按钮。\n\nFull Changelog: a...b\n#47063 Do a thing',
-            runner=runner,
-            session_deleter=lambda _session_id: None,
-        )
+            translated='新功能\n添加了按钮。\n\nFull Changelog: a...b\n#47063 Do a thing', request=request)
+        prompt = request.call_args.args[0]
+        self.assertIn('Added a button.', prompt)
+        self.assertNotIn('Full Changelog', prompt)
+        self.assertNotIn('#47063', prompt)
 
-        self.assertIn('Added a button.', seen['prompt'])
-        self.assertNotIn('Full Changelog', seen['prompt'])
-        self.assertNotIn('#47063', seen['prompt'])
-
-    def test_grok_polish_timeout_stays_a_translation_error(self):
-        deleted = []
-
-        def runner(command, **_kwargs):
-            raise self.monitor.subprocess.TimeoutExpired(command, 90)
-
-        def deleter(session_id):
-            deleted.append(session_id)
-
-        with mock.patch.object(self.monitor.time, 'sleep'), self.assertRaises(self.monitor.TranslationError):
-            self.monitor.polish_release_notes(
-                source_name='OpenAI Codex CLI Releases',
-                title='0.157.0',
-                original='Added a button.',
-                translated='添加了按钮。',
-                runner=runner,
-                session_deleter=deleter,
-            )
-
-        self.assertEqual(len(deleted), 3)
+    def test_grok_polish_rejects_incomplete_or_empty_outputs(self):
+        for response in [{'status': 'incomplete', 'output': []}, self.grok_response(translation=''),
+                         self.grok_response(summary=['not a string'])]:
+            with self.subTest(response=response), self.assertRaises(self.monitor.TranslationError):
+                self.monitor.parse_grok_polish_output(response)
 
     def test_chinese_majority_text_skips_translation_models(self):
         self.assertTrue(self.monitor.chinese_text_is_majority('修复了若干问题，改进了启动速度。'))
@@ -1269,16 +1220,17 @@ class SoftwareUpdateMonitorTests(unittest.TestCase):
         self.assertIn('- 新增了按钮。', alert)
         self.assertNotIn('翻译暂不可用或不完整', alert)
 
-    def test_grok_session_delete_retries_three_times(self):
-        calls = {'count': 0}
-
-        def runner(_command, **_kwargs):
-            calls['count'] += 1
-            return mock.Mock(returncode=1, stdout='', stderr='temporary failure')
-
-        self.monitor.delete_grok_session('session-1', runner=runner, sleep=lambda _seconds: None)
-
-        self.assertEqual(calls['count'], 3)
+    def test_grok_timeout_stays_a_translation_error(self):
+        import httpx
+        def handler(request):
+            raise httpx.ReadTimeout('timeout', request=request)
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with mock.patch.object(self.monitor, 'read_env', return_value={
+                'GROK_MODELS_BASE_URL': 'https://example.com/v1', 'XAI_API_KEY': 'test-key'}), \
+             mock.patch.object(self.monitor.httpx, 'Client', return_value=client), \
+             mock.patch.dict(self.monitor.os.environ, {}, clear=True), \
+             self.assertRaises(self.monitor.TranslationError):
+            self.monitor.request_grok_polish('Fixed a button.')
 
     def test_load_sources_includes_custom_config_sources(self):
         self.monitor.save_json(self.monitor.CUSTOM_SOURCES_FILE, {
@@ -1831,6 +1783,7 @@ class SoftwareUpdateMonitorTests(unittest.TestCase):
             'source': {'id': 'grok_build_version'},
             'item': {'source_id': 'grok_build_version', 'id': 'version:1.0.40'},
         }
+        state['pending_events'] = [abandoned, kept]
         abandoned_path = self.monitor.ITEMS_DIR / 'abandoned.json'
         kept_path = self.monitor.ITEMS_DIR / 'kept.json'
         abandoned_path.write_text(json.dumps(abandoned), encoding='utf-8')
@@ -1841,6 +1794,7 @@ class SoftwareUpdateMonitorTests(unittest.TestCase):
         self.assertEqual(pruned['removed_state'], 1)
         self.assertEqual(pruned['removed_items'], 1)
         self.assertEqual(list(state['sources']), ['grok_build_version'])
+        self.assertEqual(state['pending_events'], [kept])
         self.assertFalse(abandoned_path.exists())
         self.assertTrue(kept_path.exists())
 

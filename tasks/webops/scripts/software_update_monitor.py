@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from pylon import events as notification_events
+from pylon.config import read_env
 import fcntl
 import hashlib
 import html
@@ -15,7 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
+import httpx
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -45,7 +46,6 @@ TRANSLATION_MAX_ATTEMPTS = 3
 TRANSLATE_RETRY_SLEEP_SECONDS = 0.5
 GROK_POLISH_TIMEOUT_SECONDS = 300
 GROK_POLISH_INPUT_CHARS = 2400
-GROK_POLISH_CWD = Path('/tmp/webops-software-update-translate')
 GROK_ENDPOINT_ENV = Path(os.environ.get('PYLON_GROK_ENV', '/srv/pylon/secrets/grok.env'))
 GROK_POLISH_SCHEMA = json.dumps({
     'type': 'object',
@@ -1282,6 +1282,9 @@ def active_source_ids(sources: list[dict[str, Any]] | None = None) -> set[str]:
 
 def prune_inactive_source_runtime(state: dict[str, Any], *, active_ids: set[str]) -> dict[str, int]:
     sources = state.setdefault('sources', {})
+    if 'pending_events' in state:
+        state['pending_events'] = [event for event in state['pending_events']
+                                   if event.get('source', {}).get('id') in active_ids]
     removed_state = 0
     for source_id in list(sources):
         if source_id not in active_ids:
@@ -2076,24 +2079,44 @@ def translate_readable_document(translator: DeepLWebTranslator, text: str) -> tu
     return '\n'.join(rendered).strip(), ok_all
 
 
-def grok_command_prefix() -> list[str]:
-    binary = os.environ.get('GROK_BIN', '').strip() or 'grok'
-    return [binary]
-
-
-def grok_subprocess_env() -> dict[str, str]:
-    env = os.environ.copy()
-    if env.get('XAI_API_KEY') or not GROK_ENDPOINT_ENV.exists():
-        return env
-    for raw_line in GROK_ENDPOINT_ENV.read_text(encoding='utf-8', errors='replace').splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith('#') or '=' not in line:
-            continue
-        if line.startswith('export '):
-            line = line[len('export '):]
-        key, value = line.split('=', 1)
-        env.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-    return env
+def request_grok_polish(prompt: str) -> dict[str, Any]:
+    env = read_env(GROK_ENDPOINT_ENV) | os.environ.copy()
+    base = env.get('GROK_MODELS_BASE_URL', '').rstrip('/')
+    key = env.get('XAI_API_KEY', '')
+    if not base or not key:
+        raise TranslationError('Grok API configuration is missing')
+    payload = {
+        'model': env.get('PYLON_GROK_MODEL', 'grok-4.7'),
+        'input': [{'role': 'user', 'content': prompt}],
+        'reasoning': {'effort': 'xhigh'},
+        'text': {'format': {'type': 'json_schema', 'name': 'release_notes',
+                            'strict': True, 'schema': json.loads(GROK_POLISH_SCHEMA)}},
+        'store': False,
+        'tools': [],
+        'stream': True,
+    }
+    try:
+        with httpx.Client(timeout=GROK_POLISH_TIMEOUT_SECONDS, trust_env=False) as client:
+            with client.stream('POST', base + '/responses', headers={'Authorization': 'Bearer ' + key}, json=payload) as response:
+                if response.status_code != 200:
+                    raise TranslationError(f'Grok polish HTTP {response.status_code}')
+                data_lines = []
+                for line in response.iter_lines():
+                    if line.startswith('data:'):
+                        data_lines.append(line[5:].lstrip())
+                    elif not line and data_lines:
+                        data = '\n'.join(data_lines)
+                        data_lines = []
+                        if data == '[DONE]':
+                            continue
+                        event = json.loads(data)
+                        if event.get('type') == 'response.completed':
+                            return event['response']
+                        if event.get('type') in {'response.failed', 'response.incomplete', 'error'}:
+                            raise TranslationError('Grok polish stream failed')
+                raise TranslationError('Grok polish stream ended before completion')
+    except (httpx.HTTPError, ValueError) as exc:
+        raise TranslationError(f'Grok polish request failed: {type(exc).__name__}') from exc
 
 
 def build_grok_polish_prompt(source_name: str, title: str, original: str, translated: str) -> str:
@@ -2116,75 +2139,21 @@ def build_grok_polish_prompt(source_name: str, title: str, original: str, transl
     ])
 
 
-def build_grok_polish_command(session_id: str, prompt: str) -> list[str]:
-    return [
-        *grok_command_prefix(),
-        '--cwd', str(GROK_POLISH_CWD),
-        '--session-id', session_id,
-        '-p', prompt,
-        '--output-format', 'json',
-        '--json-schema', GROK_POLISH_SCHEMA,
-        '--max-turns', '1',
-        '--no-plan',
-        '--no-subagents',
-        '--disable-web-search',
-        '--sandbox', 'read-only',
-        '--permission-mode', 'dontAsk',
-        '--reasoning-effort', 'xhigh',
-    ]
-
-
-def parse_grok_polish_output(stdout: str) -> tuple[dict[str, str], str]:
-    try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise TranslationError(f'Grok polish returned non-JSON output: {stdout[:300]}') from exc
-    if not isinstance(data, dict):
+def parse_grok_polish_output(data: dict[str, Any]) -> dict[str, str]:
+    if not isinstance(data, dict) or data.get('status') != 'completed':
         raise TranslationError('Grok polish returned an unexpected payload')
-    session_id = str(data.get('sessionId') or '')
-    text = data.get('text')
-    payload = text if isinstance(text, dict) else None
-    if payload is None:
-        raw = str(text or '').strip()
-        raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw, flags=re.I).strip()
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise TranslationError(f'Grok polish text is not JSON: {raw[:300]}') from exc
+    text = ''.join(block.get('text', '') for item in data.get('output', []) if item.get('type') == 'message'
+                   for block in item.get('content', []) if block.get('type') == 'output_text')
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise TranslationError('Grok polish text is not JSON') from exc
     if not isinstance(payload, dict):
         raise TranslationError('Grok polish text is not an object')
-    summary = str(payload.get('summary') or '').strip()
-    translation = str(payload.get('translation') or '').strip()
-    if not summary or not translation:
+    summary, translation = payload.get('summary'), payload.get('translation')
+    if not isinstance(summary, str) or not isinstance(translation, str) or not summary.strip() or not translation.strip():
         raise TranslationError('Grok polish response missing summary or translation')
-    return {'summary': summary, 'translation': translation}, session_id
-
-
-def delete_grok_session(session_id: str, *, runner: Any | None = None, sleep=time.sleep) -> None:
-    if not session_id:
-        return
-    command = [*grok_command_prefix(), '--cwd', str(GROK_POLISH_CWD), 'sessions', 'delete', session_id]
-    run = runner or subprocess.run
-    for attempt in range(TRANSLATION_MAX_ATTEMPTS):
-        try:
-            completed = run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=20,
-                env=grok_subprocess_env(),
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            completed = None
-        else:
-            if getattr(completed, 'returncode', 1) == 0:
-                return
-            detail = (getattr(completed, 'stderr', '') or getattr(completed, 'stdout', '') or '').lower()
-            if any(token in detail for token in ('not found', 'no session', 'does not exist', '不存在')):
-                return
-        if attempt + 1 < TRANSLATION_MAX_ATTEMPTS:
-            sleep(TRANSLATE_RETRY_SLEEP_SECONDS * (attempt + 1))
+    return {'summary': summary.strip(), 'translation': translation.strip()}
 
 
 def release_notes_for_polish(text: str, *, limit: int = GROK_POLISH_INPUT_CHARS) -> str:
@@ -2221,8 +2190,7 @@ def polish_release_notes(
     title: str,
     original: str,
     translated: str,
-    runner: Any | None = None,
-    session_deleter: Any | None = None,
+    request: Any | None = None,
     sleep=time.sleep,
 ) -> dict[str, str]:
     prompt = build_grok_polish_prompt(
@@ -2231,39 +2199,13 @@ def polish_release_notes(
         release_notes_for_polish(original),
         release_notes_for_polish(translated),
     )
-    GROK_POLISH_CWD.mkdir(parents=True, exist_ok=True)
-    run = runner or subprocess.run
-    delete = session_deleter or delete_grok_session
+    send = request or request_grok_polish
     last_error: Exception | None = None
     for attempt in range(TRANSLATION_MAX_ATTEMPTS):
-        session_id = str(uuid.uuid4())
-        returned_session_id = ''
         try:
-            completed = run(
-                build_grok_polish_command(session_id, prompt),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=GROK_POLISH_TIMEOUT_SECONDS,
-                env=grok_subprocess_env(),
-            )
-            if getattr(completed, 'returncode', 1) != 0:
-                detail = (getattr(completed, 'stderr', '') or getattr(completed, 'stdout', '') or '').strip()
-                raise TranslationError(f'Grok polish exited {completed.returncode}: {detail[:300]}')
-            parsed, returned_session_id = parse_grok_polish_output(getattr(completed, 'stdout', '') or '')
-            return parsed
+            return parse_grok_polish_output(send(prompt))
         except (TranslationError, subprocess.TimeoutExpired, OSError) as exc:
             last_error = exc
-        finally:
-            seen_ids: list[str] = []
-            for candidate in (session_id, returned_session_id):
-                if not candidate or candidate in seen_ids:
-                    continue
-                seen_ids.append(candidate)
-                try:
-                    delete(candidate)
-                except Exception:
-                    pass
         if attempt + 1 < TRANSLATION_MAX_ATTEMPTS:
             sleep(TRANSLATE_RETRY_SLEEP_SECONDS * (attempt + 1))
     if isinstance(last_error, TranslationError):

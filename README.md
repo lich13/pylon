@@ -2,6 +2,8 @@
 
 Dagu 2.18.0 调度现有 Python 任务，独立服务负责 Telegram 固定命令和持久化通知。生产入口：https://example.com/pylon/
 
+软件更新继续使用 DeepL 翻译和 Grok 4.7 润色；Grok 通过原端点直接请求结构化输出，不运行 CLI Agent。
+
 ## 运行
 
 - `/srv/pylon/venv/bin/pylon status`：最近执行结果、待发及不确定回执。
