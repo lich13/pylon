@@ -36,3 +36,16 @@ def test_panel_pause_also_stops_chiphell_poller(monkeypatch):
     monkeypatch.setattr(bot.subprocess, 'run', lambda args, **kwargs: calls.append(args) or SimpleNamespace(returncode=0))
     bot.synchronize_chiphell()
     assert calls[-1] == ['sudo','-n','/usr/bin/systemctl','stop','chiphell-fid26-poller.service']
+
+
+def test_cookie_import_prevents_controller_starting_poller(tmp_path, monkeypatch):
+    from pylon import bot
+    monkeypatch.setenv('PYLON_HOME', str(tmp_path))
+    journal = tmp_path / 'profiles/webops/data/chiphell_fid26/.cookie-import-transaction.json'
+    journal.parent.mkdir(parents=True)
+    journal.write_text('{"stage":"VALIDATING"}')
+    def unexpected(*args, **kwargs):
+        raise AssertionError('controller must leave the importer in control')
+    monkeypatch.setattr(bot, 'request', unexpected)
+    monkeypatch.setattr(bot.subprocess, 'run', unexpected)
+    bot.synchronize_chiphell()

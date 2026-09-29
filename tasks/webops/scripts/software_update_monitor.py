@@ -2110,8 +2110,10 @@ def request_grok_polish(prompt: str) -> dict[str, Any]:
                         if data == '[DONE]':
                             continue
                         event = json.loads(data)
+                        if not isinstance(event, dict):
+                            raise TranslationError('Grok polish stream returned an invalid event')
                         if event.get('type') == 'response.completed':
-                            return event['response']
+                            return event.get('response')
                         if event.get('type') in {'response.failed', 'response.incomplete', 'error'}:
                             raise TranslationError('Grok polish stream failed')
                 raise TranslationError('Grok polish stream ended before completion')
@@ -2142,8 +2144,26 @@ def build_grok_polish_prompt(source_name: str, title: str, original: str, transl
 def parse_grok_polish_output(data: dict[str, Any]) -> dict[str, str]:
     if not isinstance(data, dict) or data.get('status') != 'completed':
         raise TranslationError('Grok polish returned an unexpected payload')
-    text = ''.join(block.get('text', '') for item in data.get('output', []) if item.get('type') == 'message'
-                   for block in item.get('content', []) if block.get('type') == 'output_text')
+    parts = []
+    output = data.get('output')
+    if not isinstance(output, list):
+        raise TranslationError('Grok polish returned an unexpected output')
+    for item in output:
+        if not isinstance(item, dict):
+            raise TranslationError('Grok polish returned an invalid message')
+        if item.get('type') != 'message':
+            continue
+        content = item.get('content')
+        if not isinstance(content, list):
+            raise TranslationError('Grok polish returned an invalid content block')
+        for block in content:
+            if not isinstance(block, dict):
+                raise TranslationError('Grok polish returned an invalid content block')
+            if block.get('type') == 'output_text':
+                if not isinstance(block.get('text'), str):
+                    raise TranslationError('Grok polish returned invalid text')
+                parts.append(block['text'])
+    text = ''.join(parts)
     try:
         payload = json.loads(text)
     except (json.JSONDecodeError, TypeError) as exc:

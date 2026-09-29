@@ -84,6 +84,10 @@ def recover(box: Outbox):
 
 
 def synchronize_chiphell():
+    # Cookie import stops and swaps the browser profile transactionally.
+    # Leave recovery to the privileged importer while its journal exists.
+    if (home() / 'profiles/webops/data/chiphell_fid26/.cookie-import-transaction.json').exists():
+        return
     task = request('GET', '/dags/63c6ab6c4af3')
     scheduler = request('GET', '/services/scheduler/pause')
     paused = bool(task.get('suspended') or scheduler.get('paused'))

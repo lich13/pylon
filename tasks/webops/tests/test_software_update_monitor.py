@@ -1141,7 +1141,9 @@ class SoftwareUpdateMonitorTests(unittest.TestCase):
 
     def test_grok_polish_rejects_incomplete_or_empty_outputs(self):
         for response in [{'status': 'incomplete', 'output': []}, self.grok_response(translation=''),
-                         self.grok_response(summary=['not a string'])]:
+                         self.grok_response(summary=['not a string']),
+                         {'status': 'completed', 'output': None},
+                         {'status': 'completed', 'output': [{'type': 'message', 'content': None}]}]:
             with self.subTest(response=response), self.assertRaises(self.monitor.TranslationError):
                 self.monitor.parse_grok_polish_output(response)
 
