@@ -115,6 +115,24 @@ def test_chunking_preserves_text_emoji_and_link():
     assert links == ['https://example.com/']
 
 
+def test_monitor_removal_numbers_survive_telegram_formatting():
+    message = '当前监控项目，回复数字移除:\n' + '\n'.join(
+        f'{number}. 监控项目 {number}' for number in range(1, 11)
+    )
+    rendered = ''.join(transport.telegram_chunks(message))
+    for number in range(1, 11):
+        assert f'{number}. 监控项目 {number}' in rendered
+    assert '•' not in rendered
+
+
+def test_ordered_list_start_and_nested_bullets():
+    rendered = ''.join(transport.telegram_chunks('7. 外层\n   - 子项\n8. 次项\n\n- 普通项目'))
+    assert '7. 外层' in rendered
+    assert '  • 子项' in rendered
+    assert '8. 次项' in rendered
+    assert '• 普通项目' in rendered
+
+
 @pytest.mark.parametrize('text', ['', ' ', '[SILENT]', '{"wakeAgent":false}', 'NO_REPLY'])
 def test_silent_outputs(text):
     assert silent(text)

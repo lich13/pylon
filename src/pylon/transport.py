@@ -64,8 +64,29 @@ class SplitHTML(HTMLParser):
 
 def telegram_chunks(text: str) -> list[str]:
     md = MarkdownIt("commonmark", {"html": False, "breaks": True})
-    for key, value in {"softbreak": "\n", "hardbreak": "\n", "paragraph_open": "", "paragraph_close": "\n", "heading_open": "<b>", "heading_close": "</b>\n", "bullet_list_open": "", "bullet_list_close": "\n", "ordered_list_open": "", "ordered_list_close": "\n", "list_item_open": "• ", "list_item_close": "\n", "hr": "\n"}.items():
+    lists: list[int | None] = []
+
+    def list_open(tokens, idx, options, env):
+        token = tokens[idx]
+        lists.append(int(token.attrGet("start") or 1) if token.type == "ordered_list_open" else None)
+        return ""
+
+    def list_close(tokens, idx, options, env):
+        lists.pop()
+        return "\n"
+
+    def list_item_open(tokens, idx, options, env):
+        number = lists[-1]
+        if number is not None:
+            lists[-1] = number + 1
+        return "  " * (len(lists) - 1) + (f"{number}. " if number is not None else "• ")
+
+    for key, value in {"softbreak": "\n", "hardbreak": "\n", "paragraph_open": "", "paragraph_close": "\n", "heading_open": "<b>", "heading_close": "</b>\n", "list_item_close": "\n", "hr": "\n"}.items():
         md.renderer.rules[key] = lambda tokens, idx, options, env, v=value: v
+    for kind in ("bullet", "ordered"):
+        md.renderer.rules[f"{kind}_list_open"] = list_open
+        md.renderer.rules[f"{kind}_list_close"] = list_close
+    md.renderer.rules["list_item_open"] = list_item_open
     md.renderer.rules["fence"] = lambda tokens, idx, options, env: "<pre>" + html.escape(tokens[idx].content) + "</pre>\n"
     md.renderer.rules["code_block"] = md.renderer.rules["fence"]
     splitter = SplitHTML()
