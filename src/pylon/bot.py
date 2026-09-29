@@ -96,6 +96,9 @@ def synchronize_chiphell():
 
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    # Telegram and Bark put credentials in their request URLs.
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
     (home() / 'run').mkdir(parents=True, exist_ok=True)
     lock = (home() / 'run/daemon.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
