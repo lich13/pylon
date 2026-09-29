@@ -28,15 +28,13 @@ print('[SILENT]')
     assert 'upstream unavailable' in capsys.readouterr().out
 
 
-def test_native_pause_also_stops_chiphell_poller(monkeypatch):
+def test_controller_uses_atomic_reconcile_without_writing_timer_state(monkeypatch):
     from pylon import bot
     from types import SimpleNamespace
     calls=[]
-    monkeypatch.setattr(bot.scheduler, 'paused', lambda job: True)
-    monkeypatch.setattr(bot.scheduler, 'suspend', lambda job, paused: calls.append((job, paused)))
-    monkeypatch.setattr(bot.subprocess, 'run', lambda args, **kwargs: calls.append(args) or SimpleNamespace(returncode=0))
+    monkeypatch.setattr(bot.scheduler, 'admin', lambda action: calls.append(action))
     bot.synchronize_chiphell()
-    assert calls[-1] == ('63c6ab6c4af3', True)
+    assert calls == ['chiphell-reconcile']
 
 
 def test_cookie_import_prevents_controller_starting_poller(tmp_path, monkeypatch):
@@ -47,6 +45,6 @@ def test_cookie_import_prevents_controller_starting_poller(tmp_path, monkeypatch
     journal.write_text('{"stage":"VALIDATING"}')
     def unexpected(*args, **kwargs):
         raise AssertionError('controller must leave the importer in control')
-    monkeypatch.setattr(bot.scheduler, 'paused', unexpected)
+    monkeypatch.setattr(bot.scheduler, 'admin', unexpected)
     monkeypatch.setattr(bot.subprocess, 'run', unexpected)
     bot.synchronize_chiphell()

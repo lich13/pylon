@@ -88,12 +88,7 @@ def synchronize_chiphell():
     # Leave recovery to the privileged importer while its journal exists.
     if (home() / 'profiles/webops/data/chiphell_fid26/.cookie-import-transaction.json').exists():
         return
-    paused = scheduler.paused('63c6ab6c4af3')
-    active = subprocess.run(['systemctl', 'is-active', '--quiet', 'chiphell-fid26-poller.service']).returncode == 0
-    if paused and active:
-        scheduler.suspend('63c6ab6c4af3', True)
-    elif not paused and not active:
-        scheduler.suspend('63c6ab6c4af3', False)
+    scheduler.admin('chiphell-reconcile')
 
 
 def main():

@@ -49,6 +49,28 @@ class CookieImportTransactionTests(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
+    def test_reconcile_reads_current_timer_without_changing_it(self):
+        with mock.patch.object(control, 'run', return_value=SimpleNamespace(returncode=0)) as run, \
+                mock.patch.object(control, 'service_active', return_value=False), \
+                mock.patch.object(control, 'ensure_resume_ready'), \
+                mock.patch.object(control, 'cron') as cron:
+            control.command_reconcile()
+        cron.assert_not_called()
+        self.assertEqual(run.call_args_list[-1].args[0], ['systemctl', 'start', control.SERVICE])
+
+    def test_reconcile_does_not_interrupt_cookie_import(self):
+        with control.cookie_import_lock(), mock.patch.object(control, 'run') as run:
+            self.assertEqual(control.command_reconcile(), 0)
+        run.assert_not_called()
+
+    def test_resume_sets_desired_timer_before_starting_poller(self):
+        calls = []
+        with mock.patch.object(control, 'run', side_effect=lambda args: calls.append(args)), \
+                mock.patch.object(control, 'ensure_resume_ready'), \
+                mock.patch.object(control, 'cron', side_effect=lambda action: calls.append(action)):
+            control.command_resume()
+        self.assertEqual(calls, ['resume', ['systemctl', 'start', control.SERVICE]])
+
     def test_transaction_state_is_mode_0600_and_contains_no_cookie_payload(self):
         control.write_import_transaction(was_active=True, stage="PREPARE", started_at=123)
         transaction = self.paths["IMPORT_TRANSACTION_PATH"]

@@ -23,6 +23,9 @@ def main(args=None):
     args = list(sys.argv[1:] if args is None else args)
     if os.geteuid() != 0:
         raise PermissionError('root required')
+    if args == ['chiphell-reconcile']:
+        command(['/usr/local/sbin/chiphell-proxyctl', 'reconcile'], capture_output=True)
+        return 0
     if args and args[0] == 'ssh':
         if len(args) < 2 or args[1] not in {'status', 'check', 'sync', 'refresh'}:
             raise ValueError('unsupported SSH action')

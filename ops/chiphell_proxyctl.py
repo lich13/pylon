@@ -102,8 +102,9 @@ def command_test() -> int:
 
 
 def command_pause() -> int:
-    cron("pause")
-    run(["systemctl", "stop", SERVICE])
+    with cookie_import_lock():
+        cron("pause")
+        run(["systemctl", "stop", SERVICE])
     print("CHIPHELL_PAUSED")
     return 0
 
@@ -120,12 +121,35 @@ def command_baseline() -> int:
 
 
 def command_resume() -> int:
-    health = json.loads(HEALTH_PATH.read_text()) if HEALTH_PATH.exists() else {}
-    state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
-    ensure_resume_ready(health, state)
-    run(["systemctl", "start", SERVICE])
-    cron("resume")
+    with cookie_import_lock():
+        health = json.loads(HEALTH_PATH.read_text()) if HEALTH_PATH.exists() else {}
+        state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
+        ensure_resume_ready(health, state)
+        cron("resume")
+        run(["systemctl", "start", SERVICE])
     print("CHIPHELL_RESUMED")
+    return 0
+
+
+def command_reconcile() -> int:
+    # Read desired state under the same lock as explicit pause/resume/import.
+    # Reconciliation changes only the poller, never the user's timer state.
+    try:
+        with cookie_import_lock():
+            if IMPORT_TRANSACTION_PATH.exists():
+                return 0
+            paused = run(['systemctl', 'is-active', '--quiet', f'pylon-job-{CRON_ID}.timer'], check=False).returncode != 0
+            active = service_active()
+            if paused and active:
+                run(['systemctl', 'stop', SERVICE])
+            elif not paused and not active:
+                health = json.loads(HEALTH_PATH.read_text()) if HEALTH_PATH.exists() else {}
+                state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
+                ensure_resume_ready(health, state)
+                run(['systemctl', 'start', SERVICE])
+    except CookieImportFailure as exc:
+        if 'status=BUSY' not in exc.render():
+            raise
     return 0
 
 
@@ -501,7 +525,7 @@ def command_import_cookies() -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["status", "test", "baseline", "pause", "resume", "import-cookies"])
+    parser.add_argument("command", choices=["status", "test", "baseline", "pause", "resume", "reconcile", "import-cookies"])
     return parser
 
 
@@ -513,6 +537,7 @@ def main(argv: list[str] | None = None) -> int:
         "baseline": command_baseline,
         "pause": command_pause,
         "resume": command_resume,
+        "reconcile": command_reconcile,
         "import-cookies": command_import_cookies,
     }
     return handlers[command]()
