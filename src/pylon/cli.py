@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import subprocess
 
 from .outbox import Outbox
 
@@ -20,6 +21,8 @@ def main():
     ssh = sub.add_parser('ssh')
     ssh.add_argument('action', choices=['status', 'check', 'sync', 'refresh'], default='status', nargs='?')
     ssh.add_argument('address', nargs='?')
+    chiphell = sub.add_parser('chiphell')
+    chiphell.add_argument('action', choices=['status', 'test', 'baseline', 'pause', 'resume', 'import-cookies'])
     args = parser.parse_args()
     if args.command == 'execute':
         from .runner import run
@@ -27,6 +30,8 @@ def main():
     if args.command == 'daemon':
         from .bot import main as serve
         return serve()
+    if args.command == 'chiphell':
+        return subprocess.run(['sudo', '-n', '/usr/local/sbin/pylon-admin', 'chiphell', args.action]).returncode
     from . import scheduler
     from .commands import control_task, resolve_job, status_text
     if args.command in {'pause', 'resume'}:

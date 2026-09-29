@@ -12,15 +12,8 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tasks/webops/scripts"))
 
-spec = importlib.util.spec_from_file_location(
-    "chiphell_proxyctl_for_tests",
-    ROOT / "ops" / "chiphell_proxyctl.py",
-)
-control = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(control)
+from pylon.admin import chiphell as control
 
 
 def write_marker(directory: Path, value: str) -> None:

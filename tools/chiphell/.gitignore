@@ -1,0 +1,7 @@
+artifacts/
+*.tar
+*.tar.sha256
+*.log
+.DS_Store
+__pycache__/
+*.pyc

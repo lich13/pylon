@@ -8,7 +8,7 @@ def test_failed_business_result_with_zero_exit_and_repeat_run_id(tmp_path, monke
     monkeypatch.setenv('PYLON_HOME', str(tmp_path))
     monkeypatch.setenv('PYLON_OUTBOX', str(tmp_path / 'data/outbox.sqlite3'))
     monkeypatch.setenv('INVOCATION_ID', 'same-scheduled-run')
-    scripts = tmp_path / 'profiles/default/scripts'
+    scripts = tmp_path / 'profiles/default'
     scripts.mkdir(parents=True)
     binary = tmp_path / 'venv/bin'
     binary.mkdir(parents=True)
@@ -20,11 +20,11 @@ p.write_text(str(int(p.read_text())+1) if p.exists() else '1')
 Path(os.environ['PYLON_RESULT_FILE']).write_text(json.dumps({'status':'failed','detail':'upstream unavailable'}))
 print('[SILENT]')
 ''')
-    (tmp_path / 'jobs.json').write_text(json.dumps({'test': {'profile':'default','script':'task.py','timeout':10,
+    (tmp_path / 'jobs.json').write_text(json.dumps({'test': {'profile':'default','module':'task','timeout':10,
         'deliver':True,'name':'test','failure_notify':False}}))
     assert run('test') == 1
     assert run('test') == 1
-    assert (scripts.parent / 'business-count').read_text() == '1'
+    assert (scripts / 'business-count').read_text() == '1'
     assert 'upstream unavailable' in capsys.readouterr().out
 
 

@@ -40,7 +40,7 @@ def text_key(text: str, job_id: str) -> str:
     # reminders may intentionally have the same body on different days/slots.
     if job_id == "b5d6e708bf6e":
         suffix = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
-    elif job_id in {"f3ec3ec24210", "e961da51fe69", "manual", "xianbao-hermes-poll"}:
+    elif job_id in {"f3ec3ec24210", "e961da51fe69", "manual", "xianbao-poll"}:
         suffix = str(int(time.time()) // 300)
     else:
         suffix = ""
@@ -91,9 +91,6 @@ def defer_json(path: Path, value) -> bool:
 
 def flush_deferred():
     for path, value in _deferred.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_suffix(path.suffix + ".pylon-tmp")
-        temp.write_text(json.dumps(value, ensure_ascii=False, indent=2))
-        os.chmod(temp, 0o600)
-        os.replace(temp, path)
+        from .shared.state_json import save_atomic
+        save_atomic(path, value)
     _deferred.clear()

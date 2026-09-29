@@ -18,11 +18,12 @@ def task_environment(profile: str) -> dict[str, str]:
     env = os.environ.copy()
     env.update(profile_env(profile))
     root = profile_root(profile)
-    env.update(PYLON_PROFILE=profile, PYLON_PROFILE_ROOT=str(root), HERMES_HOME=str(root),
+    env.update(PYLON_PROFILE=profile, PYLON_PROFILE_ROOT=str(root),
                PYLON_HOME=str(home()), HOME=str(home() / "home"),
-               PYTHONPATH=os.pathsep.join([str(home() / "src"), str(root), str(root / "scripts")]),
                PLAYWRIGHT_BROWSERS_PATH=str(home() / "playwright-browsers"),
                PYTHONUNBUFFERED="1", TZ="Asia/Shanghai")
+    env.pop("PYTHONPATH", None)
+    env.pop("HERMES_HOME", None)
     env["PATH"] = str(home() / "venv/bin") + ":/usr/local/bin:/usr/bin:/bin"
     return env
 
@@ -54,9 +55,7 @@ def run(job_id: str, trigger: str = "scheduled") -> int:
     if job.get('admin_action'):
         argv = ['sudo', '-n', '/usr/local/sbin/pylon-admin', 'ssh', job['admin_action']]
     else:
-        script = profile_root(job["profile"]) / "scripts" / job["script"]
-        interpreter = "/bin/bash" if script.suffix == ".sh" else str(home() / "venv/bin/python")
-        argv = [interpreter, str(script), *job.get('args', [])]
+        argv = [str(home() / "venv/bin/python"), "-m", job["module"], *job.get("args", [])]
     started = time.time()
     process = None
     old_handlers = {}

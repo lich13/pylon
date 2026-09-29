@@ -14,14 +14,12 @@ Environment=PYLON_PROFILE=webops
 Environment=PYLON_PROFILE_ROOT=/srv/pylon/profiles/webops
 Environment=PYLON_JOB_ID=63c6ab6c4af3
 Environment=PYLON_OUTBOX=/srv/pylon/data/outbox.sqlite3
-Environment=PYTHONPATH=/srv/pylon/profiles/webops:/srv/pylon/profiles/webops/scripts
-Environment=HERMES_HOME=/srv/pylon/profiles/webops
 Environment=PLAYWRIGHT_BROWSERS_PATH=/srv/pylon/playwright-browsers
 Environment=CHIPHELL_PROXY_URL=socks5://127.0.0.1:18080
 Environment=CHIPHELL_REQUIRE_PROXY=1
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/srv/pylon/profiles/webops
-ExecStart=/srv/pylon/venv/bin/python /srv/pylon/profiles/webops/scripts/chiphell_fid26_proxy_poller.py --fid 328 --url "https://www.chiphell.com/forum.php?mod=forumdisplay&fid=328&filter=author&orderby=dateline"
+ExecStart=/srv/pylon/venv/bin/python -m pylon.tasks.chiphell.poller --fid 328 --url "https://www.chiphell.com/forum.php?mod=forumdisplay&fid=328&filter=author&orderby=dateline"
 Restart=always
 RestartSec=10
 TimeoutStopSec=30

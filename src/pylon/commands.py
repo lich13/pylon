@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import fcntl
-import importlib.util
 import json
 import os
 import re
@@ -92,14 +91,8 @@ def locked_command(lock_name: str, args: list[str], profile: str) -> str:
 
 
 def monitor_command(text: str, chat_id: str) -> str | None:
-    # Load the deterministic parser in a dedicated command process. No gateway
-    # or model is imported and no Telegram update is passed to a shell.
-    root = profile_root("webops")
     os.environ.update(task_environment("webops"))
-    spec = importlib.util.spec_from_file_location("pylon_monitor_commands", root / "plugins/software-update-monitor-reply/__init__.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    from .tasks.software import commands as module
     source = SimpleNamespace(platform="telegram", chat_id=chat_id, thread_id=None)
     parsed = module.parse_command(text, has_pending=module.source_key(source) in module.load_pending(module.PENDING_PATH))
     if parsed is None:
@@ -138,6 +131,9 @@ def handle(profile: str, text: str) -> str:
                 raise ValueError('此操作不接受参数')
             return scheduler.start('ssh-admin-sync' if action == 'sync' else 'ssh-beijing-refresh')
         return json.dumps(scheduler.ssh(action, ssh_command[2]), ensure_ascii=False, indent=2)
+    chiphell = re.fullmatch(r'/chiphell(?:\s+(status|test|pause|resume))?', value)
+    if chiphell:
+        return scheduler.admin('chiphell', chiphell[1] or 'status', timeout=300)
     gmail = re.fullmatch(r"/gmail(?:\s+(list|accept|ignore)(?:\s+(gmail-nt-[A-Za-z0-9_-]+))?)?", value)
     if gmail:
         action, candidate = gmail[1] or "list", gmail[2]
@@ -145,7 +141,7 @@ def handle(profile: str, text: str) -> str:
             return "用法：/gmail accept 候选ID 或 /gmail ignore 候选ID"
         arguments = ["--list-candidates"] if action == "list" else [f"--{action}-candidate", candidate]
         result = locked_command("b5d6e708bf6e", [str(home() / "venv/bin/python"),
-                   str(profile_root("default") / "scripts/gmail_cleanup_delete.py"), *arguments, "--format", "text"], "default")
+                   "-m", "pylon.tasks.gmail.cleanup", *arguments, "--format", "text"], "default")
         if action == "accept" and result.startswith("已加入"):
             result += "\n仅影响后续定时清理，本次未删除邮件。"
         return result
@@ -153,7 +149,7 @@ def handle(profile: str, text: str) -> str:
     if result is not None:
         return result
     return ("/status\n/run 任务编号\n/pause 任务编号或all\n/resume 任务编号或all\n/logs 任务编号\n"
-            "/ssh status\n/ssh check IP\n/ssh sync\n/ssh refresh\n/gmail list\n/gmail accept 候选ID\n/gmail ignore 候选ID\n"
+            "/ssh status\n/ssh check IP\n/ssh sync\n/ssh refresh\n/chiphell status|test|pause|resume\n/gmail list\n/gmail accept 候选ID\n/gmail ignore 候选ID\n"
             "增加监控 URL\n加监控 owner/repo\n移除监控 → 回复编号")
 
 

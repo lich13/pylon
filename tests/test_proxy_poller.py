@@ -11,7 +11,6 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tasks/webops/scripts"))
 
 
 class JsonState:
@@ -32,15 +31,15 @@ class JsonState:
 fake_base = types.ModuleType("chiphell_fid26_monitor")
 fake_base.paths = SimpleNamespace(CHIPHELL_DATA_ROOT=Path(tempfile.gettempdir()) / "chiphell-poller-tests")
 fake_base.state_json = JsonState
-sys.modules["chiphell_fid26_monitor"] = fake_base
 
 spec = importlib.util.spec_from_file_location(
     "chiphell_fid26_proxy_poller_for_tests",
-    ROOT / "tasks/webops/scripts" / "chiphell_fid26_proxy_poller.py",
+    ROOT / "src/pylon/tasks/chiphell/poller.py",
 )
 poller = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(poller)
+poller.base = fake_base
 
 
 class PollerFaultIntegrationTests(unittest.TestCase):

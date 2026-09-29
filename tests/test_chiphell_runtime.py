@@ -9,9 +9,8 @@ from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tasks/webops/scripts"))
 
-import chiphell_proxy_runtime as runtime
+from pylon.tasks.chiphell import runtime
 
 
 class ProxyConfigurationTests(unittest.TestCase):

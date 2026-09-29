@@ -7,7 +7,7 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 -I /usr/local/lib/pylon/ssh_admin.py load
+ExecStart=/srv/pylon/venv/bin/python -I -m pylon.admin.ssh load
 RemainAfterExit=yes
 
 [Install]

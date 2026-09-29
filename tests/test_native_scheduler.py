@@ -20,8 +20,7 @@ def load(name):
 
 
 bootstrap = load('bootstrap')
-admin = load('admin')
-ssh = load('ssh_admin')
+from pylon.admin import control as admin, ssh
 
 
 def test_all_jobs_keep_schedule_and_native_catchup():

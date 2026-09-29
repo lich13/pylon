@@ -2,108 +2,121 @@
   "b5d6e708bf6e": {
     "name": "Gmail 自动清理",
     "profile": "default",
-    "script": "gmail_cleanup_delete.sh",
     "schedule": "0 1 * * *",
     "deliver": true,
-    "timeout": 900
+    "timeout": 900,
+    "module": "pylon.tasks.gmail.cleanup",
+    "args": [
+      "--format",
+      "text",
+      "--quiet-noop"
+    ]
   },
-  "xianbao-hermes-poll": {
+  "xianbao-poll": {
     "name": "线报筛选",
     "profile": "default",
-    "script": "xianbao_hermes_poll.sh",
     "schedule": "* * * * *",
     "deliver": false,
     "timeout": 900,
-    "failure_notify": false
+    "failure_notify": false,
+    "module": "pylon.tasks.xianbao.poll"
   },
   "xianbao-retention-cleanup": {
     "name": "线报数据清理",
     "profile": "default",
-    "script": "xianbao_retention_cleanup.sh",
     "schedule": "15 4 * * *",
     "deliver": false,
     "timeout": 900,
     "args": [
       "--apply",
       "--json"
-    ]
+    ],
+    "module": "pylon.tasks.cleanup.xianbao"
   },
   "93e1c037c069": {
     "name": "V2EX 监控",
     "profile": "webops",
-    "script": "v2ex_notice_monitor.py",
     "schedule": "* * * * *",
     "deliver": true,
-    "timeout": 1800
+    "timeout": 1800,
+    "module": "pylon.tasks.forums.v2ex"
   },
   "7096dc039b73": {
     "name": "日港 iTunes 报告",
     "profile": "webops",
-    "script": "chartoo/scripts/itunes_daily_noagent.py",
     "schedule": "30 * * * *",
     "deliver": true,
-    "timeout": 1800
+    "timeout": 1800,
+    "module": "pylon.tasks.itunes.report"
   },
   "e72aa411d7f9": {
     "name": "业务数据清理",
     "profile": "webops",
-    "script": "profile_retention_cleanup.py",
     "schedule": "20 4 * * *",
     "deliver": false,
-    "timeout": 1800
+    "timeout": 1800,
+    "module": "pylon.tasks.cleanup.profile"
   },
   "63c6ab6c4af3": {
     "name": "Chiphell 新帖投递",
     "profile": "webops",
-    "script": "chiphell_fid26_dispatch.py",
     "schedule": "* * * * *",
     "deliver": true,
-    "timeout": 1800
+    "timeout": 1800,
+    "module": "pylon.tasks.chiphell.dispatch"
   },
   "f3ec3ec24210": {
     "name": "KDocs 报价刷新",
     "profile": "webops",
-    "script": "kdocs_electronics_quote_monitor_main.py",
     "schedule": "55 9,12,15,18 * * *",
     "deliver": true,
     "timeout": 1800,
     "lock": "kdocs-quotes",
-    "failure_notify": false
+    "failure_notify": false,
+    "module": "pylon.tasks.quotes.monitor",
+    "args": [
+      "--mode",
+      "main"
+    ]
   },
   "e961da51fe69": {
     "name": "KDocs 失败重试",
     "profile": "webops",
-    "script": "kdocs_electronics_quote_monitor_retry.py",
     "schedule": "*/15 * * * *",
     "deliver": true,
     "timeout": 1800,
     "lock": "kdocs-quotes",
-    "failure_notify": false
+    "failure_notify": false,
+    "module": "pylon.tasks.quotes.monitor",
+    "args": [
+      "--mode",
+      "retry"
+    ]
   },
   "fa27c561ded6": {
     "name": "软件更新监控",
     "profile": "webops",
-    "script": "software_update_monitor.py",
     "schedule": "* * * * *",
     "deliver": true,
-    "timeout": 1800
+    "timeout": 1800,
+    "module": "pylon.tasks.software.monitor"
   },
   "b7a84d1d9f21": {
     "name": "Linux.do 监控",
     "profile": "webops",
-    "script": "linuxdo_notice_monitor.py",
     "schedule": "* * * * *",
     "deliver": true,
-    "timeout": 1800
+    "timeout": 1800,
+    "module": "pylon.tasks.forums.linuxdo"
   },
   "de91ae783a36": {
     "name": "通知补发核对",
     "profile": "webops",
-    "script": "software_update_monitor_delivery_replay.py",
     "schedule": "*/5 * * * *",
     "deliver": false,
     "timeout": 1800,
-    "failure_notify": false
+    "failure_notify": false,
+    "module": "pylon.tasks.software.replay"
   },
   "ssh-admin-sync": {
     "name": "SSH 可信登录 IP 同步",
