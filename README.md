@@ -25,4 +25,6 @@ Telegram 仅接受本人私聊：`/status`、`/pause 编号`、`/resume 编号`�
 
 Python 3.12 依赖锁定在 `requirements.lock`。`ops/bootstrap.py` 仅准备运行环境，不启用调度；`ops/sync_state.py` 仅复制保留的业务数据，要求机器人服务停止。切换前必须先停止旧调度并等待在途任务结束，再同步最新状态。
 
+`ops/archive_history.py` 在旧网关停止后，将非微信、非 quant 的会话和用户文档保留到 `/srv/pylon/history/hermes`。逐表校验保留内容，只向新库写入保留记录，不复制旧数据库的全文索引或空闲页；不删除旧安装。
+
 三个测试组分别执行，避免同名 `lib` 包串用：`tasks/default/tests`、`tasks/webops/tests`、`tests`。测试环境设置独立的 `PYLON_HOME` 和 `PYLON_PROFILE_ROOT`。
