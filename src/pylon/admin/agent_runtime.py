@@ -120,7 +120,7 @@ def argv(row, folder):
     # session overrides through sudo itself; never preserve the caller's env.
     base = base[:3] + ['GROK_MEMORY=0', 'GROK_SUBAGENTS=0', 'GROK_DISABLE_AUTOUPDATER=1'] + base[3:]
     base += ['--cwd', str(folder), '--no-subagents', '--permission-mode', 'bypassPermissions',
-             '--disallowed-tools', 'spawn_subagent,send_subagent_message,workflow,scheduler_create,scheduler_delete,monitor,ask_user_question',
+             '--disallowed-tools', 'spawn_subagent,send_subagent_message,workflow,scheduler_create,scheduler_delete,scheduler_list,monitor,ask_user_question',
              '--leader-socket', str(folder / 'leader.sock'), '--prompt-file', str(folder / 'prompt.txt'),
              '--output-format', 'streaming-json', '-m', config['model']]
     if config['effort']:
@@ -385,6 +385,15 @@ def delete_session(row):
                 raise RuntimeError('会话删除失败：' + state.clean_text(result.stderr or result.stdout, 1000))
             if session_exists(row['provider'], sid, row['id']):
                 raise RuntimeError('原生命令结束后仍发现会话记录')
+    if row['provider'] == 'grok':
+        group = GROK_HOME / 'sessions' / quote(str(state.ROOT / 'work' / row['id']), safe='')
+        if group.exists():
+            if group.is_symlink() or group.resolve() != group:
+                raise PermissionError('unsafe Grok session directory')
+            # Native deletion can leave the empty working-directory group.
+            # Never remove any unexpected session or file from that group.
+            if next(group.iterdir(), None) is None:
+                group.rmdir()
     folder = state.ROOT / 'work' / row['id']
     if folder.exists():
         if folder.is_symlink() or folder.resolve() != folder or folder.stat().st_uid != os.geteuid():

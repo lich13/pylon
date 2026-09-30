@@ -273,6 +273,10 @@ def test_native_arguments_pin_provider_disable_memory_and_use_exact_resume(isola
         assert args[args.index('--') + 1] == '/usr/local/bin/' + provider
         if provider == 'grok':
             assert 'GROK_MEMORY=0' in args[:args.index('--')]
+            disabled = set(args[args.index('--disallowed-tools') + 1].split(','))
+            # All scheduler tools depend on the subagent runtime, including
+            # the read-only list operation; leaving one enabled prevents init.
+            assert {'scheduler_create', 'scheduler_delete', 'scheduler_list'} <= disabled
         assert sid in args and '--last' not in args and '--continue' not in args
         assert 'existing-model' in args
         assert 'resume' in args if provider == 'codex' else '--resume' in args
@@ -375,3 +379,24 @@ def test_foreign_session_and_symlink_cleanup_is_rejected(isolated, monkeypatch):
     (folder / row['id']).symlink_to(isolated)
     with pytest.raises(PermissionError):
         cleaner(raw(row['id']))
+
+
+def test_grok_cleanup_removes_only_empty_owned_group(isolated, monkeypatch):
+    import importlib
+    from urllib.parse import quote
+    cleaner = importlib.reload(runtime).delete_session
+    monkeypatch.setattr(runtime, 'GROK_HOME', isolated / 'grok')
+    row = new('grok')
+    folder = runtime.workdir(row['id'])
+    group = runtime.GROK_HOME / 'sessions' / quote(str(folder), safe='')
+    group.mkdir(parents=True)
+    foreign = group.parent / 'existing-project'
+    foreign.mkdir()
+    (foreign / 'existing-session').write_text('keep')
+    cleaner(raw(row['id']))
+    assert not group.exists() and not folder.exists()
+    assert (foreign / 'existing-session').read_text() == 'keep'
+    group.mkdir()
+    (group / 'unexpected').write_text('preserve')
+    cleaner(raw(row['id']))
+    assert (group / 'unexpected').read_text() == 'preserve'
