@@ -61,6 +61,16 @@ class QuoteHealthTests(unittest.TestCase):
             result = health.inspect(path, now=health._timestamp("2026-09-30T06:00:00Z"))
             self.assertTrue(result["available"], result)
 
+    def test_scheduled_slot_fallback_never_reports_future_validation(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self.make_db(Path(td), validated_at="")
+            with sqlite3.connect(path) as db:
+                db.execute("INSERT INTO meta VALUES('last_success_slot',?)", ("2026-09-30 17:55",))
+            now = health._timestamp("2026-09-30T09:38:11Z")
+            result = health.inspect(path, now=now)
+            self.assertEqual(result["validated_at"], now)
+            self.assertTrue(result["available"], result)
+
 
 if __name__ == "__main__":
     unittest.main()

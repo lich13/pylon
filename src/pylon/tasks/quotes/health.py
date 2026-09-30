@@ -41,8 +41,13 @@ def inspect(path: Path, *, now: float | None = None) -> dict:
         with sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=5) as db:
             result['count'] = db.execute('SELECT count(*) FROM quotes WHERE quote_price BETWEEN 50 AND 50000').fetchone()[0]
             meta = dict(db.execute("SELECT key,value FROM meta WHERE key IN ('quotes_validated_at','last_success_slot','last_quote_error')"))
-        result['validated_at'] = max(_timestamp(meta.get('quotes_validated_at', '')),
-                                     _timestamp(meta.get('last_success_slot', '')))
+        validated = _timestamp(meta.get('quotes_validated_at', ''))
+        if not validated:
+            # Older databases only have the scheduled slot. It is a fallback,
+            # never evidence of a validation in the future (manual runs use the
+            # current slot label even before that scheduled minute).
+            validated = min(_timestamp(meta.get('last_success_slot', '')), now)
+        result['validated_at'] = validated
         result['error'] = redact(meta.get('last_quote_error', ''))[:500]
         if not result['count']:
             result['reason'] = '没有有效报价'
