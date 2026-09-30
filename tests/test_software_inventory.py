@@ -147,3 +147,35 @@ def test_missing_docker_package_is_unknown_instead_of_no_updates(tmp_path, monke
     monkeypatch.setattr(scheduler, 'admin', lambda *_, **__: json.dumps(local))
     row = inventory.check()['rows'][0]
     assert 'error' in row and 'available' not in row
+
+
+@pytest.mark.parametrize('keeps_updating', [False, True])
+def test_update_finishing_during_collection_cannot_restore_stale_cache(tmp_path, monkeypatch, keeps_updating):
+    box = Outbox(tmp_path / 'outbox.db')
+    monkeypatch.setattr(inventory, 'Outbox', lambda: box)
+    monkeypatch.setattr(inventory, 'SOFTWARE', {'codex': inventory.SOFTWARE['codex']})
+    local = {'installed': {'codex': {'version': '0.159.1'}}, 'python': {},
+             'apt': {'packages': [], 'index_time': time.time(), 'reboot_required': False}}
+    read = Mock(side_effect=lambda *_, **__: json.dumps(local))
+    monkeypatch.setattr(scheduler, 'admin', read)
+    calls = 0
+
+    def latest(*_):
+        nonlocal calls
+        calls += 1
+        if calls == 1 or keeps_updating:
+            local['installed']['codex']['version'] = '0.159.2'
+            inventory.invalidate(box)
+        return '0.159.2', 'official'
+
+    monkeypatch.setattr(inventory, 'latest', latest)
+    if keeps_updating:
+        with pytest.raises(RuntimeError, match='检查期间软件多次更新'):
+            inventory.check()
+        assert box.get('software_inventory') is None
+    else:
+        checked = inventory.check()
+        assert checked['rows'][0]['version'] == '0.159.2'
+        assert checked['rows'][0]['available'] is False
+        assert box.get('software_inventory') == checked
+    assert read.call_count == 2

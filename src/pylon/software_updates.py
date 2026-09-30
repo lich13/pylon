@@ -51,6 +51,7 @@ def inventory_text(full=False):
 
 
 def reconcile(box=None):
+    from .software_inventory import invalidate
     box = box or Outbox()
     rows = json.loads(scheduler.admin('software', 'results'))
     for row in rows:
@@ -58,7 +59,7 @@ def reconcile(box=None):
         # repeats this read, but the persistent event key prevents duplicates.
         box.enqueue(profile=row['profile'], job_id='software-update', kind='text',
                     payload={'text': result_text(row)}, key='software-update:' + row['id'])
-        box.put('software_inventory', None)
+        invalidate(box)
         scheduler.admin('software', 'ack', row['request_id'])
     return len(rows)
 

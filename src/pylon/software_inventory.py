@@ -34,7 +34,17 @@ SOFTWARE = {
     'chrome': ('Grok Chrome for Testing', 'chrome', ''),
 }
 
-CACHE_SCHEMA = 2
+CACHE_SCHEMA = 3
+GENERATION_KEY = 'software_inventory_generation'
+
+
+def invalidate(box: Outbox):
+    with box.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT value FROM kv WHERE key=?', (GENERATION_KEY,)).fetchone()
+        generation = json.loads(row[0]) if row else 0
+        db.execute('INSERT OR REPLACE INTO kv VALUES(?,?)', (GENERATION_KEY, json.dumps(generation + 1)))
+        db.execute('DELETE FROM kv WHERE key=?', ('software_inventory',))
 
 
 def version(value: str) -> str:
@@ -98,12 +108,15 @@ def latest(kind: str, source: str, http=None) -> tuple[str, str]:
     raise ValueError('不支持的版本源')
 
 
-def check(*, max_age: int = 600) -> dict:
+def check(*, max_age: int = 600, _retries: int = 1) -> dict:
     from . import scheduler
     box = Outbox()
+    generation = box.get(GENERATION_KEY, 0)
     cached = box.get('software_inventory')
-    if cached and cached.get('schema') == CACHE_SCHEMA and time.time() - cached['checked_at'] < max_age:
+    if (cached and cached.get('schema') == CACHE_SCHEMA and cached.get('generation') == generation
+            and time.time() - cached['checked_at'] < max_age):
         return cached
+    started = time.time()
     local = json.loads(scheduler.admin('software', 'inventory', timeout=90))
     checks = []
     for key, (name, kind, source) in SOFTWARE.items():
@@ -141,8 +154,19 @@ def check(*, max_age: int = 600) -> dict:
                 return row | {'error': redact(str(exc))[:160]}
         with ThreadPoolExecutor(max_workers=8) as pool:
             rows = list(pool.map(one, checks))
-    result = {'schema': CACHE_SCHEMA, 'checked_at': time.time(), 'apt': local['apt'], 'rows': rows}
-    box.put('software_inventory', result)
+    result = {'schema': CACHE_SCHEMA, 'generation': generation, 'checked_at': started,
+              'apt': local['apt'], 'rows': rows}
+    with box.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT value FROM kv WHERE key=?', (GENERATION_KEY,)).fetchone()
+        current_generation = json.loads(row[0]) if row else 0
+        stale = current_generation != generation
+        if not stale:
+            db.execute('INSERT OR REPLACE INTO kv VALUES(?,?)', ('software_inventory', json.dumps(result, ensure_ascii=False)))
+    if stale:
+        if _retries:
+            return check(max_age=0, _retries=_retries - 1)
+        raise RuntimeError('检查期间软件多次更新，请重新查询')
     return result
 
 
