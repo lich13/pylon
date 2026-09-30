@@ -41,6 +41,11 @@ class QuoteHealthTests(unittest.TestCase):
             recovered = health.check(valid, box=box, now=now, notify=False)
             self.assertTrue(recovered["available"])
             self.assertEqual(box.get(health.KEY)["episode"], "")
+            third = health.check(missing, box=box, now=300)
+            self.assertNotEqual(first["episode"], third["episode"])
+            with box.connect() as db:
+                rows = db.execute("SELECT id FROM events WHERE id LIKE 'quotes-outage-%'").fetchall()
+            self.assertEqual(len(rows), 2)
 
     def test_empty_catalog_is_unavailable(self):
         with tempfile.TemporaryDirectory() as td:

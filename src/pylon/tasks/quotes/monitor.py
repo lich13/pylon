@@ -402,6 +402,9 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 pending = ''
             if not pending and current['available']:
+                # Persist silent recovery even when the retry timer has no
+                # pending refresh. A later outage must start a new alert episode.
+                health.check(DB_PATH, notify=False)
                 events.result('ok', health.status_text(path=DB_PATH), changed=False)
                 print(output.wake_agent_false())
                 return 0
