@@ -155,7 +155,7 @@ def _collect_proxy_once(
                     try:
                         thread_page.goto(post["url"], wait_until="domcontentloaded", timeout=args.timeout_ms)
                         thread_page.wait_for_timeout(args.settle_ms)
-                        post["body_excerpt"] = base.extract_first_post_excerpt(thread_page, args.body_limit)
+                        post.update(base.post_body_fields(thread_page, args.body_limit))
                     except Exception as error:
                         post["body_excerpt"] = f"正文抓取失败：{type(error).__name__}"
                     finally:

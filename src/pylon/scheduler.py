@@ -73,7 +73,9 @@ def start(job_id: str) -> str:
 
 def logs(job_id: str) -> str:
     unit(job_id)
-    return redact(admin("logs", job_id)) or "暂无日志"
+    result = redact(admin("logs", job_id)) or "暂无日志"
+    from .tasks.quotes.health import JOB_IDS, status_text
+    return result + '\n' + status_text() if job_id in JOB_IDS else result
 
 
 def ssh(action: str, value: str | None = None) -> dict:

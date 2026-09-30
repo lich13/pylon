@@ -9,6 +9,7 @@ from unittest import mock
 
 from pylon.tasks.quotes.arbitrage import (
     best_arbitrage_match,
+    best_arbitrage_match_from_quotes,
     collect_arbitrage_messages,
     connect,
     discover_unknown_quote_candidates,
@@ -38,6 +39,7 @@ CHIPHELL_BODY = (
     "只接受北京本地面交，外地就不考虑啦，谢谢关注，qq同VX "
     "补充内容 (2026-5-6 22:30): 3楼预定，明日面交"
 )
+AVAILABLE_CHIPHELL_BODY = CHIPHELL_BODY.replace("3楼预定，明日面交", "可以面交")
 
 
 class ElectronicsArbitrageTests(unittest.TestCase):
@@ -62,11 +64,24 @@ class ElectronicsArbitrageTests(unittest.TestCase):
             }
             with connect(db_path) as conn:
                 replace_quotes(conn, [entry])
-                match = best_arbitrage_match(conn, CHIPHELL_TITLE, CHIPHELL_BODY, assume_sale=True)
+                match = best_arbitrage_match(conn, CHIPHELL_TITLE, AVAILABLE_CHIPHELL_BODY, assume_sale=True)
             self.assertIsNotNone(match)
             assert match is not None
             self.assertEqual(match["sale_price"], 3088)
             self.assertEqual(match["profit"], 411)
+
+    def test_reserved_listing_is_not_sent_as_arbitrage(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "quotes.sqlite3"
+            entry = {
+                "sku_key": sku_key("华为", "Pura 80 12+256", "绿"), "brand": "华为",
+                "model_spec": "Pura 80 12+256", "color": "绿",
+                "product_name": "华为 Pura 80 12+256 绿", "quote_price": 3499,
+                "normalized": normalize_text("华为Pura 80 12+256绿"), "source_url": "test",
+            }
+            with connect(db_path) as conn:
+                replace_quotes(conn, [entry])
+                self.assertIsNone(best_arbitrage_match(conn, CHIPHELL_TITLE, CHIPHELL_BODY, assume_sale=True))
 
     def test_collect_arbitrage_messages_matches_v2ex_new_hardware_post(self):
         with tempfile.TemporaryDirectory() as td:
@@ -93,6 +108,8 @@ class ElectronicsArbitrageTests(unittest.TestCase):
                             "url": "https://www.v2ex.com/t/1217000",
                             "title": "【二手交易】北京出全新未拆 iPhone 17 Pro 256G 蓝 7800",
                             "body_excerpt": "全新未激活，明盘 7800，北京可面交。",
+                            "body_full": "全新未激活，明盘 7800，北京可面交。",
+                            "body_complete": True,
                         }
                     ],
                     db_path=db_path,
@@ -100,7 +117,7 @@ class ElectronicsArbitrageTests(unittest.TestCase):
 
         self.assertEqual(len(messages), 1)
         self.assertIn("## 重点比价预警", messages[0])
-        self.assertIn("毛利 ¥50", messages[0])
+        self.assertIn("差价 ¥50", messages[0])
         bark.assert_called_once()
 
     def test_accessory_newness_does_not_make_used_device_arbitrage_eligible(self):
@@ -183,7 +200,7 @@ class ElectronicsArbitrageTests(unittest.TestCase):
         alert = make_alert_message(title, "https://www.chiphell.com/thread-123-1-1.html", match, contact_note=contact_note)
         self.assertIn(contact_note, alert)
         push_title, push_body = make_bark_arbitrage_payload(title, "https://www.chiphell.com/thread-123-1-1.html", match, contact_note=contact_note)
-        self.assertIn("毛利 ¥411", push_title)
+        self.assertIn("差价 ¥411", push_title)
         self.assertIn(contact_note, push_body)
 
     def test_base64_contact_decoding_still_works_for_other_marketplaces(self):
@@ -239,7 +256,8 @@ class ElectronicsArbitrageTests(unittest.TestCase):
             with connect(db_path) as conn:
                 replace_quotes(conn, entries)
                 self.assertIsNone(best_arbitrage_match(conn, title, body_no_price, assume_sale=True))
-                match = best_arbitrage_match(conn, title, body_with_price, assume_sale=True)
+                self.assertIsNone(best_arbitrage_match(conn, title, body_with_price, assume_sale=True))
+                match = best_arbitrage_match(conn, title, body_with_price.replace("明盘", "皓白，明盘"), assume_sale=True)
             self.assertEqual(normalize_match_text("16G+512G"), "16+512")
             self.assertIn("非凡大师", normalize_match_text("HUAWEI Mate Xts ULTIMATE DEDIGN 16G+512G"))
             self.assertIsNotNone(match)
@@ -667,6 +685,58 @@ class ElectronicsArbitrageTests(unittest.TestCase):
         self.assertTrue(any("AR眼镜" in candidate["line"] for candidate in candidates))
         self.assertFalse(any("MacBook" in candidate["line"] for candidate in candidates))
         self.assertFalse(any("大疆无人机" in candidate["line"] for candidate in candidates))
+
+    def test_real_false_positive_shapes_are_rejected(self):
+        cases = [
+            (
+                "苹果",
+                "17 MAX-256G",
+                "橙",
+                8500,
+                "[杭州]苹果Iphone 17 pro max 256G 星宇橙 7400靓机",
+                "10月3日过保，使用全程带壳贴膜，外观充新，电池95%，原盒原线未使用。",
+            ),
+            (
+                "苹果",
+                "S11 46铁金属米兰尼斯",
+                "默认",
+                4950,
+                "支持快充的美版 Apple Watch S11 GPS 42mm",
+                "几乎全新，1900元出。",
+            ),
+            (
+                "华为",
+                "Mate XT2 16+1T",
+                "玄黑",
+                27100,
+                "杭州 华为 MATE XT 一代 4.2系统 带care",
+                "全新未拆，明盘 11888 元。",
+            ),
+        ]
+        for brand, spec, color, price, title, body in cases:
+            with self.subTest(title=title):
+                quote = {
+                    "sku_key": sku_key(brand, spec, color), "brand": brand,
+                    "model_spec": spec, "color": color, "product_name": f"{brand} {spec} {color}",
+                    "quote_price": price, "normalized": normalize_text(f"{brand}{spec}{color}"), "source_url": "test",
+                }
+                self.assertIsNone(best_arbitrage_match_from_quotes([quote], title, body, assume_sale=True))
+
+    def test_multi_item_price_does_not_use_other_item_lowest_price(self):
+        quote = {
+            "sku_key": sku_key("苹果", "17PRO 256G", "蓝"), "brand": "苹果",
+            "model_spec": "17PRO 256G", "color": "蓝", "product_name": "苹果 17PRO 256G 蓝",
+            "quote_price": 7850, "normalized": normalize_text("苹果17PRO256G蓝"), "source_url": "test",
+        }
+        title = "出全新未拆 iPhone 17 Pro 256G 蓝色"
+        body = "明盘7800元。另有全新小米手机一台，价格6000元。"
+        match = best_arbitrage_match_from_quotes([quote], title, body, assume_sale=True)
+        self.assertIsNotNone(match)
+        self.assertEqual(match["sale_price"], 7800)
+
+    def test_zero_price_unknown_kdocs_line_is_silent(self):
+        blob = "华为MATEX7 1TB 典藏红手写笔套装00000 白00000".encode("utf-16le")
+        self.assertEqual(discover_unknown_quote_candidates(blob), [])
 
     def test_replace_quotes_preserves_then_confirms_removed_categories(self):
         with tempfile.TemporaryDirectory() as td:

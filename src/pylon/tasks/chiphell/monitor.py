@@ -156,7 +156,7 @@ def looks_login_required(page_text: str, title: str = "") -> bool:
     return "没有权限访问该版块" in hay or "尚未登录" in hay or ("提示信息" in title and any(m in hay for m in markers))
 
 
-def extract_first_post_excerpt(page, limit: int = 180) -> str:
+def extract_first_post_body(page) -> str:
     parts: list[str] = []
     typeoption_loc = page.locator("#postlist .plc .pct .typeoption, #postlist .pcb .typeoption, .typeoption")
     try:
@@ -184,26 +184,32 @@ def extract_first_post_excerpt(page, limit: int = 180) -> str:
         if count:
             try:
                 raw_html = loc.first.evaluate("el => el.innerHTML")
-                body_text = clean_discuz_html(raw_html)
-                if body_text:
-                    parts.append(body_text)
-                full_text = " ".join(p for p in parts if p).strip()
-                excerpt = compact_excerpt(full_text, limit)
-                contact_note = format_contact_note(full_text)
-                if contact_note and contact_note not in excerpt:
-                    excerpt = f"{excerpt} {contact_note}".strip()
-                if excerpt:
-                    return excerpt
+                from pylon.shared.html_text import body_text
+                content = body_text(raw_html)
+                if content:
+                    parts.append(content)
+                full_text = "\n\n".join(p for p in parts if p).strip()
+                if full_text:
+                    return full_text
             except Exception:
                 continue
-    if parts:
-        full_text = " ".join(p for p in parts if p).strip()
-        excerpt = compact_excerpt(full_text, limit)
-        contact_note = format_contact_note(full_text)
-        if contact_note and contact_note not in excerpt:
-            excerpt = f"{excerpt} {contact_note}".strip()
-        return excerpt
-    return ""
+    return "\n\n".join(parts).strip()
+
+
+def post_body_fields(page, limit: int = 180) -> dict[str, Any]:
+    from pylon.shared.html_text import MAX_BODY_CHARS
+    full = extract_first_post_body(page)
+    excerpt = compact_excerpt(full, limit)
+    contact = format_contact_note(full)
+    if contact and contact not in excerpt:
+        excerpt = f"{excerpt} {contact}".strip()
+    return {'body_full': full[:MAX_BODY_CHARS], 'body_complete': bool(full) and len(full) <= MAX_BODY_CHARS,
+            'body_excerpt': excerpt}
+
+
+def extract_first_post_excerpt(page, limit: int = 180) -> str:
+    return post_body_fields(page, limit)['body_excerpt']
+
 
 
 @contextlib.contextmanager
@@ -302,7 +308,7 @@ def collect_once(args: argparse.Namespace) -> tuple[str, list[dict[str, Any]]]:
                 try:
                     tpage.goto(post["url"], wait_until="domcontentloaded", timeout=args.timeout_ms)
                     tpage.wait_for_timeout(args.settle_ms)
-                    post["body_excerpt"] = extract_first_post_excerpt(tpage, args.body_limit)
+                    post.update(post_body_fields(tpage, args.body_limit))
                 except Exception as e:
                     post["body_excerpt"] = f"正文抓取失败：{type(e).__name__}"
                 finally:

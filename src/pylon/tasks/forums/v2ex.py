@@ -97,6 +97,8 @@ class Post:
     core_title: str
     rough_type: str
     body_excerpt: str
+    body_full: str = ''
+    body_complete: bool = False
 
 
 @dataclass
@@ -288,11 +290,17 @@ def format_offer_detail_note(text: str) -> str:
     return note
 
 
+def extract_topic_body(page_html: str) -> str:
+    from pylon.shared.html_text import body_text
+    return strip_invisible_prompt_chars(body_text(page_html, classes={'topic_content'}))
+
+
 def extract_topic_excerpt(page_html: str) -> str:
-    match = re.search(r'<div class="topic_content">(.*?)</div>', page_html, flags=re.S)
-    if not match:
-        return ""
-    full_excerpt = strip_tags(match.group(1))
+    return format_topic_excerpt(extract_topic_body(page_html))
+
+
+def format_topic_excerpt(body: str) -> str:
+    full_excerpt = ' '.join(body.split())
     contact_note = format_contact_note(full_excerpt)
     offer_note = format_offer_detail_note(full_excerpt)
     if len(full_excerpt) <= TOPIC_EXCERPT_MAX_CHARS:
@@ -318,6 +326,7 @@ def topic_excerpt_enrichment_candidate(post: Post) -> bool:
 
 
 def enrich_posts_with_topic_excerpt(posts: List[Post], *, deadline: float | None = None) -> None:
+    from pylon.shared.html_text import MAX_BODY_CHARS
     cache: dict[str, str] = {}
     for post in posts:
         if not topic_excerpt_enrichment_candidate(post):
@@ -327,7 +336,7 @@ def enrich_posts_with_topic_excerpt(posts: List[Post], *, deadline: float | None
             break
         if post.v2ex_url not in cache:
             try:
-                cache[post.v2ex_url] = extract_topic_excerpt(
+                cache[post.v2ex_url] = extract_topic_body(
                     fetch(
                         post.v2ex_url,
                         timeout=TOPIC_REQUEST_TIMEOUT,
@@ -338,7 +347,10 @@ def enrich_posts_with_topic_excerpt(posts: List[Post], *, deadline: float | None
             except Exception as exc:
                 print(f"v2ex_topic_enrich_failed id={post.message_id} error={type(exc).__name__}", file=sys.stderr)
                 cache[post.v2ex_url] = ""
-        post.body_excerpt = cache[post.v2ex_url]
+        full = cache[post.v2ex_url]
+        post.body_excerpt = format_topic_excerpt(full)
+        post.body_full = full[:MAX_BODY_CHARS]
+        post.body_complete = bool(full) and len(full) <= MAX_BODY_CHARS
 
 
 def extract_tags_and_core(title: str) -> tuple[List[str], str]:
@@ -3173,6 +3185,8 @@ def run_once(*, dry_run: bool = False) -> int:
                 "title": strip_invisible_prompt_chars(p.title),
                 "url": strip_invisible_prompt_chars(p.v2ex_url),
                 "body_excerpt": strip_invisible_prompt_chars(p.body_excerpt),
+                "body_full": p.body_full,
+                "body_complete": p.body_complete,
             }
             for p in arbitrage_posts
         ],

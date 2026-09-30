@@ -76,6 +76,8 @@ def status_text() -> str:
     counts = box.counts()
     unresolved = sum(counts.get(s, 0) for s in ('pending', 'sending', 'uncertain', 'failed'))
     lines.append(f"待处理通知 {unresolved}；回执不确定 {counts.get('uncertain', 0)}")
+    from .tasks.quotes.health import status_text as quote_status
+    lines.append(quote_status(box=box))
     return "\n".join(lines)
 
 
@@ -122,7 +124,7 @@ def outbox_text() -> str:
     counts = box.counts()
     lines = ['通知队列', *[f'{label}：{counts.get(status, 0)}' for status, label in names.items()]]
     with box.connect() as db:
-        rows = db.execute("SELECT id,job_id,status,attempts,error FROM events WHERE status!='delivered' ORDER BY created_at DESC LIMIT 10").fetchall()
+        rows = db.execute("SELECT id,job_id,status,attempts,error FROM events WHERE status NOT IN ('delivered','suppressed') ORDER BY created_at DESC LIMIT 10").fetchall()
     catalog = jobs()
     for row in rows:
         job = catalog.get(row['job_id'], {}).get('name', '机器人回复' if row['job_id'] == 'bot' else row['job_id'])

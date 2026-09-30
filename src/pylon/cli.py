@@ -82,7 +82,7 @@ def main():
     else:
         box = Outbox()
         with box.connect() as db:
-            unresolved = [dict(row) for row in db.execute("SELECT id,job_id,kind,status,attempts,error FROM events WHERE status!='delivered' ORDER BY created_at LIMIT 30")]
+            unresolved = [dict(row) for row in db.execute("SELECT id,job_id,kind,status,attempts,error FROM events WHERE status NOT IN ('delivered','suppressed') ORDER BY created_at LIMIT 30")]
         print(json.dumps({'outbox': box.counts(), 'unresolved': unresolved}, ensure_ascii=False))
         return int(args.command == 'reconcile' and bool(unresolved))
     return 0

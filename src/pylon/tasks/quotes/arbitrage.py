@@ -280,7 +280,11 @@ def has_device_newness(text: str) -> bool:
     device signals as a blocker unless there is still an independent device-level
     newness phrase after accessory/package-scoped phrases are removed.
     """
+    from .matching import ACCESSORY, USED
     hay = text or ""
+    if USED.search(hay):
+        return False
+    hay = ACCESSORY.sub(" ", hay)
     cleaned = _strip_accessory_new_context(hay)
     if not NEW_RE.search(cleaned):
         return False
@@ -759,7 +763,7 @@ def discover_unknown_quote_candidates(open_et_bytes: bytes, *, limit: int = 20) 
         clean = _clean_wps_inline_text(line)
         if not clean or clean in seen:
             continue
-        if not INLINE_COLOR_PRICE_RE.search(clean):
+        if not any(50 <= int(m['price']) <= 50000 for m in INLINE_COLOR_PRICE_RE.finditer(clean)):
             continue
         if not (POTENTIAL_QUOTE_CANDIDATE_RE.search(clean) or POTENTIAL_QUOTE_CANDIDATE_RE.search(normalize_match_text(clean))):
             continue
@@ -911,6 +915,7 @@ def replace_quotes(
             "INSERT INTO meta(key,value) VALUES('quotes_updated_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (ts,),
         )
+        conn.execute("INSERT OR REPLACE INTO meta VALUES('quotes_validated_at',?)", (ts,))
         conn.execute(
             "INSERT INTO meta(key,value) VALUES('quotes_count',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(actual_count),),
@@ -1040,7 +1045,7 @@ def model_anchor_tokens(text: str) -> list[str]:
     norm = normalize_match_text(text)
     patterns = [
         r"MATEXTS",
-        r"MATEXT(?!S)",
+        r"MATEXT\d*(?![S\d])",
         r"MATEX\d+[A-Z]*?(?=\d{1,2}\+|$|典藏|标准|普通|全能|黑|白|蓝|紫|绿|金|银|灰|红|青)",
         r"MATE\d{2,3}(?:RS|PROMAX|PRO|ULTRA)?(?=\d{1,2}\+|\d{3,4}G?|\dT|$|典藏|标准|普通|非凡大师|黑|白|蓝|紫|绿|金|银|灰|红|青)",
         r"PURA(?:XMAX|X|\d{1,3}(?:ULTRA|PROMAX|PRO|MAX)?)(?=\d{1,2}\+|\d{3,4}G?|\dT|$|典藏|标准|普通|黑|白|蓝|紫|绿|金|银|灰|红|青)",
@@ -1197,53 +1202,8 @@ def quote_matches_text(q: sqlite3.Row, text_norm: str, raw_text: str | None = No
 
 
 def best_arbitrage_match_from_quotes(quotes: list[sqlite3.Row], title: str, body: str, *, assume_sale: bool = False) -> dict[str, Any] | None:
-    text = f"{title}\n{body}"
-    if is_excluded_device_deal(text):
-        return None
-    if not has_device_newness(text):
-        return None
-    if not assume_sale:
-        if NEGATIVE_BUY_RE.search(text) and not SALE_RE.search(text):
-            return None
-        if not SALE_RE.search(text):
-            return None
-    prices = money_candidates(text)
-    if not prices:
-        return None
-    text_norm = normalize_match_text(text)
-    candidate_quotes = [q for q in quotes if quote_matches_text(q, text_norm, raw_text=text)]
-    text_colors = {c for c in COLOR_TOKENS if c in re.sub(r"金属", "", text_norm)}
-    if not text_colors:
-        # If the post omits color, use the lowest quote for each matched model/spec
-        # instead of the highest color quote. This keeps profit conservative for
-        # rows where colors carry different KDocs prices (e.g. Mate XTS).
-        by_spec: dict[tuple[str, str], sqlite3.Row] = {}
-        for q in candidate_quotes:
-            key = (str(q["brand"]), normalize_match_text(str(q["model_spec"])))
-            prev = by_spec.get(key)
-            if prev is None or int(q["quote_price"]) < int(prev["quote_price"]):
-                by_spec[key] = q
-        candidate_quotes = list(by_spec.values())
-    best: dict[str, Any] | None = None
-    for q in candidate_quotes:
-        quote_price = int(q["quote_price"])
-        plausible_prices = [p for p in prices if quote_price * 0.35 <= p <= quote_price * 1.10]
-        if not plausible_prices:
-            continue
-        sale_price = min(plausible_prices)
-        profit = quote_price - sale_price
-        if profit <= 0:
-            continue
-        item = {
-            "product_name": q["product_name"],
-            "quote_price": quote_price,
-            "sale_price": sale_price,
-            "profit": profit,
-            "sku_key": q["sku_key"],
-        }
-        if best is None or item["profit"] > best["profit"]:
-            best = item
-    return best
+    from .matching import select_match
+    return select_match(quotes, title, body, assume_sale=assume_sale)
 
 
 def best_arbitrage_match(conn: sqlite3.Connection, title: str, body: str, *, assume_sale: bool = False) -> dict[str, Any] | None:
@@ -1386,20 +1346,20 @@ def make_alert_message(title: str, url: str, match: dict[str, Any], repeat: bool
     return (
         f"{head}\n"
         f"[{title}]({url}) — 匹配：{match['product_name']}；帖子价 {format_money(match['sale_price'])}，"
-        f"报价 {format_money(match['quote_price'])}，毛利 {format_money(match['profit'])}。已命中“全新/未拆封”等关键词，请马上核验版本、颜色、来源和交易风险。{contact_suffix}"
+        f"报价 {format_money(match['quote_price'])}，差价 {format_money(match['profit'])}。依据：{match.get('condition_evidence', '全新状态已核对')}。{contact_suffix}"
     )
 
 
 def make_bark_arbitrage_payload(title: str, url: str, match: dict[str, Any], repeat: bool = False, contact_note: str = "") -> tuple[str, str]:
     prefix = "重复提醒" if repeat else "重点比价预警"
-    push_title = f"{prefix}：毛利 {format_money(int(match['profit']))}"
+    push_title = f"{prefix}：差价 {format_money(int(match['profit']))}"
     body = (
         f"匹配：{match['product_name']}\n"
         f"帖子价：{format_money(int(match['sale_price']))}\n"
         f"报价：{format_money(int(match['quote_price']))}\n"
-        f"毛利：{format_money(int(match['profit']))}\n"
+        f"差价：{format_money(int(match['profit']))}\n"
         f"帖子：{title}\n"
-        "已命中全新/未拆封等关键词，请马上核验版本、颜色、来源和交易风险。"
+        f"依据：{match.get('condition_evidence', '全新状态已核对')}"
     )
     if contact_note:
         body += f"\n{contact_note}"
@@ -1485,7 +1445,7 @@ def send_bark_arbitrage_burst_alert(title: str, url: str, match: dict[str, Any],
     last_result: BarkResult | None = None
     for i in range(count):
         previous_key = os.environ.get("PYLON_BARK_KEY")
-        os.environ["PYLON_BARK_KEY"] = f"arbitrage:{url}:{match.get('product_name')}:{int(time.time()) // 900}:{i}"
+        os.environ["PYLON_BARK_KEY"] = f"arbitrage:{url}:{match.get('product_name')}:{match.get('sale_price')}:{match.get('quote_price')}:{i}"
         try:
             last_result = send_bark_arbitrage_alert(title, url, match, repeat=i > 0, contact_note=contact_note)
         finally:
@@ -1558,6 +1518,10 @@ def record_arbitrage_if_match(
     body: str,
     db_path: Path = DB_PATH,
 ) -> str | None:
+    if db_path == DB_PATH:
+        from .health import inspect
+        if not inspect(db_path)['available']:
+            return None
     with connect(db_path) as conn:
         if int(get_meta(conn, "quotes_count", "0") or "0") <= 0:
             return None
@@ -1603,6 +1567,10 @@ def due_repeat_alerts(db_path: Path = DB_PATH, max_repeats: int = 8, min_minutes
 
 
 def collect_arbitrage_messages(source: str, posts: list[dict[str, Any]], db_path: Path = DB_PATH) -> list[str]:
+    if db_path == DB_PATH:
+        from .health import inspect
+        if not inspect(db_path)['available']:
+            return []
     if not posts:
         return []
     messages: list[str] = []
@@ -1611,13 +1579,15 @@ def collect_arbitrage_messages(source: str, posts: list[dict[str, Any]], db_path
             return []
         quotes = load_quotes(conn)
         for post in posts:
+            if not post.get('body_complete') or not post.get('body_full'):
+                continue
             msg = _record_arbitrage_if_match_conn(
                 conn=conn,
                 source=source,
                 source_id=str(post.get("id") or post.get("message_id") or post.get("url") or post.get("v2ex_url") or ""),
                 url=str(post.get("url") or post.get("v2ex_url") or ""),
                 title=str(post.get("title") or ""),
-                body=str(post.get("body_excerpt") or post.get("body") or ""),
+                body=str(post['body_full']),
                 quotes=quotes,
             )
             if msg:

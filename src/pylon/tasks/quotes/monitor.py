@@ -21,6 +21,7 @@ from pylon.tasks.quotes.arbitrage import (
     dedupe_quote_entries,
     discover_unknown_quote_candidates,
     get_meta,
+    now_iso,
     parse_quotes_from_copied_tsv,
     parse_quotes_from_open_et,
     parse_quotes_from_svg,
@@ -32,12 +33,10 @@ playwright_env.ensure()
 
 BJ = dt.timezone(dt.timedelta(hours=8))
 TARGET_HOURS = {9, 12, 15, 18}
-QUOTE_PARSER_VERSION = "2026-05-08-kdocs-copy-tsv-fullsheet-v8"
+QUOTE_PARSER_VERSION = "2026-09-30-validated-quotes-v9"
 MIN_CLIPBOARD_TSV_CHARS = 1000
 FETCH_SOURCE_ATTEMPTS = 3
 COPY_ATTEMPTS_PER_PAGE = 4
-FAILURE_NOTIFY_AFTER = 2
-FAILURE_NOTIFY_EVERY = 4
 
 
 def bj_now() -> dt.datetime:
@@ -231,31 +230,6 @@ def _json_meta(conn, key: str, default: Any) -> Any:
         return default
 
 
-def build_category_notice(result: dict[str, Any]) -> str:
-    change = result.get("category_change") or {}
-    unknown = result.get("unknown_quote_candidates") or []
-    lines: list[str] = []
-    if change.get("added_categories"):
-        lines.append("新增品类：" + "、".join(change["added_categories"]))
-    pending = change.get("pending_removed_categories") or {}
-    confirmations = int(change.get("category_absence_confirmations") or 2)
-    if pending:
-        pieces = [f"{cat} 第 {streak}/{confirmations} 次缺失，暂不删除旧报价" for cat, streak in pending.items()]
-        lines.append("待确认移除：" + "；".join(pieces))
-    if change.get("confirmed_removed_categories"):
-        lines.append("确认移除品类：" + "、".join(change["confirmed_removed_categories"]))
-    if unknown:
-        sample = "；".join(str(item.get("line", ""))[:60] for item in unknown[:3])
-        lines.append(f"发现疑似新格式/新品类候选 {len(unknown)} 条，未自动入库：{sample}")
-    if not lines:
-        return ""
-    counts = result.get("category_counts") or {}
-    count_text = "、".join(f"{k}:{v}" for k, v in sorted(counts.items())) if counts else ""
-    if count_text:
-        lines.append("当前品类计数：" + count_text)
-    return "## KDocs 报价品类变更\n" + "\n".join(f"- {line}" for line in lines)
-
-
 def update_quotes(timeout_ms: int = 60000, min_entries: int = 20) -> dict[str, Any]:
     sources = fetch_quote_sources_via_browser(timeout_ms=timeout_ms)
     svg = sources["svg"]
@@ -273,6 +247,7 @@ def update_quotes(timeout_ms: int = 60000, min_entries: int = 20) -> dict[str, A
         parser_version = get_meta(conn, "quotes_parser_version", "")
         pending_missing = _json_meta(conn, "quotes_category_missing_streaks", {})
         if last_hash == snapshot_hash and last_count > 0 and parser_version == QUOTE_PARSER_VERSION and not pending_missing:
+            set_meta(conn, "quotes_validated_at", now_iso())
             return {"status": "unchanged", "quote_count": last_count, "db_path": str(DB_PATH), "snapshot_hash": snapshot_hash, **fetch_meta}
     svg_entries = parse_quotes_from_svg(svg)
     # `clipboard_tsv` is the only source that fully covers KDocs' lazy-rendered
@@ -283,39 +258,29 @@ def update_quotes(timeout_ms: int = 60000, min_entries: int = 20) -> dict[str, A
     open_entries = parse_quotes_from_open_et(open_et, nonphone_only=False)
     unknown_candidates = discover_unknown_quote_candidates(open_et, limit=20)
     entries = dedupe_quote_entries([*svg_entries, *open_entries, *tsv_entries])
-    if len(entries) < min_entries:
-        raise RuntimeError(f"parsed too few quote entries: {len(entries)}")
-    unknown_hash = hashlib.sha1(json.dumps(unknown_candidates, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest() if unknown_candidates else ""
+    if len(entries) < max(100, min_entries):
+        raise RuntimeError(f"parsed too few valid quote entries: {len(entries)}")
+    if last_count >= 100 and len(entries) < last_count * .8:
+        raise RuntimeError(f"报价快照不完整：原有 {last_count} 条，本次仅 {len(entries)} 条；保留旧库")
+    if any(not str(e['model_spec']).strip() or not 50 <= int(e['quote_price']) <= 50000 for e in entries):
+        raise RuntimeError('报价快照含无效型号或价格；保留旧库')
+    unknown_hash = hashlib.sha1(json.dumps(unknown_candidates, ensure_ascii=False, sort_keys=True).encode()).hexdigest() if unknown_candidates else ''
     with connect(DB_PATH) as conn:
-        last_unknown_hash = get_meta(conn, "quotes_unknown_quote_candidate_hash", "")
-        unknown_should_notify = bool(unknown_candidates and unknown_hash != last_unknown_hash)
-
-        def persist_notice(stats):
-            if stats.get("should_notify") or unknown_should_notify:
-                notice = build_category_notice({"category_change": stats, "category_counts": stats.get("category_counts", {}),
-                    "unknown_quote_candidates": unknown_candidates if unknown_should_notify else []})
-                events.publish(notice)
-
-        sync_stats = replace_quotes(
-            conn,
-            entries,
-            SOURCE_URL,
-            snapshot_hash=snapshot_hash,
-            protect_removed_categories=True,
-            category_absence_confirmations=2,
-            before_commit=persist_notice,
-        )
-        set_meta(conn, "quotes_parser_version", QUOTE_PARSER_VERSION)
-        set_meta(conn, "quotes_svg_count", str(len(svg_entries)))
-        set_meta(conn, "quotes_open_et_count", str(len(open_entries)))
-        set_meta(conn, "quotes_clipboard_tsv_count", str(len(tsv_entries)))
-        set_meta(conn, "quotes_last_fetch_attempt", str(fetch_meta["fetch_attempt"]))
-        set_meta(conn, "quotes_last_copy_attempt", str(fetch_meta["copy_attempt"]))
-        set_meta(conn, "quotes_last_clipboard_tsv_bytes", str(fetch_meta["clipboard_tsv_bytes"]))
-        set_meta(conn, "quotes_unknown_quote_candidates", json.dumps(unknown_candidates, ensure_ascii=False))
-        last_unknown_hash = get_meta(conn, "quotes_unknown_quote_candidate_hash", "")
-        unknown_should_notify = bool(unknown_candidates and unknown_hash != last_unknown_hash)
-        set_meta(conn, "quotes_unknown_quote_candidate_hash", unknown_hash)
+        def persist_metadata(stats):
+            metadata = {
+                'quotes_parser_version': QUOTE_PARSER_VERSION,
+                'quotes_svg_count': str(len(svg_entries)), 'quotes_open_et_count': str(len(open_entries)),
+                'quotes_clipboard_tsv_count': str(len(tsv_entries)),
+                'quotes_last_fetch_attempt': str(fetch_meta['fetch_attempt']),
+                'quotes_last_copy_attempt': str(fetch_meta['copy_attempt']),
+                'quotes_last_clipboard_tsv_bytes': str(fetch_meta['clipboard_tsv_bytes']),
+                'quotes_unknown_quote_candidates': json.dumps(unknown_candidates, ensure_ascii=False),
+                'quotes_unknown_quote_candidate_hash': unknown_hash,
+            }
+            conn.executemany('INSERT OR REPLACE INTO meta VALUES(?,?)', metadata.items())
+        sync_stats = replace_quotes(conn, entries, SOURCE_URL, snapshot_hash=snapshot_hash,
+                                    protect_removed_categories=True, category_absence_confirmations=2,
+                                    before_commit=persist_metadata)
     result = {
         "status": "ok",
         "quote_count": sum(int(v) for v in (sync_stats.get("category_counts", {}) or {}).values()),
@@ -323,15 +288,13 @@ def update_quotes(timeout_ms: int = 60000, min_entries: int = 20) -> dict[str, A
         "open_et_count": len(open_entries),
         "clipboard_tsv_count": len(tsv_entries),
         "unknown_quote_candidate_count": len(unknown_candidates),
-        "unknown_quote_candidates": unknown_candidates if unknown_should_notify else [],
+        "unknown_quote_candidates": unknown_candidates,
         "category_change": sync_stats,
         "category_counts": sync_stats.get("category_counts", {}),
         "db_path": str(DB_PATH),
         "snapshot_hash": snapshot_hash,
         **fetch_meta,
     }
-    if sync_stats.get("should_notify") or unknown_should_notify:
-        result["category_notice"] = build_category_notice(result)
     return result
 
 
@@ -389,6 +352,7 @@ def mark_success(slot: str, mode: str, result: dict[str, Any]) -> None:
         set_meta(conn, "last_success_slot", slot)
         set_meta(conn, "pending_slot", "")
         set_meta(conn, "pending_fail_count", "0")
+        set_meta(conn, "last_quote_error", "")
         set_meta(conn, "last_quote_result", json.dumps(result, ensure_ascii=False))
 
 
@@ -403,8 +367,7 @@ def mark_failure(slot: str, mode: str, err: Exception) -> tuple[int, bool]:
         set_meta(conn, "pending_slot", slot)
         set_meta(conn, "pending_fail_count", str(fail_count))
         set_meta(conn, "last_quote_error", f"{type(err).__name__}: {err}")
-    notify = fail_count >= FAILURE_NOTIFY_AFTER and (fail_count == FAILURE_NOTIFY_AFTER or fail_count % FAILURE_NOTIFY_EVERY == 0)
-    return fail_count, notify
+    return fail_count, False
 
 
 def should_retry() -> str:
@@ -425,38 +388,40 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "main" and os.environ.get("PYLON_TRIGGER") == "manual":
         args.mode = "force"
 
+    from . import health
     now = bj_now()
     slot = slot_id(now)
-    if args.mode == "main":
-        if now.hour not in TARGET_HOURS or now.minute < 50:
-            print(output.wake_agent_false())
-            return 0
-    elif args.mode == "retry":
-        pending = should_retry()
-        if not pending:
-            print(output.wake_agent_false())
-            return 0
-        slot = pending
-
     try:
+        if args.mode == 'main' and (now.hour not in TARGET_HOURS or now.minute < 50):
+            print(output.wake_agent_false())
+            return 0
+        if args.mode == 'retry':
+            current = health.inspect(DB_PATH)
+            try:
+                pending = should_retry()
+            except Exception:
+                pending = ''
+            if not pending and current['available']:
+                events.result('ok', health.status_text(path=DB_PATH), changed=False)
+                print(output.wake_agent_false())
+                return 0
+            slot = pending or slot
         result = update_quotes(timeout_ms=args.timeout_ms, min_entries=args.min_entries)
         mark_success(slot, args.mode, result)
-        events.result('ok', f'报价刷新完成，mode={args.mode}', changed=True)
-        notice = result.get("category_notice") if isinstance(result, dict) else ""
-        if notice:
-            events.publish(notice)
-            print(notice)
-        else:
-            print(output.wake_agent_false())
+        health.check(DB_PATH)
+        events.result('ok', health.status_text(path=DB_PATH), changed=result.get('status') != 'unchanged')
+        print(output.wake_agent_false())
         return 0
-    except Exception as e:
-        events.result("failed", f"{type(e).__name__}: {e}")
-        fail_count, notify = mark_failure(slot, args.mode, e)
-        if notify:
-            print(f"KDocs 报价抓取连续失败 {fail_count} 次：{type(e).__name__}: {e}。仍将每 15 分钟重试。")
-        else:
-            print(output.wake_agent_false())
-        return 0
+    except Exception as exc:
+        error = f'{type(exc).__name__}: {exc}'
+        try:
+            mark_failure(slot, args.mode, exc)
+        except Exception:
+            pass  # The quote DB itself may be unreadable. Outbox is independent.
+        health.check(DB_PATH, error=error)
+        events.result('failed', error + '\n' + health.status_text(path=DB_PATH))
+        print(output.wake_agent_false())
+        return 1
 
 
 if __name__ == "__main__":

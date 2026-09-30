@@ -60,6 +60,8 @@ def migrate_profile(root: Path) -> None:
 def main() -> None:
     migrate_profile(profile_root('default'))
     rename_xianbao(Outbox())
+    from .tasks.quotes.health import suppress_legacy_notices
+    suppress_legacy_notices(Outbox())
     old_lock = home() / 'run' / (OLD_XIANBAO + '.lock')
     # No process may hold the old lock during the deployment migration.
     old_lock.unlink(missing_ok=True)
