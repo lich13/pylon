@@ -404,6 +404,11 @@ def delete_session(row):
                 stat = history.lstat()
                 if history.is_symlink() or not history.is_file() or stat.st_uid != os.geteuid() or stat.st_nlink != 1:
                     raise PermissionError('unsafe Grok prompt history')
+                with history.open() as stream:
+                    for line in stream:
+                        entry = json.loads(line)
+                        if not sid or not isinstance(entry, dict) or entry.get('session_id') != sid:
+                            raise ValueError('Grok 输入历史与本任务会话不匹配，未删除')
                 history.unlink()
             group.rmdir()
     folder = state.ROOT / 'work' / row['id']

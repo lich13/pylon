@@ -387,10 +387,12 @@ def test_grok_cleanup_removes_owned_prompt_history_and_rejects_unknown_files(iso
     cleaner = importlib.reload(runtime).delete_session
     monkeypatch.setattr(runtime, 'GROK_HOME', isolated / 'grok')
     row = new('grok')
+    sid = str(uuid.uuid4())
+    runtime.record_session(row['id'], sid)
     folder = runtime.workdir(row['id'])
     group = runtime.GROK_HOME / 'sessions' / quote(str(folder), safe='')
     group.mkdir(parents=True)
-    (group / 'prompt_history.jsonl').write_text('{"text":"private task input"}\n')
+    (group / 'prompt_history.jsonl').write_text(json.dumps({'session_id': sid, 'prompt': 'private task input'}) + '\n')
     foreign = group.parent / 'existing-project'
     foreign.mkdir()
     (foreign / 'existing-session').write_text('keep')
@@ -407,3 +409,8 @@ def test_grok_cleanup_removes_owned_prompt_history_and_rejects_unknown_files(iso
     with pytest.raises(PermissionError):
         cleaner(raw(row['id']))
     assert (foreign / 'existing-session').read_text() == 'keep'
+    (group / 'prompt_history.jsonl').unlink()
+    (group / 'prompt_history.jsonl').write_text(json.dumps({'session_id': str(uuid.uuid4()), 'prompt': 'foreign input'}) + '\n')
+    with pytest.raises(ValueError, match='会话不匹配'):
+        cleaner(raw(row['id']))
+    assert 'foreign input' in (group / 'prompt_history.jsonl').read_text()
