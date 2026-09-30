@@ -13,6 +13,12 @@ pylon updates
 pylon updates --all
 pylon update codex
 pylon update grok
+pylon agent run codex '核对 sub2api 实际运行版本，只检查不更新'
+pylon agent run grok '检查 pylon-bot.service 最近错误'
+pylon agent status
+pylon agent reply 任务编号 '补充要求或回答'
+pylon agent cancel 任务编号
+pylon agent logs 任务编号
 pylon ssh status|sync|refresh
 pylon ssh check IP
 pylon chiphell status|test|baseline|pause|resume|import-cookies
@@ -20,7 +26,11 @@ pylon bot-menu sync
 pylon bot-menu check
 ```
 
-两个 Telegram 机器人提供相同的 24 项中文菜单。`/help` 查看全部入口，`/help 命令` 查看参数、示例和操作影响。菜单包含任务管理、通知队列、软件监控、软件更新、Gmail 候选、Chiphell 和 SSH 维护；仅接受配置的本人私聊。
+两个 Telegram 机器人提供相同的 30 项中文菜单。`/help` 查看全部入口，`/help 命令` 查看参数、示例和操作影响。菜单包含任务管理、通知队列、软件监控、软件更新、按需 Agent、Gmail 候选、Chiphell 和 SSH 维护；仅接受配置的本人私聊。
+
+`/agent_codex 任务描述`、`/agent_grok 任务描述` 收集相关信息后以 sudo 启动指定 CLI，沿用现有登录和模型配置；修改类要求会实际执行。`/agent_status [编号]`、`/agent_logs 编号` 查询进度与结果，`/agent_reply 编号 内容` 或直接回复任务消息可继续同一会话，`/agent_cancel 编号` 停止任务。运行中的补充内容在本轮结束后处理；完成后线程不能恢复，须发起新任务。CLI 任务默认向 WebOps 回报。
+
+Agent 由 `pylon-agent.service` 按需执行，无常驻 Agent。全局串行，与 Codex/Grok 更新器共用安装锁；每轮退出后回收专属后台及工具进程。默认累计执行 60 分钟、等待回答 24 小时，root 可在 `/etc/pylon/agents.json` 调整。完成必须通过独立版本、服务状态或文件哈希复核；无独立检查时显示结果待核验。结果先进入持久化 outbox，随后按原生会话 ID 删除线程和临时文件；清理失败独立提示并重试，发送失败不会重做业务操作。取消不撤销已有修改，中断不自动重跑；脱敏结果保留 30 天，原始输入和线程在清理时删除。
 
 `/update_codex` 和 `/update_grok` 通过固定 sudo 入口运行原生更新，只使用 stable 版本；对应会话进程占用时不执行。更新由独立 systemd 服务执行，最长 15 分钟，不阻塞机器人。重复请求合并，完成后向请求所在机器人回报实装版本和结果；发送失败只重试通知，执行结果不确定时不自动重复安装。CLI 发起的更新向 WebOps 回报。
 

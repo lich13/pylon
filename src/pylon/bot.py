@@ -57,6 +57,10 @@ def command_once(box: Outbox) -> bool:
     try:
         env = os.environ.copy()
         env['PYLON_COMMAND_ID'] = f"telegram:{row['profile']}:{row['update_id']}"
+        reply_id = message.get('reply_to_message', {}).get('message_id')
+        env.pop('PYLON_REPLY_MESSAGE_ID', None)
+        if type(reply_id) is int and reply_id > 0:
+            env['PYLON_REPLY_MESSAGE_ID'] = str(reply_id)
         proc = subprocess.run([str(home() / 'venv/bin/python'), '-m', 'pylon.commands', row['profile']],
                               input=message['text'], capture_output=True, text=True, timeout=180, env=env)
         reply = proc.stdout.strip() or '操作失败，请查看 pylon 日志'
@@ -66,7 +70,11 @@ def command_once(box: Outbox) -> bool:
         log.warning("command %s: %s", row['update_id'], redact(str(exc)))
     # Persist the reply before completion. A crash never silently replays
     # a mutating user command (especially a numbered removal).
-    box.enqueue(profile=row['profile'], job_id='bot', kind='text', payload={'text': reply}, key=f"reply:{row['update_id']}")
+    payload = {'text': reply}
+    agent_task = box.get(f"agent-command:telegram:{row['profile']}:{row['update_id']}")
+    if agent_task:
+        payload['agent_task'] = agent_task
+    box.enqueue(profile=row['profile'], job_id='bot', kind='text', payload=payload, key=f"reply:{row['update_id']}")
     with box.connect() as db:
         db.execute("UPDATE updates SET status=? WHERE profile=? AND update_id=?", (status, row['profile'], row['update_id']))
     return True
@@ -130,6 +138,8 @@ def main():
     threads.append(threading.Thread(target=synchronize_background, args=(stop,), daemon=True))
     from .software_updates import synchronize_background as synchronize_updates
     threads.append(threading.Thread(target=synchronize_updates, args=(stop,), daemon=True))
+    from .agent_tasks import synchronize_background as synchronize_agents
+    threads.append(threading.Thread(target=synchronize_agents, args=(stop,), daemon=True))
     for thread in threads:
         thread.start()
     with client() as http:

@@ -29,7 +29,23 @@ def main():
     updates.add_argument('--all', action='store_true', help='包含全部系统包和依赖明细')
     update = sub.add_parser('update', help='后台执行固定的 sudo 软件更新并向 WebOps 回报')
     update.add_argument('target', choices=['codex', 'grok'])
+    agent = sub.add_parser('agent', help='按需调用 Codex/Grok，执行后回报并清理线程')
+    actions = agent.add_subparsers(dest='action', required=True)
+    run = actions.add_parser('run')
+    run.add_argument('provider', choices=['codex', 'grok'])
+    run.add_argument('text', nargs='+')
+    for name in ('status', 'logs', 'cancel', 'reply'):
+        action = actions.add_parser(name)
+        action.add_argument('task_id', nargs='?' if name == 'status' else None, default='')
+        if name == 'reply':
+            action.add_argument('text', nargs='+')
     args = parser.parse_args()
+    if args.command == 'agent':
+        from .agent_tasks import command
+        argument = (' '.join(args.text) if args.action == 'run' else
+                    args.task_id + ' ' + ' '.join(args.text) if args.action == 'reply' else args.task_id)
+        print(command(args.provider if args.action == 'run' else args.action, argument))
+        return 0
     if args.command in {'updates', 'update'}:
         from .software_updates import inventory_text, request_update
         print(inventory_text(full=args.all) if args.command == 'updates' else request_update(args.target))

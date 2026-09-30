@@ -15,8 +15,8 @@ from pylon.transport import DeliveryError
 
 
 def test_catalog_is_valid_chinese_and_has_detailed_help():
-    assert len(COMMANDS) == 24
-    assert len({row['command'] for row in menu_commands()}) == 24
+    assert len(COMMANDS) == 30
+    assert len({row['command'] for row in menu_commands()}) == 30
     for item in COMMANDS.values():
         assert re.fullmatch('[a-z0-9_]{1,32}', item.name)
         assert 1 <= len(item.description) <= 256
@@ -46,6 +46,9 @@ def test_every_menu_entry_reaches_its_existing_operation(name, monkeypatch):
     inventory, update = Mock(return_value='清单'), Mock(return_value='已提交')
     monkeypatch.setattr(software_updates, 'inventory_text', inventory)
     monkeypatch.setattr(software_updates, 'request_update', update)
+    from pylon import agent_tasks
+    agent = Mock(return_value='Agent 已提交')
+    monkeypatch.setattr(agent_tasks, 'command', agent)
     calls = {}
     for method in ('status_text', 'outbox_text', 'control_task', 'ssh_text', 'chiphell_text', 'gmail_text', 'monitor_command'):
         calls[method] = Mock(return_value=method)
@@ -55,7 +58,7 @@ def test_every_menu_entry_reaches_its_existing_operation(name, monkeypatch):
     start, logs = Mock(return_value='已提交'), Mock(return_value='日志')
     monkeypatch.setattr(scheduler, 'start', start)
     monkeypatch.setattr(scheduler, 'logs', logs)
-    argument = {'task': '1', 'gmail': 'gmail-nt-test', 'ssh': '1.2.3.4', 'monitor': 'owner/repo', 'help': 'status'}.get(item.route, '') if item.argument else ''
+    argument = {'task': '1', 'gmail': 'gmail-nt-test', 'ssh': '1.2.3.4', 'monitor': 'owner/repo', 'help': 'status', 'agent': '0123456789ab 检查版本'}.get(item.route, '') if item.argument else ''
     result = commands.handle('default', '/' + name + (' ' + argument if argument else ''))
     if item.route == 'task':
         if item.action in {'pause', 'resume'}:
@@ -73,6 +76,8 @@ def test_every_menu_entry_reaches_its_existing_operation(name, monkeypatch):
         inventory.assert_called_once_with(full=False)
     elif item.route == 'software_update':
         update.assert_called_once_with(item.action, 'default')
+    elif item.route == 'agent':
+        agent.assert_called_once_with(item.action, argument, 'default')
     elif item.route == 'help':
         assert result == help_text('status')
     else:

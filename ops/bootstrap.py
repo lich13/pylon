@@ -89,7 +89,7 @@ def main():
         path.write_text(content)
         os.chown(path, 0, 0)
         path.chmod(0o755)
-    for service in ['pylon-bot.service', 'pylon-ssh-load.service', 'chiphell-fid26-poller.service', 'pylon-update@.service']:
+    for service in ['pylon-bot.service', 'pylon-ssh-load.service', 'chiphell-fid26-poller.service', 'pylon-update@.service', 'pylon-agent.service']:
         install_file(ROOT / 'ops' / service, UNITS / service)
     (UNITS / 'pylon-task@.service').write_text(task_service('scheduled'))
     (UNITS / 'pylon-manual@.service').write_text(task_service('manual'))
@@ -103,6 +103,9 @@ def main():
     config.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
     if not config.exists():
         install_file(ROOT / 'ops/ssh-config.json', config)
+    agent_config = Path('/etc/pylon/agents.json')
+    if not agent_config.exists():
+        install_file(ROOT / 'ops/agents-config.json', agent_config, 0o600)
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
     print('native units prepared; no scheduler started')
 

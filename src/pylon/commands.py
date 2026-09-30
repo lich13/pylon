@@ -200,6 +200,12 @@ def gmail_text(action: str, candidate: str = '') -> str:
 
 def handle(profile: str, text: str) -> str:
     value = text.strip()
+    reply_id = os.environ.get('PYLON_REPLY_MESSAGE_ID', '')
+    if reply_id.isdigit() and not value.startswith('/'):
+        from .agent_tasks import reply_to
+        result = reply_to(profile, int(reply_id), value)
+        if result is not None:
+            return result
     if value == '任务状态':
         return status_text()
     if value.startswith('/'):
@@ -233,6 +239,9 @@ def handle(profile: str, text: str) -> str:
         if item.route == 'software_update':
             from .software_updates import request_update
             return request_update(item.action, profile)
+        if item.route == 'agent':
+            from .agent_tasks import command
+            return command(item.action, argument, profile)
         if item.route == 'task':
             key = 'all' if argument == 'all' and item.action in {'pause', 'resume'} else resolve_job(argument)
             if item.action in {'pause', 'resume'}:
