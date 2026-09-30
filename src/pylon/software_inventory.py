@@ -24,7 +24,7 @@ SOFTWARE = {
     'nexushub': ('NexusHub', 'github', 'lich13/nexushub'),
     'postgres': ('PostgreSQL 18', 'postgres', '18'),
     'redis': ('Redis 8.6', 'redis', '8.6'),
-    'docker': ('Docker（Ubuntu 软件源）', 'github', 'moby/moby'),
+    'docker': ('Docker（Ubuntu 软件源）', 'apt', 'docker.io'),
     'certbot': ('Certbot', 'pypi', 'certbot'),
     'npm': ('npm', 'npm', 'npm'),
     'pnpm': ('pnpm', 'npm', 'pnpm'),
@@ -33,6 +33,8 @@ SOFTWARE = {
     'rsync': ('rsync（手动安装）', 'github', 'RsyncProject/rsync'),
     'chrome': ('Grok Chrome for Testing', 'chrome', ''),
 }
+
+CACHE_SCHEMA = 2
 
 
 def version(value: str) -> str:
@@ -100,7 +102,7 @@ def check(*, max_age: int = 600) -> dict:
     from . import scheduler
     box = Outbox()
     cached = box.get('software_inventory')
-    if cached and time.time() - cached['checked_at'] < max_age:
+    if cached and cached.get('schema') == CACHE_SCHEMA and time.time() - cached['checked_at'] < max_age:
         return cached
     local = json.loads(scheduler.admin('software', 'inventory', timeout=90))
     checks = []
@@ -121,11 +123,16 @@ def check(*, max_age: int = 600) -> dict:
             if not row.get('version'):
                 return row | {'error': row.get('error', '未检测到安装版本')}
             try:
+                if row['kind'] == 'apt':
+                    package = local['apt'].get('managed', {}).get(row['source'])
+                    if not package:
+                        raise ValueError('未能核对对应的 Ubuntu 软件包候选')
+                    return row | {'latest': package['candidate'], 'available': package['upgradable'],
+                                  'basis': 'Engine 自报；按 Ubuntu 软件源判断更新',
+                                  'note': '已安装软件包 ' + package['installed']}
                 target, url = latest(row['kind'], row['source'], http)
                 note = ''
-                if row['id'] == 'docker':
-                    note = '上游版本；按 Ubuntu 软件源维护，不能直接当作 APT 候选'
-                elif row['id'] == 'chrome' or row['source'].lower() == 'playwright':
+                if row['id'] == 'chrome' or row['source'].lower() == 'playwright':
                     note = '需验证浏览器、登录态与业务兼容性'
                 elif version(target).split('.')[0] != version(row['version']).split('.')[0]:
                     note = '跨主版本，需兼容性验证'
@@ -134,7 +141,7 @@ def check(*, max_age: int = 600) -> dict:
                 return row | {'error': redact(str(exc))[:160]}
         with ThreadPoolExecutor(max_workers=8) as pool:
             rows = list(pool.map(one, checks))
-    result = {'checked_at': time.time(), 'apt': local['apt'], 'rows': rows}
+    result = {'schema': CACHE_SCHEMA, 'checked_at': time.time(), 'apt': local['apt'], 'rows': rows}
     box.put('software_inventory', result)
     return result
 

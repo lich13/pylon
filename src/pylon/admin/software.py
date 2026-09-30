@@ -22,9 +22,9 @@ BINARIES = {'codex': '/usr/local/bin/codex', 'grok': '/usr/local/bin/grok'}
 TERMINAL = {'updated', 'current', 'busy', 'failed', 'uncertain'}
 
 
-def capture(argv, timeout=15):
+def capture(argv, timeout=15, *, include_stderr=False):
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=True)
-    return proc.stdout.strip()
+    return (proc.stdout + ('\n' + proc.stderr if include_stderr else '')).strip()
 
 
 @contextlib.contextmanager
@@ -126,7 +126,7 @@ def native_update(target):
 
 
 def installed(target):
-    return version(capture(['/usr/bin/sudo', '-n', '-H', '--', BINARIES[target], '--version']))
+    return probe_version(target, capture(['/usr/bin/sudo', '-n', '-H', '--', BINARIES[target], '--version']))
 
 
 def repair_codex_links():
@@ -212,13 +212,66 @@ def results():
 APT_SCRIPT = '''import apt,json,os
 cache=apt.Cache()
 packages=[]
+managed={}
 for p in cache:
+ if p.name=='docker.io' and p.is_installed and p.candidate:
+  managed[p.name]=dict(installed=p.installed.version,candidate=p.candidate.version,upgradable=p.is_upgradable)
  if p.is_installed and p.is_upgradable:
   packages.append(dict(name=p.name,installed=p.installed.version,candidate=p.candidate.version,security=any('security' in o.archive for o in p.candidate.origins)))
 stamp='/var/lib/apt/periodic/update-success-stamp'
-print(json.dumps(dict(packages=packages,index_time=os.path.getmtime(stamp) if os.path.exists(stamp) else 0,reboot_required=os.path.exists('/var/run/reboot-required'))))'''
+print(json.dumps(dict(packages=packages,managed=managed,index_time=os.path.getmtime(stamp) if os.path.exists(stamp) else 0,reboot_required=os.path.exists('/var/run/reboot-required'))))'''
 PYTHON_SCRIPT = '''import importlib.metadata as m,json
 print(json.dumps({d.metadata['Name']:d.version for d in m.distributions() if str(d.locate_file('')).startswith('/usr/local/') and d.metadata.get('Name')}))'''
+
+
+CONTAINER_BINARIES = {'sub2api': '/app/sub2api', 'easy_proxies': '/usr/local/bin/easy_proxies'}
+
+
+def container_snapshot(target):
+    data = json.loads(capture(['/usr/bin/docker', 'inspect', target]))[0]
+    state = data['State']
+    if not state['Running'] or state['Pid'] <= 0:
+        raise ValueError('容器未运行，无法确认实际版本')
+    proc = Path('/proc') / str(state['Pid'])
+    binary = proc / 'root' / CONTAINER_BINARIES[target].lstrip('/')
+    executable = proc / 'exe'
+    if not executable.samefile(binary):
+        raise ValueError('运行程序与容器内文件不同，无法确认实际版本')
+    stat = executable.stat()
+    return (data['Image'], state['Pid'], state['StartedAt'], stat.st_dev, stat.st_ino), data
+
+
+def container_version(target):
+    before, data = container_snapshot(target)
+    binary = CONTAINER_BINARIES[target]
+    if target == 'sub2api':
+        # The application's online updater replaces the binary in the writable
+        # container layer; image labels remain at the original image version.
+        raw = capture(['/usr/bin/docker', 'exec', target, binary, '--version'], timeout=8, include_stderr=True)
+        value = probe_version(target, raw)
+        basis = '运行程序自报'
+    else:
+        # easy_proxies has no version flag or embedded release version. Trust
+        # its image label only after ruling out mounts and writable-layer edits.
+        path = Path(binary)
+        if any(path.is_relative_to(mount['Destination']) for mount in data['Mounts']):
+            raise ValueError('程序被外部挂载覆盖，不能按镜像标签判定版本')
+        for line in capture(['/usr/bin/docker', 'diff', target]).splitlines():
+            change, changed_path = line.split(' ', 1)
+            if change in {'A', 'C', 'D'} and path.is_relative_to(changed_path):
+                raise ValueError('容器程序已被修改，不能按镜像标签判定版本')
+        # Read the immutable image, not container labels that can be overridden.
+        image_id = before[0]
+        if not re.fullmatch(r'sha256:[0-9a-f]{64}', image_id):
+            raise ValueError('无法确认运行镜像 ID')
+        raw = capture(['/usr/bin/docker', 'image', 'inspect', image_id, '--format',
+                       '{{index .Config.Labels "org.opencontainers.image.version"}}'])
+        value = probe_version(target, raw)
+        basis = '镜像标签推定，程序未替换'
+    after, _ = container_snapshot(target)
+    if before != after:
+        raise ValueError('检查期间容器发生变化，请重试')
+    return {'version': value, 'basis': basis}
 
 
 def inventory():
@@ -243,10 +296,9 @@ def inventory():
             data['installed'][key] = {'version': probe_version(key, capture(argv, timeout=8))}
         except Exception as exc:
             data['installed'][key] = {'error': redact(str(exc))[:160]}
-    for key, container in [('sub2api', 'sub2api'), ('easy_proxies', 'easy_proxies')]:
+    for key in CONTAINER_BINARIES:
         try:
-            raw = capture(['/usr/bin/docker', 'inspect', '--format', '{{index .Config.Labels "org.opencontainers.image.version"}}', container])
-            data['installed'][key] = {'version': version(raw), 'basis': '运行镜像版本'}
+            data['installed'][key] = container_version(key)
         except Exception as exc:
             data['installed'][key] = {'error': redact(str(exc))[:160]}
     try:
@@ -262,12 +314,23 @@ def inventory():
 
 
 def probe_version(target, output):
-    if target == 'openlist':
-        match = re.search(r'^Version:\s*(v?\d+\.\d+\.\d+)\s*$', output, re.MULTILINE)
-        if not match:
-            raise ValueError('OpenList 未返回应用 Version 字段')
-        return version(match.group(1))
-    return version(output)
+    number = r'(\d+(?:\.\d+){1,3})(?![\d.])'
+    prefixes = {
+        'codex': r'^codex-cli ', 'grok': r'^grok ',
+        'openlist': r'^Version:\s*v?', 'sing-box': r'^sing-box version ',
+        'nexushub': r'^nexushub-webd ', 'certbot': r'^certbot ',
+        'uv': r'^uv ', 'rsync': r'^rsync\s+version ',
+        'chrome': r'^Google Chrome for Testing ', 'postgres': r'^postgres \(PostgreSQL\) ',
+        'redis': r'^Redis server v=', 'sub2api': r'\bSub2API v?',
+    }
+    if target in {'npm', 'pnpm', 'corepack', 'docker', 'frp', 'easy_proxies'}:
+        match = re.fullmatch(r'v?' + number, output.strip())
+    else:
+        match = re.search(prefixes[target] + number, output, re.MULTILINE)
+    if not match:
+        name = SOFTWARE[target][0]
+        raise ValueError(name + ' 未返回可识别的应用 Version 字段')
+    return match.group(1)
 
 
 def main(args):

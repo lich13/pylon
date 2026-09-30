@@ -24,7 +24,7 @@ pylon bot-menu check
 
 `/update_codex` 和 `/update_grok` 通过固定 sudo 入口运行原生更新，只使用 stable 版本；对应会话进程占用时不执行。更新由独立 systemd 服务执行，最长 15 分钟，不阻塞机器人。重复请求合并，完成后向请求所在机器人回报实装版本和结果；发送失败只重试通知，执行结果不确定时不自动重复安装。CLI 发起的更新向 WebOps 回报。
 
-`/updates [all]` 查询软件、系统包候选和最近更新结果，最多缓存 10 分钟。APT 候选采用系统自动维护的软件源索引，显示索引时间；Docker 上游版本与 Ubuntu 包候选分别标注。每周一北京时间 09:00 向 WebOps 汇总系统包、开发工具、Python 依赖和浏览器的维护事项；无候选且无异常时静默。
+`/updates [all]` 查询软件、系统包候选和最近更新结果，最多缓存 10 分钟。sub2api 读取容器内程序自报版本，并核对其与运行进程一致；easy_proxies 无版本接口，仅在确认程序未被替换或挂载覆盖时按镜像标签推定，并标明来源。版本读取失败不会退回旧镜像标签。APT 候选采用系统自动维护的软件源索引，显示索引时间；Docker 只按 Ubuntu 软件源候选判断更新。每周一北京时间 09:00 向 WebOps 汇总系统包、开发工具、Python 依赖和浏览器的维护事项；无候选且无异常时静默。
 
 关键服务监控涵盖 FRP、OpenList、sing-box、easy_proxies、Certbot、PostgreSQL 18、Redis 8.6，各源每小时拉取一次。首次登记只建立基线，不回放历史消息。首次部署时在暂停软件监控且等待在途执行结束后，以 webops profile 环境运行 `python -m pylon.tasks.software.infrastructure`；后续部署不重新登记已移除的订阅。
 
