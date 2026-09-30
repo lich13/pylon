@@ -225,6 +225,9 @@ print(json.dumps({d.metadata['Name']:d.version for d in m.distributions() if str
 
 
 CONTAINER_BINARIES = {'sub2api': '/app/sub2api', 'easy_proxies': '/usr/local/bin/easy_proxies'}
+CONTAINER_VERSION_PROBES = {
+    'sub2api': ['/usr/bin/docker', 'exec', 'sub2api', CONTAINER_BINARIES['sub2api'], '--version'],
+}
 
 
 def container_snapshot(target):
@@ -247,7 +250,7 @@ def container_version(target):
     if target == 'sub2api':
         # The application's online updater replaces the binary in the writable
         # container layer; image labels remain at the original image version.
-        raw = capture(['/usr/bin/docker', 'exec', target, binary, '--version'], timeout=8, include_stderr=True)
+        raw = capture(CONTAINER_VERSION_PROBES[target], timeout=8, include_stderr=True)
         value = probe_version(target, raw)
         basis = '运行程序自报'
     else:

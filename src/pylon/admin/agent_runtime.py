@@ -39,6 +39,7 @@ RULES = '''你正在执行本人通过 pylon 明确提交的腾讯云任务。�
 不要调用其他 Agent、子代理、工作流、定时器，不写跨会话记忆，不读取无关会话。
 当前工作目录是任务临时目录，结束后会删除。正式成果必须保存到用户指定位置，未明确保存位置时先询问。
 登录和密钥只供现有程序使用，不得将凭据、完整环境变量、Cookie 或私钥写入输出。
+软件版本优先采用快照中的实际运行信息；需要重新查询时使用 version_command 中已验证的参数，不猜测服务程序的版本子命令，以免意外启动第二个服务进程。
 你已通过 sudo 启动。需要修改时按用户要求完成并验收，不要只提供计划。
 你所使用的 CLI 以及另一种 CLI 的自身升级应由 pylon update codex/grok 专用入口在会话结束后执行；本任务不要更新这两个 CLI 或停止 pylon 自身。
 缺少必要信息时不要使用交互输入或 ask_user_question 工具，直接以 needs_input 返回问题，pylon 会把回答送入同一会话。
@@ -71,6 +72,9 @@ def context(text):
     if targets:
         snapshot = software.inventory()
         data['software'] = {key: snapshot['installed'].get(key, {'error': '未识别'}) for key in targets}
+        for key in targets:
+            if key in software.CONTAINER_VERSION_PROBES:
+                data['software'][key]['version_command'] = software.CONTAINER_VERSION_PROBES[key]
         if 'docker' in targets:
             data['apt'] = snapshot.get('apt', {}).get('managed', {})
         for key in targets[:6]:
