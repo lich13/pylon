@@ -392,12 +392,20 @@ def delete_session(row):
     if row['provider'] == 'grok':
         group = GROK_HOME / 'sessions' / quote(str(state.ROOT / 'work' / row['id']), safe='')
         if group.exists():
-            if group.is_symlink() or group.resolve() != group:
+            if group.is_symlink() or group.resolve() != group or group.stat().st_uid != os.geteuid():
                 raise PermissionError('unsafe Grok session directory')
-            # Native deletion can leave the empty working-directory group.
-            # Never remove any unexpected session or file from that group.
-            if next(group.iterdir(), None) is None:
-                group.rmdir()
+            # Native deletion leaves cwd-wide prompt history containing raw
+            # input. This cwd belongs exclusively to this task. Refuse cleanup
+            # if any other session or unrecognized file appeared in its group.
+            if {p.name for p in group.iterdir()} - {'prompt_history.jsonl'}:
+                raise ValueError('Grok 任务目录存在未识别残留，未删除')
+            history = group / 'prompt_history.jsonl'
+            if history.exists() or history.is_symlink():
+                stat = history.lstat()
+                if history.is_symlink() or not history.is_file() or stat.st_uid != os.geteuid() or stat.st_nlink != 1:
+                    raise PermissionError('unsafe Grok prompt history')
+                history.unlink()
+            group.rmdir()
     folder = state.ROOT / 'work' / row['id']
     if folder.exists():
         if folder.is_symlink() or folder.resolve() != folder or folder.stat().st_uid != os.geteuid():

@@ -381,7 +381,7 @@ def test_foreign_session_and_symlink_cleanup_is_rejected(isolated, monkeypatch):
         cleaner(raw(row['id']))
 
 
-def test_grok_cleanup_removes_only_empty_owned_group(isolated, monkeypatch):
+def test_grok_cleanup_removes_owned_prompt_history_and_rejects_unknown_files(isolated, monkeypatch):
     import importlib
     from urllib.parse import quote
     cleaner = importlib.reload(runtime).delete_session
@@ -390,6 +390,7 @@ def test_grok_cleanup_removes_only_empty_owned_group(isolated, monkeypatch):
     folder = runtime.workdir(row['id'])
     group = runtime.GROK_HOME / 'sessions' / quote(str(folder), safe='')
     group.mkdir(parents=True)
+    (group / 'prompt_history.jsonl').write_text('{"text":"private task input"}\n')
     foreign = group.parent / 'existing-project'
     foreign.mkdir()
     (foreign / 'existing-session').write_text('keep')
@@ -398,5 +399,11 @@ def test_grok_cleanup_removes_only_empty_owned_group(isolated, monkeypatch):
     assert (foreign / 'existing-session').read_text() == 'keep'
     group.mkdir()
     (group / 'unexpected').write_text('preserve')
-    cleaner(raw(row['id']))
+    with pytest.raises(ValueError, match='未识别残留'):
+        cleaner(raw(row['id']))
     assert (group / 'unexpected').read_text() == 'preserve'
+    (group / 'unexpected').unlink()
+    (group / 'prompt_history.jsonl').symlink_to(foreign / 'existing-session')
+    with pytest.raises(PermissionError):
+        cleaner(raw(row['id']))
+    assert (foreign / 'existing-session').read_text() == 'keep'
