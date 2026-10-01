@@ -62,6 +62,16 @@ def test_submit_durable_idempotence_and_provider_selection(isolated):
     assert 'text' not in first and 'session_id' not in first
 
 
+def test_gmail_input_stages_complete_bundle_outside_sqlite(isolated):
+    bundle = json.dumps({'prompt': '只分析样本', 'examples': [{'body': '完整正文'}]}, ensure_ascii=False)
+    row = state.gmail_input('grok', 'default', 'telegram:default:44', bundle)
+    with state.database() as db:
+        stored = db.execute('SELECT text FROM inputs WHERE task_id=?', (row['id'],)).fetchone()[0]
+    assert stored.startswith(state.GMAIL_INPUT_PREFIX)
+    assert '完整正文' not in stored
+    assert (state.ROOT / 'work' / row['id'] / stored.removeprefix(state.GMAIL_INPUT_PREFIX)).is_file()
+
+
 @pytest.mark.parametrize('provider,profile,key,text', [
     ('bash', 'default', 'telegram:default:1', 'x'), ('codex', 'other', 'cli:' + 'a' * 32, 'x'),
     ('codex', 'default', 'telegram:webops:1', 'x'), ('codex', 'default', '../bad', 'x'),

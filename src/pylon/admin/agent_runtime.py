@@ -147,6 +147,11 @@ def argv(row, folder):
              '--disallowed-tools', 'spawn_subagent,send_subagent_message,workflow,scheduler_create,scheduler_delete,scheduler_list,monitor,ask_user_question',
              '--leader-socket', str(folder / 'leader.sock'), '--prompt-file', str(folder / 'prompt.txt'),
              '--output-format', 'streaming-json', '-m', config['model']]
+    if row.get('purpose') == 'gmail_review':
+        # Mail is untrusted input. The provider gets no tools with which to
+        # touch credentials, scripts, mail, the network, or the host.
+        base[base.index('bypassPermissions')] = 'dontAsk'
+        base += ['--tools', '', '--deny', '*', '--disable-web-search']
     if config['effort']:
         base += ['--reasoning-effort', config['effort']]
     return base + (['--resume', sid] if row['turns'] > 1 else ['--session-id', sid])
@@ -256,7 +261,21 @@ def run_turn(row, inputs, remaining):
     progress(row['id'], '正在收集本轮相关信息')
     with state.database() as db:
         original = db.execute('SELECT text FROM inputs WHERE task_id=? ORDER BY seq LIMIT 1', (row['id'],)).fetchone()
-    snapshot = context((original[0] if original else '') + '\n' + '\n'.join(inputs))
+    snapshot = {} if row.get('purpose') == 'gmail_review' else context((original[0] if original else '') + '\n' + '\n'.join(inputs))
+    expanded = []
+    for value in inputs:
+        if row.get('purpose') == 'gmail_review' and value.startswith(state.GMAIL_INPUT_PREFIX):
+            name = value.removeprefix(state.GMAIL_INPUT_PREFIX)
+            if not re.fullmatch(r'gmail-[0-9a-f]{24}\.json', name):
+                raise ValueError('invalid Gmail input reference')
+            path = folder / name
+            if path.is_symlink() or path.stat().st_uid != os.geteuid() or path.stat().st_mode & 0o077:
+                raise PermissionError('unsafe Gmail sample input')
+            bundle = json.loads(path.read_text())
+            expanded.append(bundle['prompt'] + '\n<untrusted_mail_samples>\n' + json.dumps(bundle['examples'], ensure_ascii=False) + '\n</untrusted_mail_samples>')
+        else:
+            expanded.append(value)
+    inputs = expanded
     if not json.loads(row['settings']):
         config = settings(row['provider'])
         with state.database() as db:

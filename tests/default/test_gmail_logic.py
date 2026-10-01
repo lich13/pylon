@@ -1,4 +1,4 @@
-from pylon.tasks.gmail.logic import html_to_text, matches, validate_program
+from pylon.tasks.gmail.logic import html_to_text, matches, validate_program, narrow_query, get_message_full
 from pylon.tasks.gmail import cleanup
 
 
@@ -49,3 +49,35 @@ def test_cleanup_logic_filter_honors_starred_and_effective_time(monkeypatch):
     rule = {'logic': program(), 'effective_after_utc': '1970-01-01T00:00:01Z'}
     kept, rejected = cleanup.filter_logic_message_ids(object(), rule, ['m1', 'm2', 'm3'])
     assert kept == ['m1'] and rejected == 2
+
+
+def test_new_query_requires_sender_and_preserves_quoted_terms():
+    assert narrow_query('-is:starred from:alerts@example.com subject:"weekly digest"')
+    assert not narrow_query('-is:starred subject:"weekly digest"')
+    assert not narrow_query('-is:starred from:alerts@example.com {digest unsubscribe}')
+
+
+def test_full_message_reads_text_attachment_and_decodes_headers():
+    class Call:
+        def __init__(self, value): self.value = value
+        def execute(self): return self.value
+    class Attachments:
+        def get(self, **kwargs):
+            return Call({'data': 'VGV4dCBhdHRhY2htZW50'})
+    class Messages:
+        def get(self, **kwargs):
+            return Call({'id': 'm1', 'internalDate': '2000', 'labelIds': ['INBOX'], 'payload': {
+                'headers': [{'name': 'From', 'value': '=?utf-8?b?5Y+R5Lu2?= <a@example.com>'}],
+                'mimeType': 'multipart/mixed', 'parts': [
+                    {'mimeType': 'text/plain', 'body': {'data': '5L2g5aW9'}},
+                    {'mimeType': 'text/plain', 'filename': 'note.txt', 'body': {'attachmentId': 'a1', 'size': 20}},
+                ]}})
+        def attachments(self): return Attachments()
+    class Users:
+        def messages(self): return Messages()
+    class Service:
+        def users(self): return Users()
+    result = get_message_full(Service(), 'm1')
+    assert result['from'].startswith('发件')
+    assert '你好' in result['body'] and 'Text attachment' in result['body']
+    assert result['attachment_names'] == ['note.txt']

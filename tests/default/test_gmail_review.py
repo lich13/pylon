@@ -62,6 +62,20 @@ def test_validate_requires_star_protection(files):
         review.validate_proposal(value)
 
 
+def test_logic_proposal_requires_narrow_query_exclusion(files):
+    value = proposal()
+    value['operations'][0]['logic'] = {
+        'version': 1,
+        'all': [{'field': 'from', 'op': 'equals', 'value': 'alerts@example.com'}],
+        'any': [],
+        'none': [{'field': 'subject', 'op': 'contains', 'value': '安全'}],
+    }
+    assert review.validate_proposal(value, require_logic=True)['operations'][0]['logic']['version'] == 1
+    value['operations'][0]['query'] = '-is:starred subject:登录'
+    with pytest.raises(ValueError, match='准确发件人'):
+        review.validate_proposal(value, require_logic=True)
+
+
 def test_agent_schema_accepts_gmail_proposal():
     payload = {
         'status': 'completed', 'summary': '已生成草案', 'question': '',
@@ -147,6 +161,21 @@ def test_preview_and_apply_are_read_only_then_future_only(files, monkeypatch):
     assert saved['status'] == 'applied'
     candidate_state = json.loads((files / 'new_type_candidates.json').read_text())
     assert candidate_state['candidates']['gmail-nt-test1234']['status'] == 'applied'
+
+
+def test_apply_requires_same_preview_snapshot(files, monkeypatch):
+    proposal_id = 'gmail-rp-' + 'd' * 12
+    record = {'id': proposal_id, 'candidate_id': 'gmail-nt-test1234', 'agent_task_id': 'b' * 32,
+              'status': 'pending', 'base_rules_hash': review._rule_digest(), **proposal(), 'created_at_utc': 'now'}
+    review._save(review.PROPOSALS_PATH, {'version': 1, 'proposals': {proposal_id: record}})
+    monkeypatch.setattr(cleanup, 'build_gmail_service', lambda: object())
+    phase = {'value': 0}
+    monkeypatch.setattr(cleanup, 'list_message_ids', lambda service, query, max_messages=None: ['m1'] if phase['value'] == 0 else ['m2'])
+    monkeypatch.setattr(cleanup, 'get_message_metadata', lambda service, mid: {'id': mid, 'subject': mid, 'from': 'alerts@example.com'})
+    review.preview(proposal_id)
+    phase['value'] = 1
+    with pytest.raises(ValueError, match='变化'):
+        review.apply(proposal_id)
 
 
 def test_reject_returns_candidate_to_pending(files):

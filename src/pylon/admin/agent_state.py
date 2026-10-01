@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,8 @@ CONFIG = Path('/etc/pylon/agents.json')
 TERMINAL = {'succeeded', 'failed', 'uncertain', 'interrupted', 'cancelled', 'timed_out'}
 PROVIDERS = {'codex', 'grok'}
 PROFILES = {'default', 'webops'}
+GMAIL_INPUT_LIMIT = 4 * 1024 * 1024
+GMAIL_INPUT_PREFIX = 'pylon-gmail-input:'
 
 
 def clean_text(value, limit=12000):
@@ -97,6 +100,8 @@ def database():
               payload TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0,
               created_at REAL NOT NULL);
         ''')
+        if 'purpose' not in {r[1] for r in db.execute('PRAGMA table_info(tasks)')}:
+            db.execute("ALTER TABLE tasks ADD COLUMN purpose TEXT NOT NULL DEFAULT 'general'")
         try:
             with db:
                 yield db
@@ -177,6 +182,51 @@ def reply(task_id, profile, key, text):
         db.execute("UPDATE tasks SET status=CASE WHEN status='waiting' THEN 'queued' ELSE status END, waiting_since=NULL,updated_at=? WHERE id=?",
                    (time.time(), row['id']))
         return public(task(db, row['id']))
+
+
+def gmail_input(target, profile, key, value, *, resume=False):
+    """Keep originals only in the private, task-owned workspace, never SQLite."""
+    request_key(key, profile)
+    if not isinstance(value, str) or len(value.encode()) > GMAIL_INPUT_LIMIT or '\0' in value:
+        raise ValueError('完整样本过大，请减少选定样本后重试；未截断原文')
+    bundle = json.loads(value)
+    if not isinstance(bundle, dict) or set(bundle) != {'prompt', 'examples'} or not isinstance(bundle['examples'], list):
+        raise ValueError('invalid Gmail review input')
+    prompt_text(bundle['prompt'])
+    if len(bundle['examples']) > 12:
+        raise ValueError('一次最多分析 12 个完整样本')
+    with database() as db:
+        previous = db.execute('SELECT task_id FROM requests WHERE id=?', (key,)).fetchone()
+        if previous:
+            return public(task(db, previous[0]))
+        now = time.time()
+        if resume:
+            row = task(db, target)
+            if row['purpose'] != 'gmail_review' or row['profile'] != profile or row['status'] in TERMINAL or row['cancelled']:
+                raise ValueError('Gmail 审查任务已结束或不属于此会话')
+            if row['status'] == 'waiting' and now - row['waiting_since'] >= limits()['waiting_seconds']:
+                raise ValueError('Gmail 审查等待已到期，请重新分析')
+            task_id = row['id']
+        else:
+            if target != 'grok':
+                raise ValueError('Gmail 审查只使用 Grok')
+            task_id = uuid.uuid4().hex
+            db.execute("INSERT INTO tasks(id,provider,profile,status,created_at,updated_at,purpose) VALUES(?,?,?,'queued',?,?,'gmail_review')",
+                       (task_id, 'grok', profile, now, now))
+        parent = private_dir(ROOT / 'work')
+        folder = private_dir(parent / task_id)
+        if folder.resolve() != folder:
+            raise PermissionError('unsafe Gmail workspace')
+        name = 'gmail-' + hashlib.sha256(key.encode()).hexdigest()[:24] + '.json'
+        fd = os.open(folder / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(bundle, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        db.execute('INSERT INTO requests VALUES(?,?)', (key, task_id))
+        db.execute('INSERT INTO inputs(task_id,text) VALUES(?,?)', (task_id, GMAIL_INPUT_PREFIX + name))
+        db.execute("UPDATE tasks SET status=CASE WHEN status='waiting' THEN 'queued' ELSE status END,waiting_since=NULL,updated_at=? WHERE id=?", (now, task_id))
+        return public(task(db, task_id))
 
 
 def finish(db, task_id, status, result, *, elapsed=0):

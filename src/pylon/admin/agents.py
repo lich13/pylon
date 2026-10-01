@@ -139,9 +139,11 @@ def main(args):
     if not args:
         raise ValueError('missing agent action')
     action = args[0]
-    if action in {'run', 'reply', 'cancel'} and len(args) == 4:
+    if action in {'run', 'reply', 'cancel', 'gmail-run', 'gmail-reply'} and len(args) == 4:
         target, profile, key = args[1:]
-        if action == 'run':
+        if action in {'gmail-run', 'gmail-reply'}:
+            output = state.gmail_input(target, profile, key, sys.stdin.read(state.GMAIL_INPUT_LIMIT + 1), resume=action == 'gmail-reply')
+        elif action == 'run':
             output = state.submit(target, profile, key, sys.stdin.read(16001))
         elif action == 'reply':
             output = state.reply(target, profile, key, sys.stdin.read(16001))
