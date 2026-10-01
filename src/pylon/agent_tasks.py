@@ -35,6 +35,15 @@ def render(row, *, details=True):
         result = row.get('result', {})
         if result.get('summary'):
             lines.append(result['summary'])
+        review = result.get('gmail_review')
+        if isinstance(review, dict):
+            if review.get('proposal_id'):
+                lines.append(f"Gmail 规则草案 {review['proposal_id']}：{review.get('summary', '已生成')}\n"
+                             f"请先使用 /gmail_rule_preview {review['proposal_id']}，确认后使用 /gmail_rule_apply {review['proposal_id']}。")
+            elif review.get('status') == 'waiting' and review.get('question'):
+                lines.append('Gmail 审查需要补充：' + review['question'])
+            elif review.get('error'):
+                lines.append('Gmail 规则草案失败：' + str(review['error'])[:1200])
         for field, title in [('changes', '修改'), ('verification', 'Agent 验证'), ('independent_checks', '独立复核'), ('limitations', '未完成或限制')]:
             if result.get(field):
                 lines.append(title + '：\n' + '\n'.join('• ' + str(x) for x in result[field]))
@@ -120,6 +129,14 @@ def reconcile(box=None):
     rows = invoke('results')
     for event in rows:
         row = json.loads(event['payload'])
+        gmail_review = None
+        try:
+            from .tasks.gmail import review as gmail_review_module
+            gmail_review = gmail_review_module.consume_agent_result(row)
+        except Exception as exc:
+            logging.getLogger('pylon').warning('gmail review result: %s', redact(str(exc)))
+        if gmail_review is not None:
+            row.setdefault('result', {})['gmail_review'] = gmail_review
         if row['cleanup'] == 'done':
             text = f"Agent #{row['id'][:12]}：本次线程、原始对话及临时文件已清理。"
         elif row['cleanup'] == 'failed':

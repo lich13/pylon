@@ -15,8 +15,8 @@ from pylon.transport import DeliveryError
 
 
 def test_catalog_is_valid_chinese_and_has_detailed_help():
-    assert len(COMMANDS) == 30
-    assert len({row['command'] for row in menu_commands()}) == 30
+    assert len(COMMANDS) == 36
+    assert len({row['command'] for row in menu_commands()}) == len(COMMANDS)
     for item in COMMANDS.values():
         assert re.fullmatch('[a-z0-9_]{1,32}', item.name)
         assert 1 <= len(item.description) <= 256

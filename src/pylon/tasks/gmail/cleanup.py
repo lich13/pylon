@@ -20,6 +20,7 @@ TOKEN_PATH = PYLON_PROFILE_ROOT / "google_token.json"
 DATA_DIR = PYLON_PROFILE_ROOT / "data" / "gmail_cleanup"
 EXTRA_RULES_PATH = DATA_DIR / "extra_rules.json"
 NEW_TYPE_STATE_PATH = DATA_DIR / "new_type_candidates.json"
+RULE_OVERRIDES_PATH = DATA_DIR / "rule_overrides.json"
 # Keep this aligned with gmail_cleanup_oauth.py and the stored token.
 # Using narrower Gmail scopes here can make refresh fail with invalid_scope
 # when the token was originally granted for https://mail.google.com/.
@@ -695,9 +696,84 @@ def load_extra_rules(path: Path | None = None) -> list[dict[str, Any]]:
     return out
 
 
+def load_rule_overrides(path: Path | None = None) -> dict[str, Any]:
+    path = path or RULE_OVERRIDES_PATH
+    data = load_json(path, {"version": 1, "operations": []})
+    if not isinstance(data, dict):
+        return {"version": 1, "operations": []}
+    operations = data.get("operations")
+    if not isinstance(operations, list):
+        operations = []
+    cleaned = []
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        kind = str(operation.get("operation") or "").strip()
+        target = str(operation.get("target_rule") or "").strip()
+        if kind not in {"add", "modify", "disable"} or not target:
+            continue
+        item = {
+            "operation": kind,
+            "target_rule": target,
+            "name": str(operation.get("name") or target).strip(),
+            "description": str(operation.get("description") or target).strip(),
+            "query": str(operation.get("query") or "").strip(),
+            "source": str(operation.get("source") or "gmail_grok_review").strip(),
+            "source_candidate_id": str(operation.get("source_candidate_id") or "").strip(),
+            "proposal_id": str(operation.get("proposal_id") or "").strip(),
+            "updated_at_utc": str(operation.get("updated_at_utc") or "").strip(),
+        }
+        if kind != "disable" and (
+            not item["query"]
+            or PROTECTION not in item["query"].split()
+            or re.search(r"(?<!-)\bis:starred\b", item["query"], re.I)
+            or any(token in item["query"] for token in ("\x00", "\n", ";", "&&", "||", "`"))
+        ):
+            continue
+        cleaned.append(item)
+    try:
+        version = int(data.get("version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    return {"version": version, "operations": cleaned}
+
+
+def effective_rules(
+    extra_rules_path: Path | None = None,
+    overrides_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return built-ins plus accepted rules and validated runtime overrides."""
+    rules = [dict(rule) for rule in [*RULES, *load_extra_rules(extra_rules_path)]]
+    by_name = {str(rule.get("name")): index for index, rule in enumerate(rules)}
+    for operation in load_rule_overrides(overrides_path).get("operations", []):
+        kind = operation["operation"]
+        target = operation["target_rule"]
+        if kind == "disable":
+            index = by_name.get(target)
+            if index is not None:
+                rules[index] = None
+            continue
+        rule = {
+            "name": operation["name"] or target,
+            "query": operation["query"],
+            "description": operation["description"] or operation["name"] or target,
+            "source": operation.get("source") or "gmail_grok_review",
+            "source_candidate_id": operation.get("source_candidate_id") or "",
+        }
+        index = by_name.get(target)
+        if kind == "modify" and index is not None:
+            rules[index] = rule
+            by_name[rule["name"]] = index
+            if rule["name"] != target:
+                by_name.pop(target, None)
+        elif kind == "add" and rule["name"] not in by_name:
+            by_name[rule["name"]] = len(rules)
+            rules.append(rule)
+    return [rule for rule in rules if isinstance(rule, dict)]
+
+
 def all_rules(extra_rules_path: Path | None = None) -> list[dict[str, Any]]:
-    extra_rules_path = extra_rules_path or EXTRA_RULES_PATH
-    return [*RULES, *load_extra_rules(extra_rules_path)]
+    return effective_rules(extra_rules_path)
 
 
 def sender_email(value: str) -> str:
@@ -751,7 +827,10 @@ def load_candidate_state(path: Path | None = None) -> dict[str, Any]:
         data = {"version": 1, "candidates": {}}
     if not isinstance(data.get("candidates"), dict):
         data["candidates"] = {}
-    data.setdefault("version", 1)
+    try:
+        data["version"] = max(2, int(data.get("version") or 1))
+    except (TypeError, ValueError):
+        data["version"] = 2
     return data
 
 

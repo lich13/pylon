@@ -98,14 +98,23 @@ def execute_next():
                 result = runtime.run_turn(row, [r['text'] for r in pending], remaining)
                 status = {'completed': 'succeeded', 'needs_input': 'waiting', 'failed': 'failed'}[result['status']]
                 if status == 'succeeded':
-                    try:
-                        result['independent_checks'] = runtime.verify(result.pop('checks'))
-                    except Exception as exc:
-                        result['independent_checks'] = []
-                        result['limitations'].append(state.clean_text(exc, 2000))
-                    if not result['independent_checks']:
-                        status = 'uncertain'
-                        result['limitations'].append('Agent 已结束；本任务没有可独立复核的验收项，结论待核验。')
+                    if result.get('gmail_proposal'):
+                        # Gmail review proposals are read-only until the user
+                        # explicitly applies them.  Their independent check is
+                        # the strict structure/protection validation above;
+                        # Gmail counts are refreshed by /gmail_rule_preview.
+                        runtime.validate_gmail_proposal(result['gmail_proposal'])
+                        result.pop('checks', None)
+                        result['independent_checks'] = ['规则草案结构与 -is:starred 保护已由 pylon 校验']
+                    else:
+                        try:
+                            result['independent_checks'] = runtime.verify(result.pop('checks'))
+                        except Exception as exc:
+                            result['independent_checks'] = []
+                            result['limitations'].append(state.clean_text(exc, 2000))
+                        if not result['independent_checks']:
+                            status = 'uncertain'
+                            result['limitations'].append('Agent 已结束；本任务没有可独立复核的验收项，结论待核验。')
                 else:
                     result.pop('checks', None)
             except Exception as exc:

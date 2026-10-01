@@ -76,6 +76,11 @@ def status_text() -> str:
     counts = box.counts()
     unresolved = sum(counts.get(s, 0) for s in ('pending', 'sending', 'uncertain', 'failed'))
     lines.append(f"待处理通知 {unresolved}；回执不确定 {counts.get('uncertain', 0)}")
+    try:
+        from .tasks.gmail.review import status_line as gmail_review_status
+        lines.append(gmail_review_status())
+    except Exception as exc:
+        lines.append('Gmail 新类型审查状态暂不可读：' + redact(str(exc))[:160])
     from .tasks.quotes.health import status_text as quote_status
     lines.append(quote_status(box=box))
     return "\n".join(lines)
@@ -190,6 +195,17 @@ def chiphell_text(action: str) -> str:
 
 
 def gmail_text(action: str, candidate: str = '') -> str:
+    if action in {'candidate', 'feedback', 'review_status', 'rule_preview', 'rule_apply', 'rule_reject'}:
+        from .tasks.gmail import review
+        profile = os.environ.get('PYLON_COMMAND_PROFILE', 'default')
+        request_key = os.environ.get('PYLON_COMMAND_ID', '')
+        try:
+            return review.command(action, candidate, profile, request_key)
+        except ValueError as exc:
+            return str(exc) + '\n\n' + help_text('gmail_' + action)
+    if action == 'list':
+        from .tasks.gmail import review
+        return review.list_candidates()
     if action != 'list' and not re.fullmatch(r'gmail-nt-[A-Za-z0-9_-]+', candidate):
         return '候选 ID 格式不正确，请从 /gmail_candidates 复制完整 ID。\n\n' + help_text('gmail_' + action)
     arguments = ['--list-candidates'] if action == 'list' else [f'--{action}-candidate', candidate]
@@ -201,6 +217,7 @@ def gmail_text(action: str, candidate: str = '') -> str:
 
 
 def handle(profile: str, text: str) -> str:
+    os.environ['PYLON_COMMAND_PROFILE'] = profile
     value = text.strip()
     reply_id = os.environ.get('PYLON_REPLY_MESSAGE_ID', '')
     if reply_id.isdigit() and not value.startswith('/'):

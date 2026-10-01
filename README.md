@@ -26,7 +26,9 @@ pylon bot-menu sync
 pylon bot-menu check
 ```
 
-两个 Telegram 机器人提供相同的 30 项中文菜单。`/help` 查看全部入口，`/help 命令` 查看参数、示例和操作影响。菜单包含任务管理、通知队列、软件监控、软件更新、按需 Agent、Gmail 候选、Chiphell 和 SSH 维护；仅接受配置的本人私聊。
+两个 Telegram 机器人提供相同的 36 项中文菜单。`/help` 查看全部入口，`/help 命令` 查看参数、示例和操作影响。菜单包含任务管理、通知队列、软件监控、软件更新、按需 Agent、Gmail 候选审查、Chiphell 和 SSH 维护；仅接受配置的本人私聊。
+
+Gmail 的 `/gmail_candidates` 只展示尚未确认的新类型；已确认的内置和自定义类型继续自动清理。对候选使用 `/gmail_candidate 候选ID` 查看元数据，再用 `/gmail_feedback 候选ID 意见` 交给 Grok 生成规则草案。草案通过 `/gmail_rule_preview 提案ID` 预览、`/gmail_rule_apply 提案ID` 确认后写入运行时覆盖层，下一次排程才会按新规则清理；反馈、预览和应用命令都不会删除当前邮件。`/gmail_accept` 和 `/gmail_ignore` 保留为兼容入口。
 
 `/agent_codex 任务描述`、`/agent_grok 任务描述` 收集相关信息后以 sudo 启动指定 CLI，沿用现有登录和模型配置；修改类要求会实际执行。`/agent_status [编号]`、`/agent_logs 编号` 查询进度与结果，`/agent_reply 编号 内容` 或直接回复任务消息可继续同一会话，`/agent_cancel 编号` 停止任务。运行中的补充内容在本轮结束后处理；完成后线程不能恢复，须发起新任务。CLI 任务默认向 WebOps 回报。
 

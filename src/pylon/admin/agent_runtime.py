@@ -31,6 +31,21 @@ SCHEMA = {
             'properties': {'kind': {'type': 'string', 'enum': ['software_version', 'service_active', 'file_sha256']},
                            'target': {'type': 'string'}, 'expected': {'type': 'string'}},
             'required': ['kind', 'target', 'expected']}},
+        'gmail_proposal': {'type': 'object', 'additionalProperties': False,
+            'properties': {
+                'title': {'type': 'string'}, 'summary': {'type': 'string'},
+                'operations': {'type': 'array', 'items': {'type': 'object', 'additionalProperties': False,
+                    'properties': {
+                        'operation': {'type': 'string', 'enum': ['add', 'modify', 'disable']},
+                        'target_rule': {'type': 'string'}, 'name': {'type': 'string'},
+                        'description': {'type': 'string'}, 'query': {'type': 'string'},
+                        'reason': {'type': 'string'},
+                    },
+                    'required': ['operation', 'target_rule', 'name', 'description', 'query', 'reason']}},
+                'impact': {'type': 'array', 'items': {'type': 'string'}},
+                'verification': {'type': 'array', 'items': {'type': 'string'}},
+            },
+            'required': ['title', 'summary', 'operations', 'impact', 'verification']},
     },
     'required': ['status', 'summary', 'question', 'changes', 'verification', 'limitations', 'checks'],
 }
@@ -153,7 +168,7 @@ def parse_result(text):
     for found in re.finditer(r'\{', text):
         try:
             candidate, _ = decoder.raw_decode(text[found.start():])
-            if isinstance(candidate, dict) and set(SCHEMA['required']) == set(candidate):
+            if isinstance(candidate, dict) and set(SCHEMA['required']) <= set(candidate) <= set(SCHEMA['properties']):
                 value = candidate
         except ValueError:
             continue
@@ -171,7 +186,35 @@ def parse_result(text):
         raise ValueError('Agent 请求回答但没有返回问题')
     if not isinstance(value['checks'], list) or len(value['checks']) > 20:
         raise ValueError('Agent 验收项异常')
+    if 'gmail_proposal' in value:
+        validate_gmail_proposal(value['gmail_proposal'])
     return value
+
+
+def validate_gmail_proposal(proposal):
+    """Validate the agent-facing envelope before it can be persisted."""
+    if not isinstance(proposal, dict) or set(proposal) != {'title', 'summary', 'operations', 'impact', 'verification'}:
+        raise ValueError('Gmail 规则草案字段异常')
+    if not isinstance(proposal['title'], str) or not isinstance(proposal['summary'], str):
+        raise ValueError('Gmail 规则草案说明异常')
+    if not isinstance(proposal['operations'], list) or not 1 <= len(proposal['operations']) <= 10:
+        raise ValueError('Gmail 规则草案操作数量异常')
+    if not all(isinstance(x, str) for x in proposal['impact'] + proposal['verification']):
+        raise ValueError('Gmail 规则草案影响说明异常')
+    for operation in proposal['operations']:
+        if not isinstance(operation, dict) or set(operation) != {'operation', 'target_rule', 'name', 'description', 'query', 'reason'}:
+            raise ValueError('Gmail 规则操作字段异常')
+        if operation['operation'] not in {'add', 'modify', 'disable'}:
+            raise ValueError('Gmail 规则操作类型异常')
+        if not all(isinstance(operation[key], str) for key in ('target_rule', 'name', 'description', 'query', 'reason')):
+            raise ValueError('Gmail 规则操作值异常')
+        query = operation['query']
+        if operation['operation'] != 'disable':
+            if '-is:starred' not in query.split() or re.search(r'(?<!-)\bis:starred\b', query, re.I):
+                raise ValueError('Gmail 规则查询缺少 -is:starred 保护')
+        elif query:
+            raise ValueError('停用 Gmail 规则不能包含查询条件')
+    return proposal
 
 
 def verify(checks):
