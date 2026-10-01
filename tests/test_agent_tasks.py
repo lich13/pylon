@@ -273,6 +273,7 @@ def test_native_arguments_pin_provider_disable_memory_and_use_exact_resume(isola
         assert args[args.index('--') + 1] == '/usr/local/bin/' + provider
         if provider == 'grok':
             assert 'GROK_MEMORY=0' in args[:args.index('--')]
+            assert '--no-leader' in args
             disabled = set(args[args.index('--disallowed-tools') + 1].split(','))
             # All scheduler tools depend on the subagent runtime, including
             # the read-only list operation; leaving one enabled prevents init.

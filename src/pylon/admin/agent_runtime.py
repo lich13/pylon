@@ -138,7 +138,10 @@ def argv(row, folder):
     # sudo resets environment variables. Pass only these fixed, explicit
     # session overrides through sudo itself; never preserve the caller's env.
     base = base[:3] + ['GROK_MEMORY=0', 'GROK_SUBAGENTS=0', 'GROK_DISABLE_AUTOUPDATER=1'] + base[3:]
-    base += ['--cwd', str(folder), '--no-subagents', '--permission-mode', 'bypassPermissions',
+    # Grok 1.0.46 waits indefinitely when a custom leader socket is supplied
+    # without explicitly disabling leader reuse.  Keep the socket isolated,
+    # but force a private headless process for every pylon task.
+    base += ['--cwd', str(folder), '--no-subagents', '--no-leader', '--permission-mode', 'bypassPermissions',
              '--disallowed-tools', 'spawn_subagent,send_subagent_message,workflow,scheduler_create,scheduler_delete,scheduler_list,monitor,ask_user_question',
              '--leader-socket', str(folder / 'leader.sock'), '--prompt-file', str(folder / 'prompt.txt'),
              '--output-format', 'streaming-json', '-m', config['model']]
