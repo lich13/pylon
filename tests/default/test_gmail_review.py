@@ -157,3 +157,49 @@ def test_reject_returns_candidate_to_pending(files):
     assert '保留待重新提交意见' in review.reject(proposal_id)
     state = json.loads((files / 'new_type_candidates.json').read_text())
     assert state['candidates']['gmail-nt-test1234']['status'] == 'pending'
+
+
+def test_button_signature_and_sample_reason_flow(files, monkeypatch):
+    profile = 'default'
+    data = review.dashboard_payload(profile)
+    assert 'Gmail 清理向导' in data['text']
+    callback = {
+        'id': 'callback-1',
+        'data': review.callback_data(profile, 'delete', 'gmail-nt-test1234'),
+        'message': {'message_id': 77},
+    }
+    marked = review.callback(profile, callback, 'telegram:default:77')
+    assert '应删除' in marked['text']
+    callback['id'] = 'callback-2'
+    callback['data'] = review.callback_data(profile, 'reason_delete', 'gmail-nt-test1234')
+    review.callback(profile, callback, 'telegram:default:78')
+    assert '已记录' in review.bind_reason(profile, 77, '这是营销通知，没有安全或账单价值。')
+    state = json.loads((files / 'reviews.json').read_text())
+    sample = state['reviews']['gmail-nt-test1234']['examples']['delete'][0]
+    assert sample['reason'].startswith('这是营销')
+
+
+def test_logic_proposal_is_persisted_and_preview_uses_local_filter(files, monkeypatch):
+    value = proposal()
+    value['operations'][0]['logic'] = {
+        'version': 1,
+        'all': [{'field': 'from', 'op': 'contains', 'value': 'alerts@example.com'}],
+        'any': [{'field': 'subject', 'op': 'contains', 'value': '登录'}],
+        'none': [{'field': 'subject', 'op': 'contains', 'value': '安全'}],
+    }
+    assert review.validate_proposal(value)['operations'][0]['logic']['version'] == 1
+
+
+def test_applied_logic_proposal_can_be_rolled_back(files, monkeypatch):
+    proposal_id = 'gmail-rp-' + 'e' * 12
+    value = proposal()
+    value['operations'][0]['logic'] = {
+        'version': 1, 'all': [{'field': 'from', 'op': 'contains', 'value': 'alerts@example.com'}],
+        'any': [{'field': 'subject', 'op': 'contains', 'value': '登录'}], 'none': [],
+    }
+    record = {'id': proposal_id, 'candidate_id': 'gmail-nt-test1234', 'status': 'applied',
+              'base_rules_hash': review._rule_digest(), **value, 'created_at_utc': 'now'}
+    review._save(review.PROPOSALS_PATH, {'version': 1, 'proposals': {proposal_id: record}})
+    cleanup.save_json(cleanup.RULE_OVERRIDES_PATH, {'version': 2, 'operations': [{'operation': 'add', 'target_rule': 'login_notice', 'name': 'login_notice', 'description': 'x', 'query': value['operations'][0]['query'], 'logic': value['operations'][0]['logic'], 'proposal_id': proposal_id}]})
+    assert '已回滚' in review.rollback(proposal_id)
+    assert json.loads((files / 'rule_overrides.json').read_text())['operations'] == []

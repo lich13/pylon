@@ -40,6 +40,8 @@ SCHEMA = {
                         'target_rule': {'type': 'string'}, 'name': {'type': 'string'},
                         'description': {'type': 'string'}, 'query': {'type': 'string'},
                         'reason': {'type': 'string'},
+                        'logic': {'type': 'object'}, 'effective_after_utc': {'type': 'string'},
+                        'sample_validation': {'type': 'object'},
                     },
                     'required': ['operation', 'target_rule', 'name', 'description', 'query', 'reason']}},
                 'impact': {'type': 'array', 'items': {'type': 'string'}},
@@ -205,7 +207,8 @@ def validate_gmail_proposal(proposal):
     if not all(isinstance(x, str) for x in proposal['impact'] + proposal['verification']):
         raise ValueError('Gmail 规则草案影响说明异常')
     for operation in proposal['operations']:
-        if not isinstance(operation, dict) or set(operation) != {'operation', 'target_rule', 'name', 'description', 'query', 'reason'}:
+        allowed = {'operation', 'target_rule', 'name', 'description', 'query', 'reason', 'logic', 'effective_after_utc', 'sample_validation'}
+        if not isinstance(operation, dict) or not set(operation) <= allowed or not {'operation', 'target_rule', 'name', 'description', 'query', 'reason'} <= set(operation):
             raise ValueError('Gmail 规则操作字段异常')
         if operation['operation'] not in {'add', 'modify', 'disable'}:
             raise ValueError('Gmail 规则操作类型异常')
@@ -215,6 +218,9 @@ def validate_gmail_proposal(proposal):
         if operation['operation'] != 'disable':
             if '-is:starred' not in query.split() or re.search(r'(?<!-)\bis:starred\b', query, re.I):
                 raise ValueError('Gmail 规则查询缺少 -is:starred 保护')
+            if 'logic' in operation:
+                from pylon.tasks.gmail.logic import validate_program
+                validate_program(operation['logic'])
         elif query:
             raise ValueError('停用 Gmail 规则不能包含查询条件')
     return proposal

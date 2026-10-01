@@ -18,6 +18,15 @@ from .outbox import Outbox
 from .runner import task_environment
 
 
+RESPONSE_PREFIX = "PYLON_REPLY_JSON:"
+
+
+def encode_response(text: str, reply_markup: dict | None = None) -> str:
+    if not reply_markup:
+        return text
+    return RESPONSE_PREFIX + json.dumps({"text": text, "reply_markup": reply_markup}, ensure_ascii=False, separators=(",", ":"))
+
+
 def authorized(profile: str, message: dict) -> bool:
     owner = str(profile_env(profile).get("TELEGRAM_HOME_CHANNEL", ""))
     return bool(owner and message.get("chat", {}).get("type") == "private"
@@ -195,7 +204,7 @@ def chiphell_text(action: str) -> str:
 
 
 def gmail_text(action: str, candidate: str = '') -> str:
-    if action in {'candidate', 'feedback', 'review_status', 'rule_preview', 'rule_apply', 'rule_reject'}:
+    if action in {'review', 'rules', 'candidate', 'feedback', 'review_status', 'rule_preview', 'rule_apply', 'rule_reject', 'rule_rollback'}:
         from .tasks.gmail import review
         profile = os.environ.get('PYLON_COMMAND_PROFILE', 'default')
         request_key = os.environ.get('PYLON_COMMAND_ID', '')
@@ -221,6 +230,10 @@ def handle(profile: str, text: str) -> str:
     value = text.strip()
     reply_id = os.environ.get('PYLON_REPLY_MESSAGE_ID', '')
     if reply_id.isdigit() and not value.startswith('/'):
+        from .tasks.gmail import review as gmail_review
+        result = gmail_review.bind_reason(profile, int(reply_id), value)
+        if result is not None:
+            return result
         from .agent_tasks import reply_to
         result = reply_to(profile, int(reply_id), value)
         if result is not None:
@@ -282,9 +295,18 @@ def handle(profile: str, text: str) -> str:
     return '没有识别到命令。发送 /help 查看可用命令。'
 
 
+def handle_callback(profile: str, payload: dict) -> str:
+    from .tasks.gmail import review
+    result = review.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
+    return encode_response(result.get('text', ''), result.get('reply_markup'))
+
+
 if __name__ == "__main__":
     try:
-        print(handle(sys.argv[1], sys.stdin.read()))
+        if len(sys.argv) > 2 and sys.argv[2] == '--callback':
+            print(handle_callback(sys.argv[1], json.loads(sys.stdin.read())))
+        else:
+            print(handle(sys.argv[1], sys.stdin.read()))
     except Exception as exc:
         print("操作失败：" + redact(f"{type(exc).__name__}: {exc}"))
         raise SystemExit(1)

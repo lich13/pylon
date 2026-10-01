@@ -15,6 +15,7 @@ class Command:
     argument: str = ''
     example: str = ''
     detail: str = ''
+    menu: bool = True
 
     @property
     def usage(self) -> str:
@@ -69,23 +70,29 @@ COMMANDS = {item.name: item for item in (
     Command('remove_monitor', '列出可移除的监控，回复对应编号完成移除', 'monitor', 'remove',
             detail='先发送此命令取得列表，再单独回复编号。编号对应此次列表中的项目；成功后结束本次选择。原“移除监控”仍可使用。'),
     Command('gmail_candidates', '查看待确认的新邮件类型候选', 'gmail', 'list',
-            detail='只列出待确认候选及元数据；已确认类型不会出现在这里，并继续按现有规则自动删除。查看单条详情用 /gmail_candidate。'),
+            detail='兼容入口：只列出待确认候选及元数据。日常操作请使用 /gmail_review。', menu=False),
+    Command('gmail_review', '打开 Gmail 清理向导（按钮操作）', 'gmail', 'review',
+            detail='按卡片选择样本，标记应删除或必须保留，回复原因后交给 Grok 生成受限逻辑规则。预览和分析不会删除邮件；应用按钮只影响下一次排程。'),
+    Command('gmail_rules', '查看已生效 Gmail 规则及版本', 'gmail', 'rules',
+            detail='查看内置规则、已确认规则和运行时逻辑覆盖层版本；只读，不删除邮件。'),
     Command('gmail_candidate', '查看单条新邮件类型的元数据和摘要', 'gmail', 'candidate', '候选ID', '/gmail_candidate gmail-nt-abc123',
-            '显示发件人、主题族、日期、摘要、标签和样本数，不读取邮件全文，不新增规则、不删除邮件。'),
+            '兼容入口：显示发件人、主题族、日期、摘要、标签和样本数。向导中可直接查看完整文本样本。', menu=False),
     Command('gmail_feedback', '提交一条意见并交给 Grok 生成规则草案', 'gmail', 'feedback', '候选ID 意见', '/gmail_feedback gmail-nt-abc123 这是登录提醒，保留安全告警，删除普通通知',
-            '每个候选独立处理；重复消息不会重复启动任务。Grok 只生成新增、修改或停用草案，不删除邮件；执行中可再次提交意见继续同一会话。'),
+            '兼容入口：每个候选独立处理；重复消息不会重复启动任务。Grok 只生成草案，不删除邮件。', menu=False),
     Command('gmail_review_status', '查看 Gmail 候选的 Grok 审查和草案状态', 'gmail', 'review_status', '[候选ID]', '/gmail_review_status gmail-nt-abc123',
-            '显示意见、Grok 任务、等待问题、提案编号和失败原因。省略候选 ID 查看全部审查记录，只查询不修改邮件。'),
+            '兼容入口：显示意见、Grok 任务、提案编号和失败原因。向导入口请用 /gmail_review。', menu=False),
     Command('gmail_rule_preview', '预览 Gmail 规则草案的当前影响', 'gmail', 'rule_preview', '提案ID', '/gmail_rule_preview gmail-rp-abc123456789',
-            '重新读取 Gmail，展示预计匹配数量和少量元数据样本；只读，不删除邮件。规则发生变化时会标记过期。'),
+            '兼容入口：重新读取 Gmail，展示预计匹配数量和样本；只读，不删除邮件。', menu=False),
     Command('gmail_rule_apply', '确认应用 Gmail 规则草案', 'gmail', 'rule_apply', '提案ID', '/gmail_rule_apply gmail-rp-abc123456789',
-            '再次校验当前规则并写入运行时覆盖层；只影响下一次排程，当前不会删除邮件。所有查询必须保留 -is:starred 保护。'),
+            '兼容入口：再次校验规则并写入覆盖层；只影响下一次排程，当前不会删除邮件。', menu=False),
     Command('gmail_rule_reject', '拒绝 Gmail 规则草案并保留候选', 'gmail', 'rule_reject', '提案ID', '/gmail_rule_reject gmail-rp-abc123456789',
-            '拒绝后不修改规则、不删除邮件，候选回到待确认状态，可重新提交意见。'),
+            '兼容入口：拒绝后不修改规则、不删除邮件，候选回到待确认状态。', menu=False),
+    Command('gmail_rule_rollback', '回滚已应用的 Gmail 规则提案', 'gmail', 'rule_rollback', '提案ID', '/gmail_rule_rollback gmail-rp-abc123456789',
+            '兼容维护入口：移除指定提案写入的运行时覆盖层；不会删除邮件。', menu=False),
     Command('gmail_accept', '接受指定候选，加入后续清理规则，本次不删除邮件', 'gmail', 'accept', '候选ID',
-            '/gmail_accept gmail-nt-abc123', '兼容旧的简单接受快捷方式，不经过 Grok；只修改未来清理规则，已确认类型继续自动删除，已有非星标保护继续生效。'),
+            '/gmail_accept gmail-nt-abc123', '兼容旧的简单接受快捷方式，不经过 Grok；只修改未来清理规则。', menu=False),
     Command('gmail_ignore', '忽略指定候选，保留现有清理规则', 'gmail', 'ignore', '候选ID',
-            '/gmail_ignore gmail-nt-abc123', '将 /gmail_candidates 中的完整候选 ID 替换示例 ID。记录忽略选择，不新增清理规则、不删除邮件。'),
+            '/gmail_ignore gmail-nt-abc123', '兼容旧入口：记录忽略选择，不新增清理规则、不删除邮件。', menu=False),
     Command('chiphell_status', '查看 Chiphell 抓取、待发队列和健康状态', 'chiphell', 'status',
             detail='显示抓取与投递排程、待发数量、最近健康结果。已暂停是运行状态，不等于抓取失败。'),
     Command('chiphell_test', '测试 Chiphell 实际页面抓取及登录、代理状态', 'chiphell', 'test',
@@ -106,7 +113,7 @@ COMMANDS = {item.name: item for item in (
 
 
 def menu_commands() -> list[dict[str, str]]:
-    return [{'command': item.name, 'description': item.description} for item in COMMANDS.values()]
+    return [{'command': item.name, 'description': item.description} for item in COMMANDS.values() if item.menu]
 
 
 def task_list() -> str:

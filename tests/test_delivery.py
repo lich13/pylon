@@ -154,6 +154,15 @@ def test_owner_only_and_durable_update_offsets(box):
         assert db.execute('SELECT count(*) FROM updates').fetchone()[0] == 1
 
 
+def test_owner_callback_updates_keep_kind_and_message_binding(box):
+    callback = {'id': 'cq-1', 'from': {'id': 123}, 'data': 'g2|open|gmail-nt-test|deadbeef',
+                'message': {'message_id': 88, 'date': 100, 'chat': {'id': 123, 'type': 'private'}}}
+    store_updates(box, 'webops', [{'update_id': 9, 'callback_query': callback}])
+    with box.connect() as db:
+        row = db.execute('SELECT kind,chat_id,message_id FROM updates WHERE update_id=9').fetchone()
+    assert tuple(row) == ('callback_query', '123', 88)
+
+
 def test_interrupted_commands_do_not_repeat_mutations(box):
     store_updates(box, 'webops', [{'update_id': 5, 'message': {'chat': {'id':123, 'type':'private'}, 'from': {'id':123}, 'text':'移除监控'}}])
     with box.connect() as db:

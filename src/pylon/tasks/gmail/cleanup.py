@@ -686,13 +686,22 @@ def load_extra_rules(path: Path | None = None) -> list[dict[str, Any]]:
         query = str(rule.get("query") or "").strip()
         if not name or not query:
             continue
-        out.append({
+        item = {
             "name": name,
             "query": query,
             "description": str(rule.get("description") or name).strip(),
             "source": rule.get("source") or "manual_candidate",
             "source_candidate_id": rule.get("source_candidate_id") or "",
-        })
+        }
+        if isinstance(rule.get("logic"), dict):
+            try:
+                from .logic import validate_program
+                item["logic"] = validate_program(rule["logic"])
+            except ValueError:
+                continue
+        if rule.get("effective_after_utc"):
+            item["effective_after_utc"] = str(rule["effective_after_utc"])
+        out.append(item)
     return out
 
 
@@ -723,6 +732,14 @@ def load_rule_overrides(path: Path | None = None) -> dict[str, Any]:
             "proposal_id": str(operation.get("proposal_id") or "").strip(),
             "updated_at_utc": str(operation.get("updated_at_utc") or "").strip(),
         }
+        if isinstance(operation.get("logic"), dict):
+            try:
+                from .logic import validate_program
+                item["logic"] = validate_program(operation["logic"])
+            except ValueError:
+                continue
+        if operation.get("effective_after_utc"):
+            item["effective_after_utc"] = str(operation["effective_after_utc"])
         if kind != "disable" and (
             not item["query"]
             or PROTECTION not in item["query"].split()
@@ -760,6 +777,10 @@ def effective_rules(
             "source": operation.get("source") or "gmail_grok_review",
             "source_candidate_id": operation.get("source_candidate_id") or "",
         }
+        if operation.get("logic"):
+            rule["logic"] = operation["logic"]
+        if operation.get("effective_after_utc"):
+            rule["effective_after_utc"] = operation["effective_after_utc"]
         index = by_name.get(target)
         if kind == "modify" and index is not None:
             rules[index] = rule
@@ -809,6 +830,15 @@ def build_candidate_from_message(message: dict[str, Any]) -> dict[str, Any]:
         "subject_family": family,
         "suggested_query": query,
         "sample_count": 1,
+        "sample_ids": [message.get("id") or ""],
+        "samples": [{
+            "id": message.get("id") or "",
+            "from": message.get("from") or "",
+            "subject": message.get("subject") or "",
+            "date": message.get("date") or "",
+            "snippet": message.get("snippet") or "",
+            "labels": message.get("labels") or [],
+        }],
         "sample": {
             "id": message.get("id") or "",
             "from": message.get("from") or "",
@@ -913,6 +943,9 @@ def update_candidate_state(
         existing = grouped.get(candidate["id"])
         if existing:
             existing["sample_count"] += 1
+            if candidate.get("sample", {}).get("id") and candidate["sample"]["id"] not in existing.setdefault("sample_ids", []):
+                existing["sample_ids"].append(candidate["sample"]["id"])
+                existing.setdefault("samples", []).append(candidate.get("sample") or {})
             continue
         grouped[candidate["id"]] = candidate
 
@@ -935,6 +968,11 @@ def update_candidate_state(
         current["last_seen"] = run_date
         current["updated_at_utc"] = now
         current["sample_count"] = int(current.get("sample_count") or 0) + int(candidate.get("sample_count") or 1)
+        for sample in candidate.get("samples") or [candidate.get("sample") or {}]:
+            sid = sample.get("id")
+            if sid and sid not in current.setdefault("sample_ids", []):
+                current["sample_ids"].append(sid)
+                current.setdefault("samples", []).append(sample)
         current.setdefault("sample", candidate.get("sample") or {})
         current.setdefault("suggested_query", candidate.get("suggested_query") or "")
         current.setdefault("from", candidate.get("from") or "")
@@ -1164,6 +1202,33 @@ def get_message_metadata(service, message_id: str) -> dict[str, Any]:
     }
 
 
+def filter_logic_message_ids(service, rule: dict[str, Any], ids: list[str]) -> tuple[list[str], int]:
+    """Apply a reviewed rule locally after Gmail's narrow coarse query."""
+    program = rule.get("logic")
+    if not program:
+        return ids, 0
+    from .logic import get_message_full, matches, parse_date_ms
+    effective_ms = parse_date_ms(str(rule.get("effective_after_utc") or ""))
+    accepted: list[str] = []
+    rejected = 0
+    for mid in ids:
+        try:
+            message = get_message_full(service, mid)
+            if "STARRED" in set(message.get("labels") or []):
+                rejected += 1
+                continue
+            if effective_ms and int(message.get("received_at_ms") or 0) < effective_ms:
+                rejected += 1
+                continue
+            if matches(program, message):
+                accepted.append(mid)
+            else:
+                rejected += 1
+        except Exception:
+            rejected += 1
+    return accepted, rejected
+
+
 def batch_delete(service, message_ids: list[str]) -> int:
     deleted = 0
     for i in range(0, len(message_ids), 1000):
@@ -1245,6 +1310,9 @@ def main(argv: list[str] | None = None) -> int:
 
     for rule in rules:
         ids = list_message_ids(service, rule["query"], args.max_per_rule)
+        logic_rejected = 0
+        if rule.get("logic"):
+            ids, logic_rejected = filter_logic_message_ids(service, rule, ids)
         new_ids = [mid for mid in ids if mid not in seen_ids]
         for mid in new_ids:
             seen_ids.add(mid)
@@ -1262,6 +1330,10 @@ def main(argv: list[str] | None = None) -> int:
             "matched_count": len(ids),
             "new_unique_count": len(new_ids),
         }
+        if rule.get("logic"):
+            rule_result["logic_checked"] = len(ids) + logic_rejected
+            rule_result["logic_rejected"] = logic_rejected
+            rule_result["effective_after_utc"] = rule.get("effective_after_utc") or ""
         if args.format == "json" and not args.compact:
             rule_result["query"] = rule["query"]
             rule_result["samples"] = samples

@@ -47,6 +47,19 @@ class Outbox:
                     PRIMARY KEY(profile,update_id)
                 );
             """)
+            # Updates started as message-only rows.  Keep old databases usable
+            # while making callback_query ownership explicit for idempotency.
+            try:
+                db.execute("ALTER TABLE updates ADD COLUMN kind TEXT NOT NULL DEFAULT 'message'")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+            for column, definition in (("chat_id", "TEXT"), ("message_id", "INTEGER")):
+                try:
+                    db.execute(f"ALTER TABLE updates ADD COLUMN {column} {definition}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
         os.chmod(self.path, 0o600)
 
     @contextlib.contextmanager

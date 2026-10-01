@@ -156,7 +156,12 @@ def deliver_event(box: Outbox, event: dict, http: httpx.Client):
                 receipt = receipt or []
                 chunks = telegram_chunks(payload["text"])
                 for chunk in chunks[len(receipt):]:
-                    result = telegram_request(http, token, "sendMessage", data={"chat_id": chat, "text": chunk, "parse_mode": "HTML", "link_preview_options": '{"is_disabled":true}'})
+                    data = {"chat_id": chat, "text": chunk, "parse_mode": "HTML", "link_preview_options": '{"is_disabled":true}'}
+                    if payload.get("reply_markup") and len(receipt) + 1 == len(chunks):
+                        data["reply_markup"] = json.dumps(payload["reply_markup"], ensure_ascii=False, separators=(",", ":"))
+                    if payload.get("reply_to_message_id") and not receipt:
+                        data["reply_parameters"] = json.dumps({"message_id": payload["reply_to_message_id"]})
+                    result = telegram_request(http, token, "sendMessage", data=data)
                     receipt.append({"message_id": result["message_id"], "chat_id": result["chat"]["id"]})
                     # A confirmed chunk is never repeated after a later chunk fails.
                     box.finish(event["id"], "sending", receipt=receipt)

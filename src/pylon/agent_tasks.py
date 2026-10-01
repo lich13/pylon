@@ -143,8 +143,17 @@ def reconcile(box=None):
             text = f"Agent #{row['id'][:12]}：线程清理未完成，正在重试。\n" + row['cleanup_error']
         else:
             text = render(row)
+        payload = {'text': text, 'agent_task': row['id'], 'agent_state': row['status']}
+        if gmail_review and gmail_review.get('proposal_id'):
+            try:
+                from .tasks.gmail.review import proposal_payload
+                card = proposal_payload(event['profile'], gmail_review['proposal_id'])
+                payload['text'] = card['text']
+                payload['reply_markup'] = card.get('reply_markup')
+            except Exception as exc:
+                logging.getLogger('pylon').warning('gmail proposal card: %s', redact(str(exc)))
         box.enqueue(profile=event['profile'], job_id='agent', kind='text',
-                    payload={'text': text, 'agent_task': row['id'], 'agent_state': row['status']},
+                    payload=payload,
                     key='agent-event:' + event['id'])
         if row['cleanup'] == 'done':
             scrub_inputs(box, {row['id']})
