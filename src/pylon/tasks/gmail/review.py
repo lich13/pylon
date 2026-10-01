@@ -294,8 +294,12 @@ def start_feedback(candidate_id: str, feedback: str, profile: str, request_key: 
         review["feedback"].append(entry)
         review["requests"][request_key] = entry["at_utc"]
         review["status"] = "reviewing"
+        # A new opinion starts a fresh attempt.  Do not expose a previous
+        # prompt-size/provider failure while the replacement task is running.
+        review.pop("last_error", None)
         review["updated_at_utc"] = entry["at_utc"]
         candidate["status"] = "reviewing"
+        candidate.pop("last_error", None)
         candidate["last_feedback_at_utc"] = entry["at_utc"]
         candidate["updated_at_utc"] = entry["at_utc"]
         _save(REVIEWS_PATH, data)

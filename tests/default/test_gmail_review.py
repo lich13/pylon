@@ -94,6 +94,25 @@ def test_feedback_is_idempotent_and_starts_one_grok_task(files, monkeypatch):
     assert len(review_state['reviews']['gmail-nt-test1234']['feedback']) == 1
 
 
+def test_new_feedback_clears_previous_error(files, monkeypatch):
+    from pylon import agent_tasks
+    candidate_state = json.loads((files / 'new_type_candidates.json').read_text())
+    candidate_state['candidates']['gmail-nt-test1234']['status'] = 'error'
+    candidate_state['candidates']['gmail-nt-test1234']['last_error'] = '旧错误'
+    cleanup.save_json(cleanup.NEW_TYPE_STATE_PATH, candidate_state)
+    review._save(review.REVIEWS_PATH, {'version': 1, 'reviews': {
+        'gmail-nt-test1234': {'candidate_id': 'gmail-nt-test1234', 'status': 'error',
+                              'feedback': [], 'requests': {}, 'proposal_ids': [],
+                              'task_id': '', 'last_error': '旧错误'}}})
+    monkeypatch.setattr(agent_tasks, 'invoke', lambda action, *args, text='':
+                         [] if action == 'status' else {'id': 'b' * 32, 'status': 'queued'})
+    review.start_feedback('gmail-nt-test1234', '请重新审查这类通知', 'default', 'telegram:default:2')
+    saved_review = json.loads((files / 'reviews.json').read_text())['reviews']['gmail-nt-test1234']
+    saved_candidate = json.loads((files / 'new_type_candidates.json').read_text())['candidates']['gmail-nt-test1234']
+    assert 'last_error' not in saved_review
+    assert 'last_error' not in saved_candidate
+
+
 def test_agent_result_creates_pending_proposal_without_deleting_mail(files):
     data = {'version': 1, 'reviews': {'gmail-nt-test1234': {
         'candidate_id': 'gmail-nt-test1234', 'status': 'reviewing', 'feedback': [],
