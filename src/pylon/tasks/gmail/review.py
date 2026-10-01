@@ -494,6 +494,11 @@ def _preview_locked(proposal: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("规则在 Grok 草案生成后发生变化，请重新提交意见生成新草案")
     validated = validate_proposal({key: proposal.get(key) for key in ("title", "summary", "operations", "impact", "verification")}, rules=current_rules)
     rules = _apply_operations(current_rules, validated["operations"])
+    proposed_names = {
+        operation["name"]
+        for operation in validated["operations"]
+        if operation["operation"] != "disable" and operation["name"]
+    }
     service = cleanup.build_gmail_service()
     seen: set[str] = set()
     per_rule = []
@@ -503,14 +508,14 @@ def _preview_locked(proposal: dict[str, Any]) -> dict[str, Any]:
         new_ids = [mid for mid in ids if mid not in seen]
         seen.update(new_ids)
         per_rule.append({"name": rule["name"], "description": rule.get("description", ""),
-                         "query": rule["query"], "matched_count": len(ids), "new_unique_count": len(new_ids)})
+                         "query": rule["query"], "matched_count": len(ids),
+                         "new_unique_count": len(new_ids),
+                         "proposed": rule["name"] in proposed_names})
         for mid in new_ids[:3 - len(samples)]:
             try:
                 samples.append(cleanup.get_message_metadata(service, mid))
             except Exception:
                 pass
-        if len(samples) >= 3:
-            break
     preview = {"at_utc": _now(), "rules_hash": _rule_digest(current_rules),
                "total_unique_matches": len(seen), "per_rule": per_rule, "samples": samples}
     proposal["preview"] = preview
@@ -529,7 +534,8 @@ def preview(proposal_id: str) -> str:
         _save(PROPOSALS_PATH, data)
     lines = [f"Gmail 规则提案 {proposal_id} 预览：预计匹配 {preview_data['total_unique_matches']} 封（不会删除）"]
     for rule in preview_data["per_rule"]:
-        lines.append(f"- {rule['name']}：{rule['new_unique_count']} 封｜{rule['description']}")
+        marker = "本提案｜" if rule.get("proposed") else ""
+        lines.append(f"- {marker}{rule['name']}：{rule['new_unique_count']} 封｜{rule['description']}")
     if preview_data["samples"]:
         lines.append("样本：" + "；".join(str(x.get("subject") or x.get("from") or "")[:120] for x in preview_data["samples"]))
     lines.append(f"确认应用：/gmail_rule_apply {proposal_id}")

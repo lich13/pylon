@@ -137,7 +137,9 @@ def test_preview_and_apply_are_read_only_then_future_only(files, monkeypatch):
     monkeypatch.setattr(cleanup, 'get_message_metadata', lambda service, mid: {'id': mid, 'subject': '登录提醒', 'from': 'alerts@example.com'})
     batch_delete = Mock(side_effect=AssertionError('review must never delete mail'))
     monkeypatch.setattr(cleanup, 'batch_delete', batch_delete)
-    assert '预计匹配 2 封' in review.preview(proposal_id)
+    preview_text = review.preview(proposal_id)
+    assert '预计匹配 2 封' in preview_text
+    assert '本提案｜login_notice：0 封｜登录通知' in preview_text
     assert '本次没有删除邮件' in review.apply(proposal_id)
     batch_delete.assert_not_called()
     assert any(rule['name'] == 'login_notice' for rule in cleanup.all_rules())
