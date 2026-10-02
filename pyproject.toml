@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "pylon-tasks"
 version = "0.3.0"
 requires-python = ">=3.11"
-dependencies = ["httpx==0.28.1", "markdown-it-py==4.0.0", "google-api-python-client>=2.0,<3", "google-auth-oauthlib>=1.2,<2", "playwright==1.59.0"]
+dependencies = ["httpx==0.28.1", "markdown-it-py==4.2.0", "google-api-python-client>=2.0,<3", "google-auth-oauthlib>=1.2,<2", "playwright==1.63.0"]
 
 [project.scripts]
 pylon = "pylon.cli:main"
