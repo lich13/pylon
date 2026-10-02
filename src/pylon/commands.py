@@ -90,6 +90,11 @@ def status_text() -> str:
         lines.append(gmail_review_status())
     except Exception as exc:
         lines.append('Gmail 新类型审查状态暂不可读：' + redact(str(exc))[:160])
+    try:
+        from .software_updates import review_status_text
+        lines.append(review_status_text(box=box))
+    except Exception as exc:
+        lines.append('系统小包更新状态暂不可读：' + redact(str(exc))[:160])
     from .tasks.quotes.health import status_text as quote_status
     lines.append(quote_status(box=box))
     return "\n".join(lines)
@@ -266,8 +271,8 @@ def handle(profile: str, text: str) -> str:
         if item.route == 'updates':
             if argument not in {'', 'all'}:
                 return help_text(name)
-            from .software_updates import inventory_text
-            return inventory_text(full=argument == 'all')
+            from .software_updates import inventory_text, pending_keyboard
+            return encode_response(inventory_text(full=argument == 'all'), pending_keyboard(profile))
         if item.route == 'software_update':
             from .software_updates import request_update
             return request_update(item.action, profile)
@@ -279,7 +284,11 @@ def handle(profile: str, text: str) -> str:
             if item.action in {'pause', 'resume'}:
                 return control_task(key, item.action == 'pause')
             if item.action == 'logs':
-                return scheduler.logs(key)[-12000:]
+                output = scheduler.logs(key)
+                if key == 'software-update-review':
+                    from .software_updates import review_logs_text
+                    output += '\n' + review_logs_text(box=Outbox())
+                return output[-12000:]
             return jobs()[key]['name'] + '：' + scheduler.start(key)
         if item.route == 'ssh':
             return ssh_text(item.action, argument)
@@ -296,8 +305,13 @@ def handle(profile: str, text: str) -> str:
 
 
 def handle_callback(profile: str, payload: dict) -> str:
-    from .tasks.gmail import review
-    result = review.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
+    value = str(payload.get('data') or '')
+    if value.startswith('su1|'):
+        from . import software_updates
+        result = software_updates.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
+    else:
+        from .tasks.gmail import review
+        result = review.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
     return encode_response(result.get('text', ''), result.get('reply_markup'))
 
 

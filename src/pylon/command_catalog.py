@@ -39,7 +39,7 @@ COMMANDS = {item.name: item for item in (
     Command('outbox', '查看待发、失败和回执不确定的通知', 'outbox',
             detail='显示待发送、发送中、失败和回执不确定的数量及最近记录。只查询；网络失败按队列策略补发，回执不确定不会自动重发。'),
     Command('updates', '查看腾讯云可更新软件、系统包和最近升级结果', 'updates', argument='[all]', example='/updates\n/updates all',
-            detail='省略参数查看摘要；all 展示全部软件及系统包候选。检查结果最多缓存 10 分钟并注明时间，APT 使用系统自动刷新的软件源索引。检查失败显示未确认，不会当作最新版。查询不安装软件。每周一北京时间 09:00 向库库干汇总维护事项，无更新且无异常时静默。'),
+            detail='省略参数查看摘要；all 展示全部软件及系统包候选。默认机器人会为允许点选的系统小包显示更新和跳过按钮。检查结果最多缓存 10 分钟并注明时间，APT 使用系统自动刷新的软件源索引。检查失败显示未确认，不会当作最新版。查询不安装软件。每周一北京时间 09:00 向库库干汇总维护事项，无更新且无异常时静默。'),
     Command('update_codex', '使用 sudo 更新腾讯云 Codex CLI，完成后自动回报', 'software_update', 'codex',
             detail='执行 sudo codex update，使用官方 stable 版本；无需参数。发现对应会话进程占用时不更新，退出会话后可再次点击。后台执行不阻塞机器人，最长 15 分钟；重复请求合并。回报更新前后版本、耗时及失败原因，保留登录、配置与会话。'),
     Command('update_grok', '使用 sudo 更新腾讯云 Grok Build，完成后自动回报', 'software_update', 'grok',

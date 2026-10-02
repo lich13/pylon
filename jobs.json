@@ -145,5 +145,14 @@
     "deliver": false,
     "timeout": 300,
     "module": "pylon.tasks.software.maintenance"
+  },
+  "software-update-review": {
+    "name": "系统小包更新确认",
+    "profile": "default",
+    "schedule": "15 */6 * * *",
+    "deliver": false,
+    "timeout": 300,
+    "failure_notify": true,
+    "module": "pylon.tasks.software.review"
   }
 }

@@ -89,7 +89,8 @@ def main():
         path.write_text(content)
         os.chown(path, 0, 0)
         path.chmod(0o755)
-    for service in ['pylon-bot.service', 'pylon-ssh-load.service', 'chiphell-fid26-poller.service', 'pylon-update@.service', 'pylon-agent.service']:
+    for service in ['pylon-bot.service', 'pylon-ssh-load.service', 'chiphell-fid26-poller.service',
+                    'pylon-update@.service', 'pylon-apt-update@.service', 'pylon-agent.service']:
         install_file(ROOT / 'ops' / service, UNITS / service)
     (UNITS / 'pylon-task@.service').write_text(task_service('scheduled'))
     (UNITS / 'pylon-manual@.service').write_text(task_service('manual'))

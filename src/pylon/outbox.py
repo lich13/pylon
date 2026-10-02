@@ -46,6 +46,25 @@ class Outbox:
                     status TEXT NOT NULL DEFAULT 'pending', error TEXT,
                     PRIMARY KEY(profile,update_id)
                 );
+                CREATE TABLE IF NOT EXISTS software_reviews (
+                    id TEXT PRIMARY KEY,
+                    target TEXT NOT NULL,
+                    package_name TEXT NOT NULL,
+                    installed_version TEXT NOT NULL,
+                    candidate_version TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    risk TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    profile TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    request_id TEXT,
+                    event_id TEXT,
+                    detail TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS software_reviews_status
+                    ON software_reviews(status,updated_at);
             """)
             # Updates started as message-only rows.  Keep old databases usable
             # while making callback_query ownership explicit for idempotency.
@@ -140,3 +159,82 @@ class Outbox:
         with self.connect() as db:
             db.execute("INSERT INTO operations VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,payload=excluded.payload,updated_at=excluded.updated_at",
                        (operation_id, kind, json.dumps(payload, ensure_ascii=False), status, now, now))
+
+    def software_review(self, review_id: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM software_reviews WHERE id=?", (review_id,)).fetchone()
+            return dict(row) if row else None
+
+    def software_reviews(self, *, statuses: tuple[str, ...] | None = None,
+                         profile: str | None = None) -> list[dict]:
+        with self.connect() as db:
+            clauses, values = [], []
+            if statuses:
+                placeholders = ",".join("?" for _ in statuses)
+                clauses.append(f"status IN ({placeholders})")
+                values.extend(statuses)
+            if profile:
+                clauses.append("profile=?")
+                values.append(profile)
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM software_reviews" + where + " ORDER BY created_at DESC", values
+            ).fetchall()]
+
+    def upsert_software_review(self, review: dict) -> dict:
+        now = time.time()
+        values = {
+            "id": str(review["id"]),
+            "target": str(review["target"]),
+            "package_name": str(review["package_name"]),
+            "installed_version": str(review["installed_version"]),
+            "candidate_version": str(review["candidate_version"]),
+            "source": str(review.get("source") or ""),
+            "risk": str(review.get("risk") or ""),
+            "fingerprint": str(review["fingerprint"]),
+            "profile": str(review.get("profile") or "default"),
+            "status": str(review.get("status") or "pending"),
+            "request_id": review.get("request_id"),
+            "event_id": review.get("event_id"),
+            "detail": review.get("detail"),
+            "created_at": float(review.get("created_at") or now),
+            "updated_at": now,
+        }
+        with self.connect() as db:
+            db.execute("""
+                INSERT INTO software_reviews
+                  (id,target,package_name,installed_version,candidate_version,source,risk,
+                   fingerprint,profile,status,request_id,event_id,detail,created_at,updated_at)
+                VALUES (:id,:target,:package_name,:installed_version,:candidate_version,:source,:risk,
+                        :fingerprint,:profile,:status,:request_id,:event_id,:detail,:created_at,:updated_at)
+                ON CONFLICT(id) DO UPDATE SET
+                  target=excluded.target, package_name=excluded.package_name,
+                  installed_version=excluded.installed_version, candidate_version=excluded.candidate_version,
+                  source=excluded.source, risk=excluded.risk, fingerprint=excluded.fingerprint,
+                  profile=excluded.profile, status=excluded.status, request_id=excluded.request_id,
+                  event_id=excluded.event_id, detail=excluded.detail, updated_at=excluded.updated_at
+            """, values)
+            row = db.execute("SELECT * FROM software_reviews WHERE id=?", (values["id"],)).fetchone()
+            return dict(row)
+
+    def update_software_review(self, review_id: str, **changes) -> dict:
+        allowed = {"status", "request_id", "event_id", "detail", "candidate_version",
+                   "installed_version", "risk", "source"}
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError("unsupported software review fields")
+        changes = {key: value for key, value in changes.items() if key in allowed}
+        if not changes:
+            row = self.software_review(review_id)
+            if row is None:
+                raise KeyError(review_id)
+            return row
+        changes["updated_at"] = time.time()
+        assignments = ",".join(f"{key}=?" for key in changes)
+        with self.connect() as db:
+            result = db.execute("UPDATE software_reviews SET " + assignments + " WHERE id=?",
+                                [*changes.values(), review_id])
+            if result.rowcount != 1:
+                raise KeyError(review_id)
+            row = db.execute("SELECT * FROM software_reviews WHERE id=?", (review_id,)).fetchone()
+            return dict(row)

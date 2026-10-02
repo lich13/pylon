@@ -214,6 +214,156 @@ def test_inventory_optional_argument_is_read_only(monkeypatch):
     assert [x.kwargs for x in read.call_args_list] == [{'full': False}, {'full': True}]
 
 
+def test_eligible_candidates_are_limited_to_the_exact_apt_allowlist():
+    snapshot = {'apt': {'packages': [
+        {'name': name, 'installed': '1.0', 'candidate': '1.1'}
+        for name in ('libegl-mesa0', 'libgbm1', 'libgl1-mesa-dri', 'libglx-mesa0',
+                     'mesa-libgallium', 'sosreport', 'thermald')
+    ] + [
+        {'name': 'frp', 'installed': '0.69.0', 'candidate': '0.71.0'},
+        {'name': 'postgresql-18', 'installed': '18.3', 'candidate': '18.6'},
+        {'name': 'libegl-mesa0', 'installed': '1.1', 'candidate': '1.1'},
+    ]}}
+    rows = updates.eligible_candidates(snapshot)
+    assert {row['package_name'] for row in rows} == {
+        'libegl-mesa0', 'libgbm1', 'libgl1-mesa-dri', 'libglx-mesa0',
+        'mesa-libgallium', 'sosreport', 'thermald'}
+    assert all(row['target'].startswith('apt:') and row['fingerprint'] for row in rows)
+
+
+def test_publish_candidates_is_one_card_per_fingerprint_and_idempotent(tmp_path):
+    box = Outbox(tmp_path / 'outbox.db')
+    snapshot = {'apt': {'packages': [
+        {'name': 'sosreport', 'installed': '4.8.0', 'candidate': '4.8.1'}
+    ]}}
+    assert updates.publish_candidates(snapshot, box) == 1
+    assert updates.publish_candidates(snapshot, box) == 0
+    assert box.counts() == {'pending': 1}
+    row = box.software_reviews(profile='default')[0]
+    assert row['event_id'] and row['status'] == 'pending'
+    with box.connect() as db:
+        event = db.execute('SELECT profile,job_id,payload FROM events').fetchone()
+    payload = json.loads(event['payload'])
+    assert event['profile'] == 'default' and event['job_id'] == 'software-update-review'
+    assert payload['reply_markup']['inline_keyboard'][0][0]['text'] == '更新此包'
+    assert payload['reply_markup']['inline_keyboard'][0][1]['text'] == '跳过此版本'
+
+
+def test_software_review_callback_requires_owner_signature_and_skip_is_idempotent(tmp_path, monkeypatch):
+    box = Outbox(tmp_path / 'outbox.db')
+    candidate = updates.eligible_candidates({'apt': {'packages': [
+        {'name': 'sosreport', 'installed': '4.8.0', 'candidate': '4.8.1'}
+    ]}})[0]
+    updates.publish_candidates({'apt': {'packages': [
+        {'name': 'sosreport', 'installed': '4.8.0', 'candidate': '4.8.1'}
+    ]}}, box)
+    monkeypatch.setattr(updates, 'Outbox', lambda: box)
+    monkeypatch.setattr(updates, 'profile_env', lambda profile: {
+        'TELEGRAM_BOT_TOKEN': 'token-' + profile, 'TELEGRAM_HOME_CHANNEL': '123'})
+    payload = {
+        'id': 'callback-1',
+        'data': updates.callback_data('default', 'skip', candidate['id']),
+        'from': {'id': 123, 'is_bot': False},
+        'message': {'message_id': 88, 'chat': {'id': 123, 'type': 'private'}},
+    }
+    assert '已跳过' in updates.callback('default', payload)['text']
+    assert '已跳过' in updates.callback('default', payload)['text']
+    assert updates.pending_keyboard('default') is None
+    with pytest.raises(ValueError, match='本人默认机器人私聊'):
+        updates.callback('webops', payload)
+    payload['data'] = 'su1|skip|' + candidate['id'] + '|bad'
+    with pytest.raises(ValueError, match='签名'):
+        updates.callback('default', payload)
+
+
+def test_software_review_approve_passes_expected_versions_to_root(monkeypatch, tmp_path):
+    box = Outbox(tmp_path / 'outbox.db')
+    candidate = updates.eligible_candidates({'apt': {'packages': [
+        {'name': 'thermald', 'installed': '2.5.0', 'candidate': '2.5.1'}
+    ]}})[0]
+    updates.publish_candidates({'apt': {'packages': [
+        {'name': 'thermald', 'installed': '2.5.0', 'candidate': '2.5.1'}
+    ]}}, box)
+    monkeypatch.setattr(updates, 'Outbox', lambda: box)
+    monkeypatch.setattr(updates, 'profile_env', lambda _: {
+        'TELEGRAM_BOT_TOKEN': 'token', 'TELEGRAM_HOME_CHANNEL': '123'})
+    monkeypatch.setattr(updates.scheduler, 'admin', Mock(return_value=json.dumps({
+        'id': 'run-1', 'target': 'apt:thermald', 'status': 'queued'})))
+    payload = {
+        'id': 'callback-2',
+        'data': updates.callback_data('default', 'approve', candidate['id']),
+        'from': {'id': 123, 'is_bot': False},
+        'message': {'message_id': 88, 'chat': {'id': 123, 'type': 'private'}},
+    }
+    result = updates.callback('default', payload)
+    assert '已提交' in result['text']
+    assert updates.scheduler.admin.call_args.args == (
+        'software', 'apt-update', 'thermald', 'default',
+        'software-review:' + candidate['id'], '2.5.0', '2.5.1')
+
+
+def test_failed_or_uncertain_review_cannot_be_retried_by_click(tmp_path, monkeypatch):
+    box = Outbox(tmp_path / 'outbox.db')
+    candidate = updates.eligible_candidates({'apt': {'packages': [
+        {'name': 'sosreport', 'installed': '4.8.0', 'candidate': '4.8.1'}
+    ]}})[0]
+    updates.publish_candidates({'apt': {'packages': [
+        {'name': 'sosreport', 'installed': '4.8.0', 'candidate': '4.8.1'}
+    ]}}, box)
+    box.update_software_review(candidate['id'], status='uncertain', detail='回执待核对')
+    monkeypatch.setattr(updates, 'Outbox', lambda: box)
+    admin_call = Mock(side_effect=AssertionError('uncertain result must not be replayed'))
+    monkeypatch.setattr(updates.scheduler, 'admin', admin_call)
+    monkeypatch.setattr(updates, 'profile_env', lambda _: {
+        'TELEGRAM_BOT_TOKEN': 'token', 'TELEGRAM_HOME_CHANNEL': '123'})
+    payload = {
+        'id': 'callback-3',
+        'data': updates.callback_data('default', 'approve', candidate['id']),
+        'from': {'id': 123, 'is_bot': False},
+        'message': {'message_id': 88, 'chat': {'id': 123, 'type': 'private'}},
+    }
+    assert '结果待核对' in updates.callback('default', payload)['text']
+    admin_call.assert_not_called()
+
+
+def test_apt_simulation_safety_rejects_extra_changes_and_phased_updates():
+    assert admin._apt_simulation_safe(
+        'Inst sosreport (4.8.1 Ubuntu:24.04/stable)\n0 upgraded, 0 newly installed, 0 to remove.',
+        'sosreport')[0]
+    assert not admin._apt_simulation_safe(
+        'Inst sosreport (4.8.1)\nInst bash (5.2.0)\n', 'sosreport')[0]
+    assert not admin._apt_simulation_safe(
+        'The following packages will be newly installed:\n  evil\n', 'sosreport')[0]
+    ok, reason = admin._apt_simulation_safe(
+        'The following packages have been kept back:\n  sosreport\n', 'sosreport')
+    assert not ok and 'phased' in reason
+
+
+def test_apt_version_comparison_uses_debian_epoch_and_tilde_rules(monkeypatch):
+    def compare(argv, **kwargs):
+        return SimpleNamespace(returncode=0 if argv[2] == '1:2.0-1' else 1)
+    monkeypatch.setattr(admin.subprocess, 'run', compare)
+    assert admin._apt_newer('1:2.0-1', '9.9-1')
+    assert admin._apt_newer('1.0~rc1-1', '1.0-1') is False
+
+
+def test_apt_root_entry_rejects_out_of_scope_package(root_db):
+    with pytest.raises(ValueError):
+        admin.start_apt('frp', 'default', 'software-review:one', '1.0', '1.1')
+    root_db.assert_not_called()
+
+
+def test_apt_worker_marks_candidate_stale_without_installing(root_db, monkeypatch):
+    row = admin.start_apt('sosreport', 'default', 'software-review:one', '4.8.0', '4.8.1')
+    monkeypatch.setattr(admin, '_apt_version', lambda _: '4.8.2')
+    monkeypatch.setattr(admin, '_apt_candidate', lambda _: '4.8.1')
+    simulate = Mock(side_effect=AssertionError('stale candidate must not simulate or install'))
+    monkeypatch.setattr(admin, '_apt_simulation', simulate)
+    admin.apt_update('sosreport')
+    assert get_run(row['id'])['status'] == 'stale'
+    simulate.assert_not_called()
+
+
 def test_stable_and_branch_selection():
     def respond(request):
         if 'postgresql.org' in request.url.host:

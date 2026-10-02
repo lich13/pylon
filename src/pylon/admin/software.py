@@ -16,10 +16,11 @@ import uuid
 
 from ..config import redact
 from ..software_inventory import SOFTWARE, latest, newer, version
+from ..software_policy import apt_policy, is_allowed_apt_package
 
 ROOT = Path('/var/lib/pylon-updates')
 BINARIES = {'codex': '/usr/local/bin/codex', 'grok': '/usr/local/bin/grok'}
-TERMINAL = {'updated', 'current', 'busy', 'failed', 'uncertain'}
+TERMINAL = {'updated', 'current', 'busy', 'failed', 'uncertain', 'deferred', 'stale'}
 
 
 def capture(argv, timeout=15, *, include_stderr=False):
@@ -46,10 +47,17 @@ def database():
                 PRAGMA synchronous=FULL;
                 CREATE TABLE IF NOT EXISTS runs (
                   id TEXT PRIMARY KEY,target TEXT,status TEXT,before_version TEXT,after_version TEXT,
-                  latest_version TEXT,detail TEXT,created_at REAL,finished_at REAL);
+                  latest_version TEXT,detail TEXT,created_at REAL,finished_at REAL,
+                  expected_before TEXT DEFAULT '', expected_latest TEXT DEFAULT '');
                 CREATE TABLE IF NOT EXISTS requests (
                   id TEXT PRIMARY KEY,run_id TEXT,profile TEXT,acknowledged INTEGER DEFAULT 0);
             """)
+            for column in ('expected_before', 'expected_latest'):
+                try:
+                    db.execute(f"ALTER TABLE runs ADD COLUMN {column} TEXT DEFAULT ''")
+                except sqlite3.OperationalError as exc:
+                    if 'duplicate column' not in str(exc).lower():
+                        raise
             with db:
                 yield db
         finally:
@@ -58,7 +66,10 @@ def database():
 
 
 def active(target):
-    value = capture(['/usr/bin/systemctl', 'show', 'pylon-update@' + target + '.service', '-p', 'ActiveState', '--value'])
+    package = target.removeprefix('apt:') if str(target).startswith('apt:') else ''
+    unit_prefix = 'pylon-apt-update@' if package else 'pylon-update@'
+    instance = package or target
+    value = capture(['/usr/bin/systemctl', 'show', unit_prefix + instance + '.service', '-p', 'ActiveState', '--value'])
     return value in {'active', 'activating', 'deactivating', 'reloading'}
 
 
@@ -95,6 +106,36 @@ def start(target, profile, request_id):
         db.execute('INSERT INTO requests(id,run_id,profile) VALUES(?,?,?)', (request_id, run_id, profile))
     try:
         capture(['/usr/bin/systemctl', 'start', '--no-block', 'pylon-update@' + target + '.service'])
+    except Exception as exc:
+        finish(run_id, 'failed', detail=redact(str(exc)))
+    with database() as db:
+        return dict(db.execute('SELECT * FROM runs WHERE id=?', (run_id,)).fetchone())
+
+
+def start_apt(package, profile, request_id, expected_before, expected_latest):
+    if (not is_allowed_apt_package(package) or profile != 'default'
+            or not re.fullmatch(r'[A-Za-z0-9:_-]{1,100}', request_id)
+            or not re.fullmatch(r'[A-Za-z0-9.+:~_-]{1,160}', expected_before)
+            or not re.fullmatch(r'[A-Za-z0-9.+:~_-]{1,160}', expected_latest)):
+        raise ValueError('invalid APT update request')
+    target = 'apt:' + package
+    with database() as db:
+        db.execute('BEGIN IMMEDIATE')
+        previous = db.execute('SELECT r.* FROM runs r JOIN requests q ON q.run_id=r.id WHERE q.id=?', (request_id,)).fetchone()
+        if previous:
+            return dict(previous)
+        running = db.execute("SELECT * FROM runs WHERE target=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1", (target,)).fetchone()
+        if running:
+            db.execute('INSERT INTO requests(id,run_id,profile) VALUES(?,?,?)', (request_id, running['id'], profile))
+            return dict(running)
+        run_id = uuid.uuid4().hex
+        db.execute("""INSERT INTO runs
+            (id,target,status,created_at,expected_before,expected_latest)
+            VALUES(?,?, 'queued',?,?,?)""",
+                   (run_id, target, time.time(), expected_before, expected_latest))
+        db.execute('INSERT INTO requests(id,run_id,profile) VALUES(?,?,?)', (request_id, run_id, profile))
+    try:
+        capture(['/usr/bin/systemctl', 'start', '--no-block', 'pylon-apt-update@' + package + '.service'])
     except Exception as exc:
         finish(run_id, 'failed', detail=redact(str(exc)))
     with database() as db:
@@ -143,6 +184,149 @@ def repair_codex_links():
         temporary.unlink(missing_ok=True)
         temporary.symlink_to(entry)
         temporary.replace(target)
+
+
+def _apt_version(package: str) -> str:
+    if not is_allowed_apt_package(package):
+        raise ValueError('APT 包不在固定白名单中')
+    value = capture(['/usr/bin/dpkg-query', '-W', '-f=${Version}', package], timeout=15)
+    if not re.fullmatch(r'[A-Za-z0-9.+:~_-]{1,160}', value):
+        raise ValueError('无法读取已安装 APT 版本')
+    return value
+
+
+def _apt_candidate(package: str) -> str:
+    output = capture(['/usr/bin/apt-cache', 'policy', package], timeout=20)
+    match = re.search(r'^\s+Candidate:\s*(\S+)', output, re.MULTILINE)
+    if not match or not re.fullmatch(r'[A-Za-z0-9.+:~_-]{1,160}', match.group(1)):
+        raise ValueError('无法读取 APT 候选版本')
+    return match.group(1)
+
+
+def _apt_newer(candidate: str, installed: str) -> bool:
+    """Compare Debian versions with dpkg semantics, including epochs and tildes."""
+    pattern = r'[A-Za-z0-9.+:~_-]{1,160}'
+    if not re.fullmatch(pattern, candidate) or not re.fullmatch(pattern, installed):
+        raise ValueError('APT 版本格式异常')
+    result = subprocess.run(['/usr/bin/dpkg', '--compare-versions', candidate, 'gt', installed],
+                            capture_output=True, text=True, timeout=15)
+    if result.returncode not in {0, 1}:
+        raise RuntimeError('APT 版本比较失败')
+    return result.returncode == 0
+
+
+def _apt_simulation(package: str, *, upgrade: bool = False) -> str:
+    argv = ['/usr/bin/apt-get', '-s', '-o', 'APT::Get::Assume-Yes=true',
+            '-o', 'APT::Get::Show-Upgraded=true']
+    argv += ['upgrade'] if upgrade else ['install', '--only-upgrade', '--no-install-recommends', package]
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    output = (result.stdout + '\n' + result.stderr).strip()
+    if result.returncode:
+        raise RuntimeError('APT 模拟升级失败：' + redact(output)[-1200:])
+    return output
+
+
+def _apt_simulation_safe(output: str, package: str, *, strict: bool = True) -> tuple[bool, str]:
+    lowered = output.lower()
+    if 'the following packages will be removed:' in lowered or 'the following packages will be newly installed:' in lowered:
+        return False, '模拟升级包含新增或删除包'
+    if 'autoremove' in lowered:
+        return False, '模拟升级包含 autoremove'
+    # A package kept back by the normal upgrade simulation is still phased;
+    # never bypass that release policy from a button click.
+    kept = re.search(r'The following packages have been kept back:\s*\n((?:\s+\S+\n?)+)', output, re.I)
+    if kept and re.search(r'(?<![A-Za-z0-9_.+~-])' + re.escape(package) + r'(?![A-Za-z0-9_.+~-])', kept.group(1)):
+        return False, '该包仍处于 phased updates 延迟阶段'
+    upgrade_lines = re.findall(r'^Inst\s+(\S+)', output, re.MULTILINE)
+    if strict and upgrade_lines and set(upgrade_lines) != {package}:
+        return False, '模拟升级将同时修改其他包'
+    if package and not upgrade_lines and re.search(r'0 upgraded,\s*0 newly installed', output):
+        return False, '系统没有确认该包可更新'
+    if not upgrade_lines and package and not re.search(r'kept back', output, re.I):
+        return False, '模拟升级没有确认该包'
+    return True, ''
+
+
+def apt_update(package: str):
+    if not is_allowed_apt_package(package):
+        raise ValueError('APT 包不在固定白名单中')
+    target = 'apt:' + package
+    with database() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute("SELECT * FROM runs WHERE target=? AND status='queued' ORDER BY created_at LIMIT 1", (target,)).fetchone()
+        if not row:
+            return
+        run_id = row['id']
+        db.execute("UPDATE runs SET status='running' WHERE id=?", (run_id,))
+    before = after = target_version = ''
+    try:
+        with (ROOT / 'install.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                finish(run_id, 'busy', detail='另一项软件更新正在执行，本次未更新')
+                return
+            before = _apt_version(package)
+            target_version = _apt_candidate(package)
+            expected_before = str(row['expected_before'] or '')
+            expected_latest = str(row['expected_latest'] or '')
+            if before != expected_before or target_version != expected_latest:
+                finish(run_id, 'stale', before=before, after=before, target_version=target_version,
+                       detail='候选版本或已安装版本已变化，请重新检查后再确认')
+                return
+            if not _apt_newer(target_version, before):
+                finish(run_id, 'current', before=before, after=before, target_version=target_version,
+                       detail='已安装版本不低于候选版本，本次保留现有版本')
+                return
+            simulation = _apt_simulation(package)
+            safe, reason = _apt_simulation_safe(simulation, package)
+            if not safe:
+                status = 'deferred' if 'phased' in reason else 'failed'
+                finish(run_id, status, before=before, after=before, target_version=target_version, detail=reason)
+                return
+            normal_simulation = _apt_simulation('', upgrade=True)
+            safe_normal, reason_normal = _apt_simulation_safe(normal_simulation, package, strict=False)
+            if not safe_normal and 'phased' not in reason_normal:
+                finish(run_id, 'failed', before=before, after=before, target_version=target_version, detail=reason_normal)
+                return
+            env = os.environ.copy()
+            env['DEBIAN_FRONTEND'] = 'noninteractive'
+            command = ['/usr/bin/apt-get', '-y', '-o', 'Dpkg::Options::=--force-confold',
+                       '--only-upgrade', '--no-install-recommends', 'install', package]
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=900, env=env)
+            output = (proc.stdout + '\n' + proc.stderr).strip()
+            try:
+                after = _apt_version(package)
+            except Exception:
+                after = ''
+            if proc.returncode:
+                finish(run_id, 'failed', before=before, after=after, target_version=target_version,
+                       detail=f'APT 安装退出码 {proc.returncode}\n' + output[-1600:])
+            elif after != target_version:
+                finish(run_id, 'failed', before=before, after=after, target_version=target_version,
+                       detail='APT 命令结束，但实装版本未达到候选版本')
+            else:
+                reboot = Path('/var/run/reboot-required').exists()
+                service_note = ''
+                if package == 'thermald':
+                    service = subprocess.run(['/usr/bin/systemctl', 'is-active', 'thermald'],
+                                             capture_output=True, text=True, timeout=15)
+                    state = service.stdout.strip() or service.stderr.strip() or 'unknown'
+                    if service.returncode or state != 'active':
+                        service_note = '；thermald 更新后状态为 ' + redact(state)
+                status = 'updated' if not service_note else 'failed'
+                detail = 'APT 安装与更新后版本检查通过'
+                if reboot:
+                    detail += '；系统标记需要重启，pylon 未自动重启主机'
+                detail += service_note
+                finish(run_id, status, before=before, after=after, target_version=target_version, detail=detail)
+    except Exception as exc:
+        try:
+            after = _apt_version(package)
+        except Exception:
+            pass
+        finish(run_id, 'uncertain' if isinstance(exc, TimeoutError) else 'failed', before=before, after=after,
+               target_version=target_version, detail=str(exc))
 
 
 def execute(target):
@@ -354,6 +538,8 @@ def main(args):
             output = [dict(row) for row in db.execute('SELECT * FROM runs ORDER BY created_at DESC LIMIT 5')]
     elif len(args) == 4 and args[0] == 'update':
         output = start(*args[1:])
+    elif len(args) == 6 and args[0] == 'apt-update':
+        output = start_apt(*args[1:])
     elif len(args) == 2 and args[0] == 'ack' and re.fullmatch(r'[A-Za-z0-9:_-]{1,100}', args[1]):
         with database() as db:
             db.execute('UPDATE requests SET acknowledged=1 WHERE id=?', (args[1],))
@@ -366,9 +552,11 @@ def main(args):
 
 if __name__ == '__main__':
     import sys
-    if os.geteuid() != 0 or len(sys.argv) != 2:
-        raise SystemExit('root worker requires exactly one fixed software target')
-    if sys.argv[1] == 'inventory-worker':
+    if os.geteuid() != 0 or len(sys.argv) not in {2, 3}:
+        raise SystemExit('root worker requires a fixed software target')
+    if sys.argv[1] == 'inventory-worker' and len(sys.argv) == 2:
         print(json.dumps(inventory(), ensure_ascii=False))
+    elif sys.argv[1] == 'apt-worker' and len(sys.argv) == 3:
+        apt_update(sys.argv[2])
     else:
         execute(sys.argv[1])
