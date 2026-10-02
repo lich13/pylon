@@ -47,22 +47,13 @@ def text_key(text: str, job_id: str) -> str:
     return f"{job_id}:{suffix}:{digest}"
 
 
-def publish(
-    text: str,
-    *,
-    key: str | None = None,
-    profile: str | None = None,
-    reply_markup: dict | None = None,
-) -> str | None:
+def publish(text: str, *, key: str | None = None, profile: str | None = None) -> str | None:
     if not enabled() or silent(text):
         return None
     ctx = context()
     if profile:
         ctx["profile"] = profile
-    payload = {"text": text}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return Outbox().enqueue(kind="text", payload=payload, key=key or text_key(text, ctx["job_id"]), **ctx)
+    return Outbox().enqueue(kind="text", payload={"text": text}, key=key or text_key(text, ctx["job_id"]), **ctx)
 
 
 def publish_document(path: Path, caption: str, *, key: str) -> str | None:

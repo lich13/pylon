@@ -28,7 +28,7 @@ pylon bot-menu check
 
 两个 Telegram 机器人提供相同的 29 项中文菜单。`/help` 查看全部入口，`/help 命令` 查看参数、示例和操作影响。菜单保留日常状态、更新、监控和必要维护入口；CHH 商品分类不再提供日常管理命令。
 
-CHH 分类策略由 `src/pylon/tasks/chiphell/categories.py` 中的 `SILENT_CATEGORIES` 维护，当前为空，所有类别继续推送。混合和未归类帖子始终保留，重点比价独立运行。抓取到无法确认的新类别时，只向本人发送一次询问卡片；按钮只记录“继续保留”或“待静默”意见，不直接改策略，后续由维护脚本更新分类规则。
+CHH 分类策略由 `src/pylon/tasks/chiphell/categories.py` 中的 `SILENT_CATEGORIES` 维护，当前为空，不新增类别静默。混合和未归类帖子继续保留，重点比价独立运行。抓取到完整正文仍无法归类的新商品时，向默认本人会话发送一次询问卡片；按钮只记录“继续保留”或“建议静默”，后续由维护者更新规则。相同标题模式不重复询问，同时最多一条待答、每天最多一条新询问；历史帖子不补问。意见和投递记录共用现有 SQLite outbox。
 
 Gmail 的 `/gmail_candidates` 只展示尚未确认的新类型；已确认的内置和自定义类型继续自动清理。对候选使用 `/gmail_candidate 候选ID` 查看元数据，再用 `/gmail_feedback 候选ID 意见` 交给 Grok 生成规则草案。草案通过 `/gmail_rule_preview 提案ID` 预览、`/gmail_rule_apply 提案ID` 确认后写入运行时覆盖层，下一次排程才会按新规则清理；反馈、预览和应用命令都不会删除当前邮件。`/gmail_accept` 和 `/gmail_ignore` 保留为兼容入口。
 

@@ -7,8 +7,6 @@ preference cannot hide useful information.
 """
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import hashlib
 import hmac
 import json
@@ -19,13 +17,18 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
+from pylon import events
 from pylon.config import profile_env
-from pylon.shared import paths, state_json
+from pylon.outbox import Outbox
+from pylon.shared import paths
 
 
-CATEGORY_VERSION = 1
+CATEGORY_VERSION = 2
 QUEUE_PATH = paths.CHIPHELL_DATA_ROOT / "delivery.sqlite3"
-UNKNOWN_REVIEW_PATH = paths.CHIPHELL_DATA_ROOT / "unknown-category-reviews.json"
+UNKNOWN_REVIEW_PREFIX = "chiphell:unknown-review:"
+UNKNOWN_LAST_PROMPT = "chiphell:unknown-last-prompt"
+UNKNOWN_BASELINE = "chiphell:unknown-baseline"
+UNKNOWN_PROMPT_INTERVAL = 24 * 60 * 60
 CALLBACK_PREFIX = "ch1"  # retired category mutation callbacks
 UNKNOWN_CALLBACK_PREFIX = "ch2"
 
@@ -187,38 +190,11 @@ def classify_post(post: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def load_policy(path: Path | None = None) -> dict[str, Any]:
-    """Return the deployed policy; runtime files cannot override it.
-
-    ``path`` remains accepted for callers that used the old API, but is
-    intentionally ignored.  A policy change is a reviewed source change.
-    """
-    values = [key for key in SILENT_CATEGORIES if key in CATEGORY_LABELS]
-    return {
-        "version": CATEGORY_VERSION,
-        "silent_categories": list(dict.fromkeys(values)),
-        "source": "pylon.tasks.chiphell.categories:SILENT_CATEGORIES",
-    }
-
-
-def resolve_category(value: str) -> str:
-    raw = re.sub(r"\s+", "", str(value or "")).lower()
-    if raw in CATEGORY_LABELS:
-        return raw
-    aliases = {re.sub(r"\s+", "", label).lower(): key for key, label in CATEGORY_LABELS.items()}
-    if raw in aliases:
-        return aliases[raw]
-    raise ValueError("分类不存在；请修改 SILENT_CATEGORIES 中的稳定分类 ID")
-
-
-def set_category_silence(category: str, silent: bool, *, actor: str = "local", path: Path | None = None) -> dict[str, Any]:
-    """Reject the retired runtime mutation API.
-
-    Keeping the symbol makes old imports fail explicitly instead of silently
-    changing a policy file that is no longer read by production.
-    """
-    resolve_category(category)
-    raise RuntimeError("CHH 分类策略由源码维护，请修改 SILENT_CATEGORIES 后部署")
+def load_policy() -> dict[str, Any]:
+    """The deployed source is the only category-policy authority."""
+    if not set(SILENT_CATEGORIES) <= CATEGORY_LABELS.keys():
+        raise ValueError("Unknown category id in SILENT_CATEGORIES")
+    return {"version": CATEGORY_VERSION, "silent_categories": list(dict.fromkeys(SILENT_CATEGORIES))}
 
 
 def filter_normal_posts(posts: Iterable[dict[str, Any]], policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -247,56 +223,26 @@ def filter_normal_posts(posts: Iterable[dict[str, Any]], policy: dict[str, Any] 
     return output
 
 
-def _unknown_default() -> dict[str, Any]:
-    return {"version": 1, "reviews": {}}
-
-
-@contextlib.contextmanager
-def _review_lock(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name("." + path.name + ".lock")
-    with lock_path.open("a") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
-        yield
-
-
-def load_unknown_reviews(path: Path | None = None) -> dict[str, Any]:
-    path = path or UNKNOWN_REVIEW_PATH
-    data = state_json.load(path, default=_unknown_default())
-    if not isinstance(data, dict) or not isinstance(data.get("reviews"), dict):
-        return _unknown_default()
-    reviews: dict[str, dict[str, Any]] = {}
-    for fingerprint, review in data["reviews"].items():
-        if re.fullmatch(r"[0-9a-f]{16}", str(fingerprint)) and isinstance(review, dict):
-            reviews[str(fingerprint)] = dict(review)
-    return {"version": 1, "reviews": reviews}
-
-
-def _save_unknown_reviews(data: dict[str, Any], path: Path) -> None:
-    # Keep the review journal bounded; it is only a once-per-pattern prompt
-    # ledger, not a copy of the monitored feed.
-    rows = data.get("reviews") if isinstance(data.get("reviews"), dict) else {}
-    ordered = sorted(rows.items(), key=lambda item: int(item[1].get("last_seen") or 0))[-500:]
-    state_json.save_atomic(path, {"version": 1, "reviews": dict(ordered)})
-
-
 def unknown_fingerprint(post: dict[str, Any]) -> str:
-    """Build a stable, low-detail key for one unknown product pattern."""
+    """Group title variants without inferring a production filtering rule."""
     title = str(post.get("title") or "").strip().lower()
-    title = re.sub(r"^\s*\[[^]]+\]\s*", "", title)
+    title = re.sub(r"^\s*[\[【][^]】]+[]】]\s*", "", title)
     title = re.sub(r"https?://\S+", "", title)
+    title = re.sub(r"(?:售价|明盘|价格)?\s*\d+(?:\.\d+)?\s*(?:元|块|rmb|包邮)", "", title)
+    title = re.sub(r"全新未拆封|全新|闲置|出售|转让|低价|便宜|打包|包邮|自提", "", title)
+    title = re.sub(r"^(?:出|收|卖|求购|清理)+", "", title.strip())
     title = re.sub(r"\d+(?:\.\d+)?", "#", title)
-    title = re.sub(r"[^0-9a-z\u4e00-\u9fff#]+", " ", title)
-    title = re.sub(r"\s+", " ", title).strip()
-    if not title:
-        title = str(post.get("id") or post.get("url") or "unknown").strip().lower()
-    return hashlib.sha256(("chh-unknown-v1:" + title[:160]).encode()).hexdigest()[:16]
+    title = re.sub(r"[^0-9a-z\u4e00-\u9fff#]+", "", title)
+    if len(title.replace("#", "")) < 2 or title in {"东西", "杂物", "点杂物", "几样东西", "若干"}:
+        return ""
+    return hashlib.sha256(("chh-unknown-v2:" + title[:160]).encode()).hexdigest()[:16]
 
 
 def _unknown_signature(profile: str, action: str, fingerprint: str) -> str:
-    secret = str(profile_env(profile).get("TELEGRAM_BOT_TOKEN") or "pylon").encode()
-    value = f"{profile}|{action}|{fingerprint}"
-    return hmac.new(secret, value.encode(), hashlib.sha256).hexdigest()[:12]
+    secret = str(profile_env(profile).get("TELEGRAM_BOT_TOKEN") or "")
+    if not secret:
+        raise ValueError("未配置机器人")
+    return hmac.new(secret.encode(), f"{profile}|{action}|{fingerprint}".encode(), hashlib.sha256).hexdigest()[:12]
 
 
 def unknown_callback_data(profile: str, action: str, fingerprint: str) -> str:
@@ -305,64 +251,66 @@ def unknown_callback_data(profile: str, action: str, fingerprint: str) -> str:
     return f"{UNKNOWN_CALLBACK_PREFIX}|{action}|{fingerprint}|{_unknown_signature(profile, action, fingerprint)}"
 
 
-def _unknown_keyboard(profile: str, fingerprint: str) -> dict[str, Any]:
-    return {"inline_keyboard": [[
-        {"text": "继续保留", "callback_data": unknown_callback_data(profile, "keep", fingerprint)},
-        {"text": "记录为待静默", "callback_data": unknown_callback_data(profile, "mute", fingerprint)},
-    ]]}
-
-
-def unknown_prompts(
-    posts: Iterable[dict[str, Any]],
-    *,
-    profile: str = "default",
-    path: Path | None = None,
-) -> list[dict[str, Any]]:
-    """Return and persist at most one question card per unknown pattern."""
-    path = path or UNKNOWN_REVIEW_PATH
-    now = int(time.time())
-    prompts: list[dict[str, Any]] = []
-    with _review_lock(path):
-        data = load_unknown_reviews(path)
-        reviews = data["reviews"]
-        changed = False
+def seed_unknown_history(box: Outbox, posts: Iterable[dict[str, Any]]) -> int:
+    """Mark historical unknown patterns seen, without sending any cards."""
+    with box.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT 1 FROM kv WHERE key=?", (UNKNOWN_BASELINE,)).fetchone():
+            return 0
+        count = 0
         for post in posts:
-            classification = classify_post(post)
-            if UNKNOWN_KEY not in set(classification.get("categories") or []):
+            if UNKNOWN_KEY not in classify_post(post)["categories"]:
                 continue
             fingerprint = unknown_fingerprint(post)
-            current = reviews.get(fingerprint)
-            if current:
-                current["last_seen"] = now
-                current["count"] = int(current.get("count") or 0) + 1
-                changed = True
+            if fingerprint:
+                count += db.execute("INSERT OR IGNORE INTO kv VALUES(?,?)", (
+                    UNKNOWN_REVIEW_PREFIX + fingerprint, json.dumps({"status": "baseline"}))).rowcount
+        db.execute("INSERT INTO kv VALUES(?,?)", (UNKNOWN_BASELINE, json.dumps({"count": count})))
+    return count
+
+
+def publish_unknown_prompts(
+    posts: Iterable[dict[str, Any]], *, box: Outbox | None = None, now: float | None = None,
+) -> int:
+    """Atomically queue a single question and its permanent deduplication key."""
+    if box is None and not events.enabled():
+        return 0
+    box, now = box or Outbox(), time.time() if now is None else now
+    with box.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        rows = db.execute("SELECT value FROM kv WHERE key LIKE ?", (UNKNOWN_REVIEW_PREFIX + "%",)).fetchall()
+        if any(json.loads(row[0]).get("status") == "asked" for row in rows):
+            return 0
+        previous = db.execute("SELECT value FROM kv WHERE key=?", (UNKNOWN_LAST_PROMPT,)).fetchone()
+        if previous and now - float(json.loads(previous[0])) < UNKNOWN_PROMPT_INTERVAL:
+            return 0
+        for post in posts:
+            # Missing/failed body retrieval and recognized mixed listings are
+            # not evidence that a new product category exists.
+            if not post.get("body_complete") or not post.get("body_full"):
                 continue
-            title = str(post.get("title") or "无标题").strip()
-            excerpt = re.sub(r"\s+", " ", str(post.get("body_excerpt") or "")).strip()
-            reviews[fingerprint] = {
-                "status": "asked",
-                "first_seen": now,
-                "last_seen": now,
-                "count": 1,
-                "title": title[:180],
-                "url": str(post.get("url") or "")[:500],
-            }
-            changed = True
-            prompts.append({
-                "fingerprint": fingerprint,
-                "text": (
-                    "CHH 出现暂未归类的新商品类型\n"
-                    f"标题：{title[:180]}\n"
-                    + (f"摘要：{excerpt[:280]}\n" if excerpt else "")
-                    + f"链接：{post.get('url') or ''}\n\n"
-                    "当前仍按全保留推送。请选择记录意见；按钮不会直接修改生产策略，"
-                    "后续由维护脚本更新分类规则。"
-                ),
-                "reply_markup": _unknown_keyboard(profile, fingerprint),
-            })
-        if changed:
-            _save_unknown_reviews(data, path)
-    return prompts
+            if classify_post(post)["categories"] != [UNKNOWN_KEY]:
+                continue
+            fingerprint = unknown_fingerprint(post)
+            key = UNKNOWN_REVIEW_PREFIX + fingerprint
+            if not fingerprint or db.execute("SELECT 1 FROM kv WHERE key=?", (key,)).fetchone():
+                continue
+            title = str(post.get("title") or "无标题").strip()[:180]
+            url = str(post.get("url") or "")[:500]
+            markup = {"inline_keyboard": [[
+                {"text": "继续保留", "callback_data": unknown_callback_data("default", "keep", fingerprint)},
+                {"text": "建议静默", "callback_data": unknown_callback_data("default", "mute", fingerprint)},
+            ]]}
+            event_id = box.enqueue(
+                profile="default", job_id="chiphell-category-review", kind="text",
+                payload={"text": f"CHH 未识别品类\n{title}\n{url}\n\n意见仅作记录，调整规则前继续推送。",
+                         "reply_markup": markup}, key="chiphell:unknown:" + fingerprint, connection=db)
+            db.execute("INSERT INTO kv VALUES(?,?)", (key, json.dumps({
+                "status": "asked", "event_id": event_id, "created_at": now, "title": title, "url": url,
+            }, ensure_ascii=False)))
+            db.execute("INSERT OR REPLACE INTO kv VALUES(?,?)", (UNKNOWN_LAST_PROMPT, json.dumps(now)))
+            return 1
+    return 0
 
 
 def arbitrage_posts(posts: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -424,8 +372,8 @@ def _label(key: str) -> str:
     return CATEGORY_LABELS.get(key, MIXED_LABEL if key == MIXED_KEY else UNKNOWN_LABEL)
 
 
-def category_report(profile: str = "default", *, path: Path | None = None, queue_path: Path | None = None) -> tuple[str, dict[str, Any]]:
-    policy = load_policy(path)
+def category_report(*, queue_path: Path | None = None) -> tuple[str, dict[str, Any]]:
+    policy = load_policy()
     posts = history_posts(queue_path)
     counts = category_counts(posts)
     lines = [f"CHH 历史分类（分类器 v{CATEGORY_VERSION}）", f"已解析商品帖：{len(posts)} 条",
@@ -442,10 +390,10 @@ def category_report(profile: str = "default", *, path: Path | None = None, queue
     return "\n".join(lines), {}
 
 
-def policy_status_line(path: Path | None = None) -> str:
-    policy = load_policy(path)
+def policy_status_line() -> str:
+    policy = load_policy()
     muted = "、".join(_label(key) for key in policy["silent_categories"]) or "无"
-    return "CHH 普通新帖静默：" + muted + "（源码策略）；混合/未归类保留；重点比价独立"
+    return "CHH 普通新帖静默：" + muted + "；混合/未归类保留；重点比价独立"
 
 
 def _parse_unknown_callback(profile: str, data: str) -> tuple[str, str]:
@@ -463,21 +411,27 @@ def _parse_unknown_callback(profile: str, data: str) -> tuple[str, str]:
 def _unknown_callback(profile: str, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         action, fingerprint = _parse_unknown_callback(profile, str(payload.get("data") or ""))
-        with _review_lock(UNKNOWN_REVIEW_PATH):
-            data = load_unknown_reviews(UNKNOWN_REVIEW_PATH)
-            review = data["reviews"].get(fingerprint)
-            if not review:
-                return {"text": "这条未知类别记录已过期，请等待新的询问卡片。"}
-            previous = str(review.get("status") or "asked")
-            if previous in {"kept", "pending_mute"}:
-                label = "继续保留" if previous == "kept" else "记录为待静默"
-                return {"text": f"已记录：{label}。分类策略仍由源码维护。"}
-            review["status"] = "kept" if action == "keep" else "pending_mute"
-            review["decision_at"] = int(time.time())
-            review["decision_by"] = f"telegram:{profile}"
-            _save_unknown_reviews(data, UNKNOWN_REVIEW_PATH)
-        label = "继续保留" if action == "keep" else "待静默"
-        return {"text": f"已记录：{label}。不会直接修改生产策略，后续由维护脚本更新分类规则。"}
+        box = Outbox()
+        with box.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            key = UNKNOWN_REVIEW_PREFIX + fingerprint
+            row = db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            if not row:
+                return {"text": "未找到这条询问。"}
+            review = json.loads(row[0])
+            event = db.execute("SELECT profile,receipt FROM events WHERE id=?", (review.get("event_id"),)).fetchone()
+            message = payload.get("message") or {}
+            receipts = json.loads(event["receipt"] or "[]") if event else []
+            if (profile != "default" or not event or event["profile"] != profile or not receipts
+                    or receipts[-1].get("message_id") != message.get("message_id")
+                    or str(receipts[-1].get("chat_id")) != str((message.get("chat") or {}).get("id"))):
+                return {"text": "请使用原始询问消息上的按钮。"}
+            previous = review.get("status")
+            if previous not in {"kept", "pending_mute"}:
+                review.update(status="kept" if action == "keep" else "pending_mute", decision_at=time.time())
+                db.execute("UPDATE kv SET value=? WHERE key=?", (json.dumps(review, ensure_ascii=False), key))
+            label = "继续保留" if review["status"] == "kept" else "建议静默"
+            return {"text": f"已记录：{label}。调整规则前继续推送。"}
     except ValueError as error:
         return {"text": str(error)}
 

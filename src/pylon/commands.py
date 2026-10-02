@@ -284,6 +284,8 @@ def handle(profile: str, text: str) -> str:
             action = parts[0] if parts else ('list' if name == 'gmail' else 'status')
             argument = parts[1] if len(parts) > 1 else ''
             name = name + '_' + ('candidates' if name == 'gmail' and action == 'list' else action)
+        if name in {'chiphell_categories', 'chiphell_silence', 'chiphell_unsilence'}:
+            return 'CHH 分类管理入口已移除，推送偏好在维护时统一调整。'
         item = COMMANDS.get(name)
         if item is None:
             return '没有这个命令。发送 /help 查看可用命令。'

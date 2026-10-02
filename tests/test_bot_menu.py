@@ -20,6 +20,7 @@ def test_catalog_is_valid_chinese_and_has_detailed_help():
     assert {'gmail_review', 'gmail_rules'} <= {row['command'] for row in menu_commands()}
     assert 'gmail_feedback' not in {row['command'] for row in menu_commands()}
     assert not {'chiphell_categories', 'chiphell_silence', 'chiphell_unsilence'} & {row['command'] for row in menu_commands()}
+    assert len(menu_commands()) == 29
     for item in COMMANDS.values():
         assert re.fullmatch('[a-z0-9_]{1,32}', item.name)
         assert 1 <= len(item.description) <= 256
@@ -105,6 +106,13 @@ def test_retired_commands_and_extra_arguments_do_not_execute(monkeypatch):
     for text in ('/ssh_refresh arbitrary', '/chiphell_pause now', '/remove_monitor 1', '/gmail_candidates gmail-nt-x'):
         with pytest.raises(ValueError, match='不接受参数'):
             commands.handle('default', text)
+
+
+@pytest.mark.parametrize('text', ['/chiphell_categories', '/chiphell_silence 手机·苹果',
+                                 '/chiphell_unsilence 手机·苹果', '/chiphell silence phone_apple'])
+def test_retired_category_commands_do_not_reach_admin(text, monkeypatch):
+    monkeypatch.setattr(scheduler, 'admin', Mock(side_effect=AssertionError('must not execute')))
+    assert '入口已移除' in commands.handle('default', text)
 
 
 def test_monitors_does_not_arm_or_change_numbered_removal(tmp_path, monkeypatch):

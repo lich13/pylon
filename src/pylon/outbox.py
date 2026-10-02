@@ -93,10 +93,11 @@ class Outbox:
             db.close()
 
     def enqueue(self, *, profile: str, job_id: str, kind: str, payload: dict,
-                key: str, run_id: str = "", delay: float = 0) -> str:
+                key: str, run_id: str = "", delay: float = 0,
+                connection: sqlite3.Connection | None = None) -> str:
         event_id = hashlib.sha256(f"{profile}:{kind}:{key}".encode()).hexdigest()[:32]
         now = time.time()
-        with self.connect() as db:
+        with self.connect() if connection is None else contextlib.nullcontext(connection) as db:
             db.execute("INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,next_attempt,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                        (event_id, profile, job_id, kind, json.dumps(payload, ensure_ascii=False), now + delay, now, now))
             if run_id:
