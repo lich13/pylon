@@ -44,6 +44,13 @@ def test_policy_is_versioned_and_idempotent(tmp_path):
     assert json.loads(path.read_text())['updated_by'] == 'local'
 
 
+def test_concurrent_style_updates_preserve_existing_category(tmp_path):
+    path = tmp_path / 'category-policy.json'
+    categories.set_category_silence('手机·苹果', True, path=path)
+    categories.set_category_silence('电脑·CPU', True, path=path)
+    assert categories.load_policy(path)['silent_categories'] == ['computer_cpu', 'phone_apple']
+
+
 def test_history_reader_is_read_only_and_counts_posts(tmp_path):
     queue = tmp_path / 'delivery.sqlite3'
     with sqlite3.connect(queue) as db:

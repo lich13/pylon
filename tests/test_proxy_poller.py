@@ -132,6 +132,22 @@ class PollerFaultIntegrationTests(unittest.TestCase):
             poller._run_cycle(self.args, observe=False)
         self.assertEqual(self.pending_count(), 0)
 
+    def test_observe_does_not_collect_or_persist_arbitrage_alerts(self):
+        candidate = {"id": "post-1", "title": "普通帖子", "body_excerpt": "正文"}
+        result = ("OK", [candidate], [candidate], {
+            "last_error_class": None,
+            "last_error_code": None,
+            "proxy_probe_status": "NOT_NEEDED",
+            "proxy_probe_latency_ms": 0,
+            "navigation_duration_ms": 100,
+        })
+        fake_base.should_notify_post = lambda post: True
+        with mock.patch.object(poller, "_collect_proxy_once", return_value=result), mock.patch.object(
+            poller.base, "collect_arbitrage_messages", side_effect=AssertionError("observe must stay read-only")
+        ):
+            poller._run_cycle(self.args, observe=True)
+        self.assertEqual(self.pending_count(), 0)
+
     def test_apply_forum_target_overrides_parser_defaults(self):
         args = SimpleNamespace(url="https://www.chiphell.com/forum.php?mod=forumdisplay&fid=26&filter=author&orderby=dateline", fid="26")
         updated = poller.apply_forum_target(args)

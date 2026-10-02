@@ -229,14 +229,19 @@ def resolve_category(value: str) -> str:
 
 def set_category_silence(category: str, silent: bool, *, actor: str = "local", path: Path | None = None) -> dict[str, Any]:
     key = resolve_category(category)
-    policy = load_policy(path)
-    values = set(policy["silent_categories"])
-    if silent:
-        values.add(key)
-    else:
-        values.discard(key)
-    policy["silent_categories"] = sorted(values)
-    return save_policy(policy, path, actor=actor)
+    path = path or POLICY_PATH
+    with _policy_lock(path):
+        policy = load_policy(path)
+        values = set(policy["silent_categories"])
+        if silent:
+            values.add(key)
+        else:
+            values.discard(key)
+        policy["silent_categories"] = sorted(values)
+        policy["updated_at"] = int(__import__("time").time())
+        policy["updated_by"] = str(actor)[:80]
+        state_json.save_atomic(path, policy)
+    return policy
 
 
 def filter_normal_posts(posts: Iterable[dict[str, Any]], policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:

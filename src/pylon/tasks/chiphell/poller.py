@@ -267,7 +267,10 @@ def _run_cycle(args: argparse.Namespace, *, observe: bool) -> int:
 
     if status == "OK":
         quote_posts = [post for post in candidates if base.should_notify_post(post)]
-        notification = _format_notification(posts, args.fid, quote_posts)
+        # The observe path is used by health checks and must not format or
+        # persist quote alerts: collect_arbitrage_messages records matches
+        # and may send Bark notifications as part of its normal path.
+        notification = "" if observe else _format_notification(posts, args.fid, quote_posts)
         if not observe and notification:
             ids = [str(post["id"]) for post in candidates]
             queue.enqueue(f"posts:{','.join(ids)}", notification, now=now)
