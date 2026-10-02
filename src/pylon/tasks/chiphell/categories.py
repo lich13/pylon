@@ -363,6 +363,8 @@ def category_report(profile: str = "default", *, path: Path | None = None, queue
     if counts.get(UNKNOWN_KEY):
         lines.append(f"{UNKNOWN_LABEL}：{counts[UNKNOWN_KEY]}（始终保留）")
     lines.append("未列入静默的类别继续推送；重点比价不受此策略影响。")
+    if profile == "cli":
+        return "\n".join(lines), {}
     rows: list[list[dict[str, str]]] = []
     for key, label in CATEGORY_LABELS.items():
         if not counts.get(key):

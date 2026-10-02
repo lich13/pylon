@@ -65,6 +65,17 @@ def test_history_reader_is_read_only_and_counts_posts(tmp_path):
     assert queue.stat().st_mtime_ns == before
 
 
+def test_cli_category_report_does_not_need_telegram_profile(tmp_path):
+    queue = tmp_path / 'delivery.sqlite3'
+    with sqlite3.connect(queue) as db:
+        db.execute('CREATE TABLE delivery_queue (dedupe_key TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL, claimed_at INTEGER)')
+        db.execute('INSERT INTO delivery_queue VALUES (?,?,?,?)', (
+            'one', '## Chiphell 新帖\n1. [iPhone 15](https://example.invalid/t1) 摘要：全新', 1, None))
+    text, markup = categories.category_report('cli', queue_path=queue)
+    assert '手机·苹果' in text
+    assert markup == {}
+
+
 def test_callback_signature_and_owner_boundary(monkeypatch, tmp_path):
     monkeypatch.setattr(categories, 'profile_env', lambda _: {
         'TELEGRAM_BOT_TOKEN': 'fixture-token', 'TELEGRAM_HOME_CHANNEL': '123'})
