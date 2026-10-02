@@ -115,6 +115,23 @@ class PollerFaultIntegrationTests(unittest.TestCase):
             self.assertEqual(poller._run_cycle(self.args, observe=False), 60)
         self.assertEqual(self.pending_count(), 0)
 
+    def test_candidate_without_normal_or_arbitrage_message_is_not_enqueued(self):
+        candidate = {"id": "post-1", "title": "普通帖子", "body_excerpt": "正文"}
+        result = ("OK", [candidate], [], {
+            "last_error_class": None,
+            "last_error_code": None,
+            "proxy_probe_status": "NOT_NEEDED",
+            "proxy_probe_latency_ms": 0,
+            "navigation_duration_ms": 100,
+        })
+        fake_base.should_notify_post = lambda post: True
+        fake_base.collect_arbitrage_messages = lambda source, posts: []
+        fake_base.format_alerts = lambda messages: ""
+        fake_base.format_telegram_message = lambda posts, fid: "## Chiphell 新帖"
+        with mock.patch.object(poller, "_collect_proxy_once", return_value=result):
+            poller._run_cycle(self.args, observe=False)
+        self.assertEqual(self.pending_count(), 0)
+
     def test_apply_forum_target_overrides_parser_defaults(self):
         args = SimpleNamespace(url="https://www.chiphell.com/forum.php?mod=forumdisplay&fid=26&filter=author&orderby=dateline", fid="26")
         updated = poller.apply_forum_target(args)

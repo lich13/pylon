@@ -176,9 +176,12 @@ def _collect_proxy_once(
 
 def _format_notification(posts: list[dict[str, Any]], fid: str, quote_posts: list[dict[str, Any]] | None = None) -> str:
     quote_posts = quote_posts if quote_posts is not None else posts
-    arbitrage = base.format_alerts(base.collect_arbitrage_messages("chiphell", quote_posts))
+    arbitrage_messages = base.collect_arbitrage_messages("chiphell", quote_posts)
+    if not posts and not arbitrage_messages:
+        return ""
+    arbitrage = base.format_alerts(arbitrage_messages)
     normal = base.format_telegram_message(posts, fid)
-    return f"{arbitrage}\n\n{normal}".strip() if arbitrage else normal
+    return f"{arbitrage}\n\n{normal}".strip() if arbitrage and posts else (arbitrage or normal)
 
 
 def _fault_message(status: str) -> str:
@@ -264,9 +267,10 @@ def _run_cycle(args: argparse.Namespace, *, observe: bool) -> int:
 
     if status == "OK":
         quote_posts = [post for post in candidates if base.should_notify_post(post)]
-        if not observe and (posts or quote_posts):
+        notification = _format_notification(posts, args.fid, quote_posts)
+        if not observe and notification:
             ids = [str(post["id"]) for post in candidates]
-            queue.enqueue(f"posts:{','.join(ids)}", _format_notification(posts, args.fid, quote_posts), now=now)
+            queue.enqueue(f"posts:{','.join(ids)}", notification, now=now)
         if not observe and candidates:
             merged = apply_baseline(state, [post["id"] for post in candidates], max_ids=args.max_stored_ids)
             state.update(merged)

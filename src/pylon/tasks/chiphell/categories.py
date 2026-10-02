@@ -207,12 +207,12 @@ def _policy_lock(path: Path):
 
 def save_policy(policy: dict[str, Any], path: Path | None = None, *, actor: str = "local") -> dict[str, Any]:
     path = path or POLICY_PATH
-    clean = load_policy(path)
-    clean["silent_categories"] = [key for key in policy.get("silent_categories", []) if key in CATEGORY_LABELS]
-    clean["silent_categories"] = list(dict.fromkeys(clean["silent_categories"]))
-    clean["updated_at"] = int(__import__("time").time())
-    clean["updated_by"] = str(actor)[:80]
     with _policy_lock(path):
+        clean = load_policy(path)
+        clean["silent_categories"] = [key for key in policy.get("silent_categories", []) if key in CATEGORY_LABELS]
+        clean["silent_categories"] = list(dict.fromkeys(clean["silent_categories"]))
+        clean["updated_at"] = int(__import__("time").time())
+        clean["updated_by"] = str(actor)[:80]
         state_json.save_atomic(path, clean)
     return clean
 
