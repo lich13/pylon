@@ -56,11 +56,12 @@ def test_history_reader_is_read_only_and_counts_posts(tmp_path):
     with sqlite3.connect(queue) as db:
         db.execute('CREATE TABLE delivery_queue (dedupe_key TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL, claimed_at INTEGER)')
         db.execute('INSERT INTO delivery_queue VALUES (?,?,?,?)', (
-            'one', '## Chiphell 新帖\n1. [iPhone 15](https://example.invalid/t1) 摘要：全新', 1, None))
+            'one', '## Chiphell 新帖\n1. [[上海]iPhone 15](https://example.invalid/t1) 摘要：全新', 1, None))
     before = queue.stat().st_mtime_ns
     posts = categories.history_posts(queue)
     counts = categories.category_counts(posts)
     assert len(posts) == 1
+    assert posts[0]['title'] == '[上海]iPhone 15'
     assert counts['phone_apple'] == 1
     assert queue.stat().st_mtime_ns == before
 
@@ -70,9 +71,15 @@ def test_cli_category_report_does_not_need_telegram_profile(tmp_path):
     with sqlite3.connect(queue) as db:
         db.execute('CREATE TABLE delivery_queue (dedupe_key TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL, claimed_at INTEGER)')
         db.execute('INSERT INTO delivery_queue VALUES (?,?,?,?)', (
-            'one', '## Chiphell 新帖\n1. [iPhone 15](https://example.invalid/t1) 摘要：全新', 1, None))
+            'one', '## Chiphell 新帖\n1. [[上海]iPhone 15](https://example.invalid/t1) 摘要：全新', 1, None))
     text, markup = categories.category_report('cli', queue_path=queue)
     assert '手机·苹果' in text
+    assert markup == {}
+
+
+def test_empty_category_report_has_no_empty_keyboard(tmp_path):
+    text, markup = categories.category_report('default', queue_path=tmp_path / 'missing.sqlite3')
+    assert '已解析商品帖：0 条' in text
     assert markup == {}
 
 

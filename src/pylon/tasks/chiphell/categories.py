@@ -280,7 +280,9 @@ def _safe_payload_text(payload: str) -> str:
     return str(payload or "").replace("\x00", "")
 
 
-_POST_LINE = re.compile(r"^\s*\d+\.\s+\[([^\]]+)\]\((https?://[^)]+)\)(?:\s+摘要：)?(.*)$")
+# CHH titles commonly start with a location such as ``[上海]``.  Match the
+# title up to the closing ``](`` pair instead of stopping at the first `]`.
+_POST_LINE = re.compile(r"^\s*\d+\.\s+\[(.+?)\]\((https?://[^)]+)\)(?:\s+摘要：)?(.*)$")
 
 
 def history_posts(path: Path | None = None) -> list[dict[str, Any]]:
@@ -372,7 +374,7 @@ def category_report(profile: str = "default", *, path: Path | None = None, queue
         muted = key in policy["silent_categories"]
         action = "unmute" if muted else "mute"
         rows.append([{"text": ("恢复 " if muted else "静默 ") + label, "callback_data": callback_data(profile, action, key)}])
-    return "\n".join(lines), {"inline_keyboard": rows}
+    return "\n".join(lines), ({"inline_keyboard": rows} if rows else {})
 
 
 def policy_status_line(path: Path | None = None) -> str:
