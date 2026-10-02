@@ -140,3 +140,11 @@ def test_pi_news_url_is_canonicalized_and_hermes_is_removed():
     })
     assert source['url'] == 'https://pi.dev/changelog.xml'
     assert 'hermes_agent_releases' not in {value['id'] for value in monitor.SOURCES}
+
+
+def test_legacy_monitor_state_is_upgraded_to_version_two(tmp_path, monkeypatch):
+    configure(tmp_path, monkeypatch)
+    monitor.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    monitor.STATE_FILE.write_text(json.dumps({'version': 1, 'sources': {}}))
+    state = monitor.load_state()
+    assert state['version'] == 2

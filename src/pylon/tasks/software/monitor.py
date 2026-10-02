@@ -921,7 +921,12 @@ def load_state() -> dict[str, Any]:
     data = load_json(STATE_FILE, default={})
     if not isinstance(data, dict) or not data:
         return default_state()
-    data.setdefault('version', 2)
+    try:
+        current_version = int(data.get('version') or 0)
+    except (TypeError, ValueError):
+        current_version = 0
+    if current_version < 2:
+        data['version'] = 2
     data.setdefault('sources', {})
     data.setdefault('pending_events', [])
     data.setdefault('enrichment', {})
