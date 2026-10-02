@@ -99,6 +99,7 @@ HIGH_PRIORITY_SOURCE_IDS = {
     'pi_releases', 'github_anthropics_claude_code_releases',
     'github_wei_shaw_sub2api_releases',
 }
+SOURCE_FAILURE_ALERT_THRESHOLD = 3
 LITERAL_PATTERNS = (
     re.compile(r'```[\s\S]*?```'),
     re.compile(r'`[^`\n]+`'),
@@ -1406,6 +1407,7 @@ def source_state(state: dict[str, Any], source_id: str) -> dict[str, Any]:
     current.setdefault('consecutive_failures', 0)
     current.setdefault('backoff_until', 0)
     current.setdefault('last_error', None)
+    current.setdefault('failure_alerted', False)
     return current
 
 
@@ -2912,18 +2914,25 @@ def due_for_source(current: dict[str, Any], now: float) -> bool:
 
 def mark_source_failure(current: dict[str, Any], error: str, now: float) -> bool:
     failures = int(current.get('consecutive_failures') or 0) + 1
-    first_failure = failures == 1
     current['consecutive_failures'] = failures
     current['last_error'] = error[:500]
     current['last_failure_error'] = error[:500]
     current['last_failure_at'] = utc_now_iso()
     current['backoff_until'] = now + min(3600, 60 * failures)
-    current['failure_alerted'] = bool(current.get('failure_alerted')) or first_failure
-    return first_failure
+    # A single timeout or a brief upstream hiccup is common for public feeds.
+    # Keep it in state for diagnostics, but only turn it into a user-facing
+    # failure after several consecutive polls. Once alerted, do not repeat
+    # until a successful poll clears the incident.
+    already_alerted = bool(current.get('failure_alerted'))
+    should_alert = failures >= SOURCE_FAILURE_ALERT_THRESHOLD and not already_alerted
+    current['failure_alerted'] = already_alerted or should_alert
+    return should_alert
 
 
 def mark_source_success(current: dict[str, Any], now: float, *, headers: dict[str, str] | None = None) -> bool:
-    recovered = int(current.get('consecutive_failures') or 0) > 0 or bool(current.get('failure_alerted'))
+    # Do not report recovery for failures that never crossed the alert
+    # threshold. They remain visible in status/logs but stay silent.
+    recovered = bool(current.get('failure_alerted'))
     current['consecutive_failures'] = 0
     current['last_success_at'] = utc_now_iso()
     current['backoff_until'] = 0
@@ -3042,12 +3051,10 @@ def run_monitor(*, emit_existing: int = 0, dry_run: bool = False,
                 continue
             try:
                 raw = fetch_url(source['url'])
-                was_failed = int(current.get('consecutive_failures') or 0) > 0 or bool(current.get('failure_alerted'))
                 new_items = collect_source_items(state, source, raw, emit_existing=emit_existing)
+                recovered = mark_source_success(current, now)
                 current['next_poll_at'] = now + source_poll_interval(source)
-                current['consecutive_failures'] = 0
-                current['failure_alerted'] = False
-                if was_failed:
+                if recovered:
                     recoveries.append(source['name'])
                 for item in new_items:
                     save_raw_item(source, item)

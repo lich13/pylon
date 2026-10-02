@@ -1864,5 +1864,62 @@ class SoftwareUpdateMonitorTests(unittest.TestCase):
             save.assert_not_called()
         self.assertEqual(len(state['pending_events']), 9)
 
+    def test_short_source_failures_stay_silent_until_three_consecutive_polls(self):
+        source = {
+            'id': 'pi_releases', 'name': 'Pi Releases',
+            'kind': 'atom', 'url': 'https://pi.dev/changelog.xml',
+            'poll_interval_seconds': 300,
+        }
+        state = self.monitor.default_state()
+        error = self.monitor.FetchError('network error from https://pi.dev/changelog.xml: timed out')
+
+        with mock.patch.object(self.monitor, 'fetch_source', side_effect=error):
+            first, _ = self.monitor._poll_sources_for_enqueue(state, [source], [], now=0)
+            second, _ = self.monitor._poll_sources_for_enqueue(state, [source], [], now=100)
+            third, _ = self.monitor._poll_sources_for_enqueue(state, [source], [], now=300)
+
+        current = state['sources']['pi_releases']
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        self.assertEqual(len(third), 1)
+        self.assertIn('Pi Releases', third[0])
+        self.assertEqual(current['consecutive_failures'], 3)
+        self.assertTrue(current['failure_alerted'])
+
+        with mock.patch.object(self.monitor, 'fetch_source', return_value=(RSS_FIXTURE, {})):
+            failures, recoveries = self.monitor._poll_sources_for_enqueue(state, [source], [], now=600)
+
+        self.assertEqual(failures, [])
+        self.assertEqual(recoveries, ['Pi Releases'])
+        self.assertEqual(current['consecutive_failures'], 0)
+        self.assertFalse(current['failure_alerted'])
+
+    def test_transient_failure_recovery_does_not_emit_recovery_notification(self):
+        current = self.monitor.source_state(self.monitor.default_state(), 'fixture')
+        self.assertFalse(self.monitor.mark_source_failure(current, 'timeout', 0))
+        self.assertFalse(self.monitor.mark_source_success(current, 100))
+
+    def test_run_monitor_does_not_write_failure_result_before_alert_threshold(self):
+        state = self.monitor.default_state()
+        source = {'id': 'pi_releases', 'name': 'Pi Releases', 'kind': 'atom', 'url': 'https://pi.dev/changelog.xml'}
+        with mock.patch.object(self.monitor, 'load_state', return_value=state), \
+             mock.patch.object(self.monitor, 'load_sources', return_value=[source]), \
+             mock.patch.object(self.monitor, 'prune_inactive_source_runtime'), \
+             mock.patch.object(self.monitor, '_poll_sources_for_enqueue', return_value=([], [])), \
+             mock.patch.object(self.monitor, 'save_state'), \
+             mock.patch.object(self.monitor.notification_events, 'result') as result:
+            self.monitor.run_monitor(enqueue_only=True)
+        result.assert_not_called()
+
+        with mock.patch.object(self.monitor, 'load_state', return_value=state), \
+             mock.patch.object(self.monitor, 'load_sources', return_value=[source]), \
+             mock.patch.object(self.monitor, 'prune_inactive_source_runtime'), \
+             mock.patch.object(self.monitor, '_poll_sources_for_enqueue', return_value=(['Pi Releases（连续失败 3 次）'], [])), \
+             mock.patch.object(self.monitor, 'save_state'), \
+             mock.patch.object(self.monitor.notification_events, 'result') as result:
+            self.monitor.run_monitor(enqueue_only=True)
+        result.assert_called_once()
+        self.assertEqual(result.call_args.args[0], 'failed')
+
 if __name__ == '__main__':
     unittest.main()
