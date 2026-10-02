@@ -22,16 +22,13 @@ pylon agent logs 任务编号
 pylon ssh status|sync|refresh
 pylon ssh check IP
 pylon chiphell status|test|baseline|pause|resume|import-cookies
-pylon chiphell categories
-pylon chiphell silence 分类
-pylon chiphell unsilence 分类
 pylon bot-menu sync
 pylon bot-menu check
 ```
 
-两个 Telegram 机器人提供相同的 32 项中文菜单。`/help` 查看全部入口，`/help 命令` 查看参数、示例和操作影响。菜单包含任务管理、通知队列、软件监控、软件更新、按需 Agent、Gmail 候选审查、Chiphell 分类和 SSH 维护；仅接受配置的本人私聊。
+两个 Telegram 机器人提供相同的 29 项中文菜单。`/help` 查看全部入口，`/help 命令` 查看参数、示例和操作影响。菜单保留日常状态、更新、监控和必要维护入口；CHH 商品分类不再提供日常管理命令。
 
-`/chiphell_categories` 只读分析历史投递队列并显示当前类别策略；`/chiphell_silence 分类` 和 `/chiphell_unsilence 分类` 只影响后续普通新帖。混合、未归类帖子始终保留，重点比价独立运行。
+CHH 分类策略由 `src/pylon/tasks/chiphell/categories.py` 中的 `SILENT_CATEGORIES` 维护，当前为空，所有类别继续推送。混合和未归类帖子始终保留，重点比价独立运行。抓取到无法确认的新类别时，只向本人发送一次询问卡片；按钮只记录“继续保留”或“待静默”意见，不直接改策略，后续由维护脚本更新分类规则。
 
 Gmail 的 `/gmail_candidates` 只展示尚未确认的新类型；已确认的内置和自定义类型继续自动清理。对候选使用 `/gmail_candidate 候选ID` 查看元数据，再用 `/gmail_feedback 候选ID 意见` 交给 Grok 生成规则草案。草案通过 `/gmail_rule_preview 提案ID` 预览、`/gmail_rule_apply 提案ID` 确认后写入运行时覆盖层，下一次排程才会按新规则清理；反馈、预览和应用命令都不会删除当前邮件。`/gmail_accept` 和 `/gmail_ignore` 保留为兼容入口。
 
@@ -47,7 +44,7 @@ Agent 由 `pylon-agent.service` 按需执行，无常驻 Agent。全局串行，
 
 关键服务监控涵盖 FRP、OpenList、sing-box、easy_proxies、Certbot、PostgreSQL 18、Redis 8.6，各源每小时拉取一次。首次登记只建立基线，不回放历史消息。首次部署时在暂停软件监控且等待在途执行结束后，以 webops profile 环境运行 `python -m pylon.tasks.software.infrastructure`；后续部署不重新登记已移除的订阅。
 
-原 `/ssh`、`/chiphell`、`/gmail list|accept|ignore` 及“增加监控 URL”“加监控 owner/repo”“移除监控→回复编号”继续可用。`/monitors` 只查看列表，`/remove_monitor` 开启编号移除。Gmail 接受候选只修改后续清理规则。
+原 `/ssh`、`/chiphell`、`/gmail list|accept|ignore` 及“增加监控 URL”“加监控 owner/repo”“移除监控→回复编号”继续可用。`/monitors` 只查看列表，`/remove_monitor` 开启编号移除。Gmail 接受候选只修改后续清理规则。已移除 CHH 分类命令和 root 分类管理入口，旧分类按钮只返回入口已移除，不会修改策略。
 
 机器人启动时后台核对默认、所有私聊和本人会话的默认/中文/英文菜单，统一使用中文，自动替换旧命令并设置菜单按钮。网络失败或限流按退避策略重试，不阻塞消息收发。`bot-menu check` 只读核对，不一致时退出码为 1；`bot-menu sync` 仅更新差异并读回确认。命令定义统一维护在 `src/pylon/command_catalog.py`。
 

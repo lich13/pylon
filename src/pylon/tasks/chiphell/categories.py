@@ -14,6 +14,7 @@ import hmac
 import json
 import re
 import sqlite3
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,13 +24,18 @@ from pylon.shared import paths, state_json
 
 
 CATEGORY_VERSION = 1
-POLICY_PATH = paths.CHIPHELL_DATA_ROOT / "category-policy.json"
 QUEUE_PATH = paths.CHIPHELL_DATA_ROOT / "delivery.sqlite3"
-POLICY_LOCK_PATH = paths.CHIPHELL_DATA_ROOT / ".category-policy.lock"
-CALLBACK_PREFIX = "ch1"
+UNKNOWN_REVIEW_PATH = paths.CHIPHELL_DATA_ROOT / "unknown-category-reviews.json"
+CALLBACK_PREFIX = "ch1"  # retired category mutation callbacks
+UNKNOWN_CALLBACK_PREFIX = "ch2"
 
-# Stable ids are used in callback data and the policy file; labels are the
-# Chinese names shown to the user.
+# This is the only production policy input.  Edit this tuple when the user
+# explicitly decides to silence a category, then deploy the normal pylon
+# revision.  Unknown and mixed posts are always retained by the executor.
+SILENT_CATEGORIES: tuple[str, ...] = ()
+
+# Stable ids are used in the source policy and review callbacks; labels are
+# the Chinese names shown in diagnostics.
 CATEGORY_LABELS: dict[str, str] = {
     "phone_apple": "手机·苹果",
     "phone_oppo_vivo": "手机·OPPO/vivo",
@@ -161,6 +167,8 @@ def classify_post(post: dict[str, Any]) -> dict[str, Any]:
         for label in labels:
             if label not in all_labels:
                 all_labels.append(label)
+        if not labels and UNKNOWN_KEY not in all_labels:
+            all_labels.append(UNKNOWN_KEY)
         classified.append({"text": segment, "categories": labels or [UNKNOWN_KEY]})
     if not all_labels:
         all_labels = [UNKNOWN_KEY]
@@ -179,42 +187,18 @@ def classify_post(post: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _default_policy() -> dict[str, Any]:
-    return {"version": CATEGORY_VERSION, "silent_categories": [], "updated_at": None, "updated_by": None}
-
-
 def load_policy(path: Path | None = None) -> dict[str, Any]:
-    path = path or POLICY_PATH
-    data = state_json.load(path, default=_default_policy())
-    if not isinstance(data, dict):
-        data = _default_policy()
-    values = data.get("silent_categories")
-    if not isinstance(values, list):
-        values = []
-    valid = [str(value) for value in values if str(value) in CATEGORY_LABELS]
-    return {"version": CATEGORY_VERSION, "silent_categories": list(dict.fromkeys(valid)),
-            "updated_at": data.get("updated_at"), "updated_by": data.get("updated_by")}
+    """Return the deployed policy; runtime files cannot override it.
 
-
-@contextlib.contextmanager
-def _policy_lock(path: Path):
-    lock_path = path.with_name("." + path.name + ".lock")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
-        yield
-
-
-def save_policy(policy: dict[str, Any], path: Path | None = None, *, actor: str = "local") -> dict[str, Any]:
-    path = path or POLICY_PATH
-    with _policy_lock(path):
-        clean = load_policy(path)
-        clean["silent_categories"] = [key for key in policy.get("silent_categories", []) if key in CATEGORY_LABELS]
-        clean["silent_categories"] = list(dict.fromkeys(clean["silent_categories"]))
-        clean["updated_at"] = int(__import__("time").time())
-        clean["updated_by"] = str(actor)[:80]
-        state_json.save_atomic(path, clean)
-    return clean
+    ``path`` remains accepted for callers that used the old API, but is
+    intentionally ignored.  A policy change is a reviewed source change.
+    """
+    values = [key for key in SILENT_CATEGORIES if key in CATEGORY_LABELS]
+    return {
+        "version": CATEGORY_VERSION,
+        "silent_categories": list(dict.fromkeys(values)),
+        "source": "pylon.tasks.chiphell.categories:SILENT_CATEGORIES",
+    }
 
 
 def resolve_category(value: str) -> str:
@@ -224,24 +208,17 @@ def resolve_category(value: str) -> str:
     aliases = {re.sub(r"\s+", "", label).lower(): key for key, label in CATEGORY_LABELS.items()}
     if raw in aliases:
         return aliases[raw]
-    raise ValueError("分类不存在；请先使用 /chiphell_categories 查看分类名称")
+    raise ValueError("分类不存在；请修改 SILENT_CATEGORIES 中的稳定分类 ID")
 
 
 def set_category_silence(category: str, silent: bool, *, actor: str = "local", path: Path | None = None) -> dict[str, Any]:
-    key = resolve_category(category)
-    path = path or POLICY_PATH
-    with _policy_lock(path):
-        policy = load_policy(path)
-        values = set(policy["silent_categories"])
-        if silent:
-            values.add(key)
-        else:
-            values.discard(key)
-        policy["silent_categories"] = sorted(values)
-        policy["updated_at"] = int(__import__("time").time())
-        policy["updated_by"] = str(actor)[:80]
-        state_json.save_atomic(path, policy)
-    return policy
+    """Reject the retired runtime mutation API.
+
+    Keeping the symbol makes old imports fail explicitly instead of silently
+    changing a policy file that is no longer read by production.
+    """
+    resolve_category(category)
+    raise RuntimeError("CHH 分类策略由源码维护，请修改 SILENT_CATEGORIES 后部署")
 
 
 def filter_normal_posts(posts: Iterable[dict[str, Any]], policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -268,6 +245,124 @@ def filter_normal_posts(posts: Iterable[dict[str, Any]], policy: dict[str, Any] 
         if not labels <= silent:
             output.append(post)
     return output
+
+
+def _unknown_default() -> dict[str, Any]:
+    return {"version": 1, "reviews": {}}
+
+
+@contextlib.contextmanager
+def _review_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name("." + path.name + ".lock")
+    with lock_path.open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def load_unknown_reviews(path: Path | None = None) -> dict[str, Any]:
+    path = path or UNKNOWN_REVIEW_PATH
+    data = state_json.load(path, default=_unknown_default())
+    if not isinstance(data, dict) or not isinstance(data.get("reviews"), dict):
+        return _unknown_default()
+    reviews: dict[str, dict[str, Any]] = {}
+    for fingerprint, review in data["reviews"].items():
+        if re.fullmatch(r"[0-9a-f]{16}", str(fingerprint)) and isinstance(review, dict):
+            reviews[str(fingerprint)] = dict(review)
+    return {"version": 1, "reviews": reviews}
+
+
+def _save_unknown_reviews(data: dict[str, Any], path: Path) -> None:
+    # Keep the review journal bounded; it is only a once-per-pattern prompt
+    # ledger, not a copy of the monitored feed.
+    rows = data.get("reviews") if isinstance(data.get("reviews"), dict) else {}
+    ordered = sorted(rows.items(), key=lambda item: int(item[1].get("last_seen") or 0))[-500:]
+    state_json.save_atomic(path, {"version": 1, "reviews": dict(ordered)})
+
+
+def unknown_fingerprint(post: dict[str, Any]) -> str:
+    """Build a stable, low-detail key for one unknown product pattern."""
+    title = str(post.get("title") or "").strip().lower()
+    title = re.sub(r"^\s*\[[^]]+\]\s*", "", title)
+    title = re.sub(r"https?://\S+", "", title)
+    title = re.sub(r"\d+(?:\.\d+)?", "#", title)
+    title = re.sub(r"[^0-9a-z\u4e00-\u9fff#]+", " ", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    if not title:
+        title = str(post.get("id") or post.get("url") or "unknown").strip().lower()
+    return hashlib.sha256(("chh-unknown-v1:" + title[:160]).encode()).hexdigest()[:16]
+
+
+def _unknown_signature(profile: str, action: str, fingerprint: str) -> str:
+    secret = str(profile_env(profile).get("TELEGRAM_BOT_TOKEN") or "pylon").encode()
+    value = f"{profile}|{action}|{fingerprint}"
+    return hmac.new(secret, value.encode(), hashlib.sha256).hexdigest()[:12]
+
+
+def unknown_callback_data(profile: str, action: str, fingerprint: str) -> str:
+    if action not in {"keep", "mute"} or not re.fullmatch(r"[0-9a-f]{16}", fingerprint):
+        raise ValueError("无效的未知类别按钮")
+    return f"{UNKNOWN_CALLBACK_PREFIX}|{action}|{fingerprint}|{_unknown_signature(profile, action, fingerprint)}"
+
+
+def _unknown_keyboard(profile: str, fingerprint: str) -> dict[str, Any]:
+    return {"inline_keyboard": [[
+        {"text": "继续保留", "callback_data": unknown_callback_data(profile, "keep", fingerprint)},
+        {"text": "记录为待静默", "callback_data": unknown_callback_data(profile, "mute", fingerprint)},
+    ]]}
+
+
+def unknown_prompts(
+    posts: Iterable[dict[str, Any]],
+    *,
+    profile: str = "default",
+    path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return and persist at most one question card per unknown pattern."""
+    path = path or UNKNOWN_REVIEW_PATH
+    now = int(time.time())
+    prompts: list[dict[str, Any]] = []
+    with _review_lock(path):
+        data = load_unknown_reviews(path)
+        reviews = data["reviews"]
+        changed = False
+        for post in posts:
+            classification = classify_post(post)
+            if UNKNOWN_KEY not in set(classification.get("categories") or []):
+                continue
+            fingerprint = unknown_fingerprint(post)
+            current = reviews.get(fingerprint)
+            if current:
+                current["last_seen"] = now
+                current["count"] = int(current.get("count") or 0) + 1
+                changed = True
+                continue
+            title = str(post.get("title") or "无标题").strip()
+            excerpt = re.sub(r"\s+", " ", str(post.get("body_excerpt") or "")).strip()
+            reviews[fingerprint] = {
+                "status": "asked",
+                "first_seen": now,
+                "last_seen": now,
+                "count": 1,
+                "title": title[:180],
+                "url": str(post.get("url") or "")[:500],
+            }
+            changed = True
+            prompts.append({
+                "fingerprint": fingerprint,
+                "text": (
+                    "CHH 出现暂未归类的新商品类型\n"
+                    f"标题：{title[:180]}\n"
+                    + (f"摘要：{excerpt[:280]}\n" if excerpt else "")
+                    + f"链接：{post.get('url') or ''}\n\n"
+                    "当前仍按全保留推送。请选择记录意见；按钮不会直接修改生产策略，"
+                    "后续由维护脚本更新分类规则。"
+                ),
+                "reply_markup": _unknown_keyboard(profile, fingerprint),
+            })
+        if changed:
+            _save_unknown_reviews(data, path)
+    return prompts
 
 
 def arbitrage_posts(posts: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -316,15 +411,6 @@ def category_counts(posts: Iterable[dict[str, Any]]) -> Counter[str]:
     return counts
 
 
-def _signature(profile: str, action: str, category: str) -> str:
-    secret = str(profile_env(profile).get("TELEGRAM_BOT_TOKEN") or "pylon").encode()
-    return hmac.new(secret, f"{profile}|{action}|{category}".encode(), hashlib.sha256).hexdigest()[:12]
-
-
-def callback_data(profile: str, action: str, category: str) -> str:
-    return f"{CALLBACK_PREFIX}|{action}|{category}|{_signature(profile, action, category)}"
-
-
 def _authorized_callback(profile: str, payload: dict[str, Any]) -> bool:
     message = payload.get("message") or {}
     sender = payload.get("from") or {}
@@ -332,18 +418,6 @@ def _authorized_callback(profile: str, payload: dict[str, Any]) -> bool:
     chat = message.get("chat") or {}
     return bool(owner and chat.get("type") == "private" and str(chat.get("id")) == owner
                 and str(sender.get("id")) == owner and not sender.get("is_bot"))
-
-
-def _parse_callback(profile: str, data: str) -> tuple[str, str]:
-    parts = str(data or "").split("|")
-    if len(parts) != 4 or parts[0] != CALLBACK_PREFIX:
-        raise ValueError("分类按钮已失效，请重新使用 /chiphell_categories")
-    action, category, signature = parts[1:]
-    if action not in {"mute", "unmute"} or category not in CATEGORY_LABELS:
-        raise ValueError("分类按钮参数无效，请重新使用 /chiphell_categories")
-    if not hmac.compare_digest(signature, _signature(profile, action, category)):
-        raise ValueError("分类按钮签名无效，请重新使用 /chiphell_categories")
-    return action, category
 
 
 def _label(key: str) -> str:
@@ -365,69 +439,55 @@ def category_report(profile: str = "default", *, path: Path | None = None, queue
     if counts.get(UNKNOWN_KEY):
         lines.append(f"{UNKNOWN_LABEL}：{counts[UNKNOWN_KEY]}（始终保留）")
     lines.append("未列入静默的类别继续推送；重点比价不受此策略影响。")
-    if profile == "cli":
-        return "\n".join(lines), {}
-    rows: list[list[dict[str, str]]] = []
-    for key, label in CATEGORY_LABELS.items():
-        if not counts.get(key):
-            continue
-        muted = key in policy["silent_categories"]
-        action = "unmute" if muted else "mute"
-        rows.append([{"text": ("恢复 " if muted else "静默 ") + label, "callback_data": callback_data(profile, action, key)}])
-    return "\n".join(lines), ({"inline_keyboard": rows} if rows else {})
+    return "\n".join(lines), {}
 
 
 def policy_status_line(path: Path | None = None) -> str:
     policy = load_policy(path)
     muted = "、".join(_label(key) for key in policy["silent_categories"]) or "无"
-    return "CHH 普通新帖静默：" + muted + "；混合/未归类保留；重点比价独立"
+    return "CHH 普通新帖静默：" + muted + "（源码策略）；混合/未归类保留；重点比价独立"
 
 
-def callback(profile: str, payload: dict[str, Any]) -> dict[str, Any]:
-    if not _authorized_callback(profile, payload):
-        return {"text": "无权操作此分类按钮。"}
+def _parse_unknown_callback(profile: str, data: str) -> tuple[str, str]:
+    parts = str(data or "").split("|")
+    if len(parts) != 4 or parts[0] != UNKNOWN_CALLBACK_PREFIX:
+        raise ValueError("未知类别按钮已失效，请等待下一次新类别询问")
+    action, fingerprint, signature = parts[1:]
+    if action not in {"keep", "mute"} or not re.fullmatch(r"[0-9a-f]{16}", fingerprint):
+        raise ValueError("未知类别按钮参数无效")
+    if not hmac.compare_digest(signature, _unknown_signature(profile, action, fingerprint)):
+        raise ValueError("未知类别按钮签名无效")
+    return action, fingerprint
+
+
+def _unknown_callback(profile: str, payload: dict[str, Any]) -> dict[str, Any]:
     try:
-        action, category = _parse_callback(profile, str(payload.get("data") or ""))
-        policy = set_category_silence(category, action == "mute", actor=f"telegram:{profile}")
-        text, markup = category_report(profile)
-        result = "已静默" if action == "mute" else "已恢复推送"
-        return {"text": result + "：" + _label(category) + "\n\n" + text, "reply_markup": markup}
+        action, fingerprint = _parse_unknown_callback(profile, str(payload.get("data") or ""))
+        with _review_lock(UNKNOWN_REVIEW_PATH):
+            data = load_unknown_reviews(UNKNOWN_REVIEW_PATH)
+            review = data["reviews"].get(fingerprint)
+            if not review:
+                return {"text": "这条未知类别记录已过期，请等待新的询问卡片。"}
+            previous = str(review.get("status") or "asked")
+            if previous in {"kept", "pending_mute"}:
+                label = "继续保留" if previous == "kept" else "记录为待静默"
+                return {"text": f"已记录：{label}。分类策略仍由源码维护。"}
+            review["status"] = "kept" if action == "keep" else "pending_mute"
+            review["decision_at"] = int(time.time())
+            review["decision_by"] = f"telegram:{profile}"
+            _save_unknown_reviews(data, UNKNOWN_REVIEW_PATH)
+        label = "继续保留" if action == "keep" else "待静默"
+        return {"text": f"已记录：{label}。不会直接修改生产策略，后续由维护脚本更新分类规则。"}
     except ValueError as error:
         return {"text": str(error)}
 
 
-def command(action: str, argument: str = "", profile: str = "default") -> tuple[str, dict[str, Any] | None]:
-    actor = "cli" if profile == "cli" else f"telegram:{profile}"
-    if action == "categories":
-        return category_report(profile)
-    if action in {"silence", "unsilence"}:
-        if not argument.strip():
-            raise ValueError("请提供分类名称，例如：/chiphell_silence 生活·服饰鞋包")
-        policy = set_category_silence(argument, action == "silence", actor=actor)
-        key = resolve_category(argument)
-        return (("已静默：" if action == "silence" else "已恢复推送：") + _label(key)
-                + "\n当前静默：" + ("、".join(_label(x) for x in policy["silent_categories"]) or "无"), None)
-    raise ValueError("不支持的分类操作")
-
-
-def cli(action: str, argument: str = "") -> str:
-    text, _ = command(action, argument, "cli")
-    return text
-
-
-def main(argv: list[str] | None = None) -> int:
-    import argparse
-    parser = argparse.ArgumentParser(description="Chiphell 分类策略")
-    parser.add_argument("action", choices=["categories", "silence", "unsilence"])
-    parser.add_argument("category", nargs="?", default="")
-    args = parser.parse_args(argv)
-    try:
-        print(cli(args.action, args.category))
-        return 0
-    except Exception as exc:
-        print(str(exc))
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+def callback(profile: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if not _authorized_callback(profile, payload):
+        return {"text": "无权操作此未知类别按钮。"}
+    data = str(payload.get("data") or "")
+    if data.startswith(UNKNOWN_CALLBACK_PREFIX + "|"):
+        return _unknown_callback(profile, payload)
+    if data.startswith(CALLBACK_PREFIX + "|"):
+        return {"text": "分类管理入口已移除；CHH 策略由源码维护。"}
+    return {"text": "按钮类型不受支持。"}

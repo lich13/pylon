@@ -202,14 +202,6 @@ def ssh_text(action: str, address: str = '') -> str:
 
 
 def chiphell_text(action: str, argument: str = '') -> str:
-    if action in {'categories', 'silence', 'unsilence'}:
-        from .tasks.chiphell import categories
-        profile = os.environ.get('PYLON_COMMAND_PROFILE', 'default')
-        try:
-            text, markup = categories.command(action, argument, profile)
-        except ValueError as exc:
-            return str(exc) + '\n\n' + help_text('chiphell_' + action)
-        return encode_response(text, markup)
     failure = None
     try:
         output = scheduler.admin('chiphell', action, timeout=150)
@@ -359,7 +351,7 @@ def handle_callback(profile: str, payload: dict) -> str:
     if value.startswith('su1|'):
         from . import software_updates
         result = software_updates.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
-    elif value.startswith('ch1|'):
+    elif value.startswith('ch1|') or value.startswith('ch2|'):
         from .tasks.chiphell import categories
         result = categories.callback(profile, payload)
     else:

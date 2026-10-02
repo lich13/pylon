@@ -15,10 +15,11 @@ from pylon.transport import DeliveryError
 
 
 def test_catalog_is_valid_chinese_and_has_detailed_help():
-    assert len(COMMANDS) == 42
+    assert len(COMMANDS) == 39
     assert len({row['command'] for row in menu_commands()}) == sum(item.menu for item in COMMANDS.values())
     assert {'gmail_review', 'gmail_rules'} <= {row['command'] for row in menu_commands()}
     assert 'gmail_feedback' not in {row['command'] for row in menu_commands()}
+    assert not {'chiphell_categories', 'chiphell_silence', 'chiphell_unsilence'} & {row['command'] for row in menu_commands()}
     for item in COMMANDS.values():
         assert re.fullmatch('[a-z0-9_]{1,32}', item.name)
         assert 1 <= len(item.description) <= 256

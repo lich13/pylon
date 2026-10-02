@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 
+from pylon import events
 from pylon.tasks.chiphell import monitor as base
 from pylon.tasks.chiphell import categories
 from pylon.tasks.chiphell.runtime import (
@@ -267,6 +268,14 @@ def _run_cycle(args: argparse.Namespace, *, observe: bool) -> int:
 
     if status == "OK":
         quote_posts = [post for post in candidates if base.should_notify_post(post)]
+        if not observe:
+            for prompt in categories.unknown_prompts(posts, profile="default"):
+                events.publish(
+                    prompt["text"],
+                    profile="default",
+                    key="chiphell:unknown:" + prompt["fingerprint"],
+                    reply_markup=prompt["reply_markup"],
+                )
         # The observe path is used by health checks and must not format or
         # persist quote alerts: collect_arbitrage_messages records matches
         # and may send Bark notifications as part of its normal path.

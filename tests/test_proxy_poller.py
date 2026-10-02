@@ -132,6 +132,27 @@ class PollerFaultIntegrationTests(unittest.TestCase):
             poller._run_cycle(self.args, observe=False)
         self.assertEqual(self.pending_count(), 0)
 
+    def test_unknown_category_prompt_is_sent_once_to_default_profile(self):
+        candidate = {"id": "post-unknown", "title": "新奇设备", "body_excerpt": "正文"}
+        result = ("OK", [candidate], [], {
+            "last_error_class": None,
+            "last_error_code": None,
+            "proxy_probe_status": "NOT_NEEDED",
+            "proxy_probe_latency_ms": 0,
+            "navigation_duration_ms": 100,
+        })
+        fake_base.should_notify_post = lambda post: True
+        fake_base.collect_arbitrage_messages = lambda source, posts: []
+        prompt = {"fingerprint": "0123456789abcdef", "text": "未知类别", "reply_markup": {"inline_keyboard": []}}
+        with mock.patch.object(poller, "_collect_proxy_once", return_value=result), mock.patch.object(
+            poller.categories, "unknown_prompts", return_value=[prompt]
+        ), mock.patch.object(poller.events, "publish") as publish:
+            poller._run_cycle(self.args, observe=False)
+        publish.assert_called_once_with(
+            "未知类别", profile="default", key="chiphell:unknown:0123456789abcdef",
+            reply_markup={"inline_keyboard": []}
+        )
+
     def test_observe_does_not_collect_or_persist_arbitrage_alerts(self):
         candidate = {"id": "post-1", "title": "普通帖子", "body_excerpt": "正文"}
         result = ("OK", [candidate], [candidate], {

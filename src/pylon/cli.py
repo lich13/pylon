@@ -22,8 +22,7 @@ def main():
     ssh.add_argument('action', choices=['status', 'check', 'sync', 'refresh'], default='status', nargs='?')
     ssh.add_argument('address', nargs='?')
     chiphell = sub.add_parser('chiphell')
-    chiphell.add_argument('action', choices=['status', 'test', 'baseline', 'pause', 'resume', 'import-cookies', 'categories', 'silence', 'unsilence'])
-    chiphell.add_argument('category', nargs='?')
+    chiphell.add_argument('action', choices=['status', 'test', 'baseline', 'pause', 'resume', 'import-cookies'])
     bot_menu = sub.add_parser('bot-menu', help='同步或核对两个机器人的中文菜单')
     bot_menu.add_argument('action', choices=['sync', 'check'])
     updates = sub.add_parser('updates', help='检查腾讯云软件更新，不安装软件')
@@ -62,8 +61,6 @@ def main():
         return serve()
     if args.command == 'chiphell':
         command = ['sudo', '-n', '/usr/local/sbin/pylon-admin', 'chiphell', args.action]
-        if args.category:
-            command.append(args.category)
         return subprocess.run(command).returncode
     from . import scheduler
     from .commands import control_task, resolve_job, status_text
