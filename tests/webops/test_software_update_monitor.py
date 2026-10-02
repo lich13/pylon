@@ -1381,14 +1381,14 @@ class SoftwareUpdateMonitorTests(unittest.TestCase):
         source_ids = [source['id'] for source in self.monitor.load_sources()]
 
         self.assertNotIn('openai_codex_changelog', source_ids)
-        self.assertIn('hermes_agent_releases', source_ids)
+        self.assertNotIn('hermes_agent_releases', source_ids)
 
     def test_list_source_projects_groups_plugin_release_and_version_sources(self):
         projects = self.monitor.list_source_projects()
 
         design_director = next(project for project in projects if project['id'] == 'design_director')
 
-        self.assertEqual(design_director['number'], 5)
+        self.assertEqual(design_director['number'], 4)
         self.assertEqual(design_director['name'], 'Design Director')
         self.assertEqual(design_director['source_ids'], [
             'design_director_releases',

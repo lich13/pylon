@@ -18,6 +18,7 @@ from typing import Any
 
 PROFILE_ROOT = Path(os.environ.get("PYLON_PROFILE_ROOT", "/srv/pylon/profiles/webops"))
 MONITOR_JOB_ID = "fa27c561ded6"
+MONITOR_JOB_IDS = (MONITOR_JOB_ID, "software-update-enrich")
 STATE_FILE = PROFILE_ROOT / "cron_state" / "software_update_monitor_delivery_replay.json"
 ITEMS_DIR = PROFILE_ROOT / "data" / "software_update_monitor" / "items"
 
@@ -386,8 +387,13 @@ def run_replay(*, dry_run: bool = False) -> dict[str, Any]:
     from pylon.outbox import Outbox
     from pylon import events
     box = Outbox()
+    placeholders = ",".join("?" for _ in MONITOR_JOB_IDS)
     with box.connect() as db:
-        rows = db.execute("SELECT status,count(*) n FROM events WHERE job_id=? AND status!='delivered' GROUP BY status", (MONITOR_JOB_ID,)).fetchall()
+        rows = db.execute(
+            f"SELECT status,count(*) n FROM events WHERE job_id IN ({placeholders}) "
+            "AND status!='delivered' GROUP BY status",
+            MONITOR_JOB_IDS,
+        ).fetchall()
     counts = {row["status"]: row["n"] for row in rows}
     pending = sum(counts.values())
     if pending and not dry_run:

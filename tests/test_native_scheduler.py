@@ -25,7 +25,7 @@ from pylon.admin import control as admin, ssh
 
 def test_all_jobs_keep_schedule_and_native_catchup():
     catalog = json.loads((ROOT / 'jobs.json').read_text())
-    assert len(catalog) == 16
+    assert len(catalog) == 17
     for key, job in catalog.items():
         unit = bootstrap.timer_text(key, job)
         assert f'Unit=pylon-task@{key}.service' in unit

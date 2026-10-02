@@ -263,6 +263,12 @@ class SoftwareUpdateMonitorDeliveryReplayTests(unittest.TestCase):
         self.assertTrue(self.replay.run_replay()["ok"])
         self.assertEqual(box.counts(), {"delivered": 1})
 
+        enrich_event = box.enqueue(profile="webops", job_id="software-update-enrich", kind="text",
+                                    payload={"text": "enriched"}, key="enriched")
+        self.assertFalse(self.replay.run_replay()["ok"])
+        box.finish(enrich_event, "delivered", receipt={"message_id": 2})
+        self.assertTrue(self.replay.run_replay()["ok"])
+
     def test_raw_item_replay_finds_and_formats_codex_changelog_item(self):
         self.write_raw_item()
         fake_monitor, fake_translator = self.translated_fake_monitor()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from pylon import events as notification_events
 from pylon.config import read_env
 import fcntl
@@ -13,6 +14,7 @@ import random
 import re
 import subprocess
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,26 +29,36 @@ PROFILE_ROOT = Path(os.environ.get('PYLON_PROFILE_ROOT', '/srv/pylon/profiles/we
 STATE_FILE = PROFILE_ROOT / 'cron_state' / 'software_update_monitor.json'
 DATA_ROOT = PROFILE_ROOT / 'data' / 'software_update_monitor'
 TRANSLATION_CACHE_FILE = DATA_ROOT / 'translation_cache.json'
+ENRICHMENT_CACHE_FILE = DATA_ROOT / 'enrichment_cache.json'
 ITEMS_DIR = DATA_ROOT / 'items'
 LOCK_PATH = PROFILE_ROOT / 'cron_state' / 'software_update_monitor.lock'
 CUSTOM_SOURCES_FILE = PROFILE_ROOT / 'config' / 'software_update_monitor_sources.json'
+TRANSLATION_CONFIG_FILE = PROFILE_ROOT / 'config' / 'software_update_translation.json'
 
 USER_AGENT = 'pylon-SoftwareUpdateMonitor/1.0'
+# Kept for replay and compatibility tests. Production enrichment never calls it.
 DEEPL_WEB_URL = 'https://www2.deepl.com/jsonrpc'
 MAX_SEEN_IDS = 800
 MAX_EVENTS_PER_RUN = 8
 MAX_TRANSLATION_BLOCKS_PER_RUN = 8
 MAX_ALERT_CHARS = 12000
-SOURCE_TIMEOUT_SECONDS = 25
-TRANSLATE_TIMEOUT_SECONDS = 25
+SOURCE_TIMEOUT_SECONDS = 15
+TRANSLATE_TIMEOUT_SECONDS = 12
 MIN_TRANSLATE_SLEEP_SECONDS = 0.8
 MAX_TRANSLATE_SLEEP_SECONDS = 1.5
 TRANSLATE_FAILURE_BACKOFF_SECONDS = 10 * 60
 TRANSLATION_MAX_ATTEMPTS = 3
 TRANSLATE_RETRY_SLEEP_SECONDS = 0.5
+GROK_DIGEST_TIMEOUT_SECONDS = 45
+GROK_DIGEST_INPUT_CHARS = 6000
+GROK_DIGEST_MAX_ITEMS_PER_RUN = 4
+# Initial request plus at most two retries, as configured by the rollout plan.
+GROK_DIGEST_MAX_ATTEMPTS = 3
+GROK_DIGEST_PROMPT_VERSION = '2026-10-02-v1'
+GROK_ENDPOINT_ENV = Path(os.environ.get('PYLON_GROK_ENV', '/srv/pylon/secrets/grok.env'))
+TRANSLATION_ENDPOINT_ENV = Path(os.environ.get('PYLON_TRANSLATION_ENV', '/srv/pylon/secrets/translation.env'))
 GROK_POLISH_TIMEOUT_SECONDS = 300
 GROK_POLISH_INPUT_CHARS = 2400
-GROK_ENDPOINT_ENV = Path(os.environ.get('PYLON_GROK_ENV', '/srv/pylon/secrets/grok.env'))
 GROK_POLISH_SCHEMA = json.dumps({
     'type': 'object',
     'additionalProperties': False,
@@ -56,6 +68,37 @@ GROK_POLISH_SCHEMA = json.dumps({
     },
     'required': ['summary', 'translation'],
 }, separators=(',', ':'))
+GROK_DIGEST_SCHEMA = {
+    'type': 'object',
+    'additionalProperties': False,
+    'properties': {
+        'title_zh': {'type': 'string'},
+        'importance': {'type': 'string', 'enum': ['high', 'normal', 'low']},
+        'summary_zh': {'type': 'array', 'minItems': 1, 'maxItems': 4, 'items': {'type': 'string'}},
+        'impact_zh': {'type': 'string'},
+        'action_zh': {'type': 'string'},
+        'change_types': {'type': 'array', 'items': {'type': 'string', 'enum': [
+            'security', 'bugfix', 'feature', 'breaking', 'compatibility',
+            'performance', 'docs', 'internal',
+        ]}},
+        'evidence': {'type': 'array', 'minItems': 1, 'maxItems': 4, 'items': {'type': 'string'}},
+        'confidence': {'type': 'number'},
+    },
+    'required': [
+        'title_zh', 'importance', 'summary_zh', 'impact_zh', 'action_zh',
+        'change_types', 'evidence', 'confidence',
+    ],
+}
+GROK_DIGEST_SCHEMA_JSON = json.dumps(GROK_DIGEST_SCHEMA, separators=(',', ':'))
+GROK_DIGEST_CHANGE_TYPES = {
+    'security', 'bugfix', 'feature', 'breaking', 'compatibility',
+    'performance', 'docs', 'internal',
+}
+HIGH_PRIORITY_SOURCE_IDS = {
+    'openai_codex_changelog', 'openai_codex_cli_releases', 'grok_build_version',
+    'pi_releases', 'github_anthropics_claude_code_releases',
+    'github_wei_shaw_sub2api_releases',
+}
 LITERAL_PATTERNS = (
     re.compile(r'```[\s\S]*?```'),
     re.compile(r'`[^`\n]+`'),
@@ -99,12 +142,6 @@ SOURCES: list[dict[str, Any]] = [
         'item_title_include_patterns': ['re:^\\d+\\.\\d+\\.\\d+$'],
         'release_ready_after_seconds': 0,
         'release_stable_checks': 1,
-    },
-    {
-        'id': 'hermes_agent_releases',
-        'name': 'Hermes Agent Releases',
-        'url': 'https://github.com/NousResearch/hermes-agent/releases.atom',
-        'kind': 'atom',
     },
     {
         'id': 'grok_build_version',
@@ -183,10 +220,21 @@ def parse_time_to_epoch(text: str) -> float | None:
 
 def default_state() -> dict[str, Any]:
     return {
-        'version': 1,
+        'version': 2,
         'created_at': utc_now_iso(),
         'updated_at': None,
         'sources': {},
+        'pending_events': [],
+        'enrichment': {
+            'grok_successes': 0,
+            'grok_failures': 0,
+            'fallback_translations': 0,
+            'original_fallbacks': 0,
+            'cache_hits': 0,
+            'last_error': None,
+            'last_success_at': None,
+            'last_provider': None,
+        },
         'translation': {
             'consecutive_failures': 0,
             'backoff_until': 0,
@@ -222,10 +270,26 @@ def normalize_url_for_dedupe(url: str) -> str:
     return urllib.parse.urlunsplit((scheme, netloc, path, parsed.query, ''))
 
 
+def canonical_source_url(url: str) -> str:
+    value = (url or '').strip()
+    if normalize_url_for_dedupe(value) == 'https://pi.dev/news.xml':
+        return 'https://pi.dev/changelog.xml'
+    return value
+
+
+def default_poll_interval(source_id: str) -> int:
+    source_id = str(source_id or '')
+    if source_id in HIGH_PRIORITY_SOURCE_IDS:
+        return 5 * 60
+    if source_id.startswith('infra_'):
+        return 60 * 60
+    return 30 * 60
+
+
 def normalize_source(source: Any) -> dict[str, Any] | None:
     if not isinstance(source, dict):
         return None
-    url = str(source.get('url') or '').strip()
+    url = canonical_source_url(str(source.get('url') or ''))
     if not re.match(r'^https?://', url):
         return None
     name = normalize_ws(str(source.get('name') or ''))
@@ -243,6 +307,7 @@ def normalize_source(source: Any) -> dict[str, Any] | None:
         'name': name,
         'url': url,
         'kind': kind,
+        'poll_interval_seconds': default_poll_interval(source_id),
     }
     version_path = str(source.get('version_path') or '').strip()
     if version_path:
@@ -856,8 +921,25 @@ def load_state() -> dict[str, Any]:
     data = load_json(STATE_FILE, default={})
     if not isinstance(data, dict) or not data:
         return default_state()
-    data.setdefault('version', 1)
+    data.setdefault('version', 2)
     data.setdefault('sources', {})
+    data.setdefault('pending_events', [])
+    data.setdefault('enrichment', {})
+    enrichment = data['enrichment']
+    if not isinstance(enrichment, dict):
+        enrichment = {}
+        data['enrichment'] = enrichment
+    for field, default in {
+        'grok_successes': 0,
+        'grok_failures': 0,
+        'fallback_translations': 0,
+        'original_fallbacks': 0,
+        'cache_hits': 0,
+        'last_error': None,
+        'last_success_at': None,
+        'last_provider': None,
+    }.items():
+        enrichment.setdefault(field, default)
     data.setdefault('translation', {})
     data['translation'].setdefault('consecutive_failures', 0)
     data['translation'].setdefault('backoff_until', 0)
@@ -1846,6 +1928,298 @@ def build_deepl_payload(
     return payload, body
 
 
+class GrokDigestError(TranslationError):
+    pass
+
+
+def event_key(event: dict[str, Any]) -> str:
+    source = event.get('source') if isinstance(event.get('source'), dict) else {}
+    item = event.get('item') if isinstance(event.get('item'), dict) else {}
+    seed = f"{source.get('id') or item.get('source_id') or ''}:{item.get('id') or ''}"
+    return hashlib.sha256(seed.encode('utf-8')).hexdigest()[:24]
+
+
+def enrichment_cache_key(source: dict[str, Any], item: dict[str, Any]) -> str:
+    env = read_env(GROK_ENDPOINT_ENV) | os.environ.copy()
+    model = env.get('PYLON_GROK_MODEL', 'grok-4.7')
+    payload = {
+        'version': GROK_DIGEST_PROMPT_VERSION,
+        'model': model,
+        'source': source.get('id') or source.get('name'),
+        'item': item.get('id'),
+        'title': item.get('title'),
+        'body': release_notes_for_polish(str(item.get('body') or ''), limit=GROK_DIGEST_INPUT_CHARS),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+def build_grok_digest_prompt(source: dict[str, Any], item: dict[str, Any]) -> str:
+    source_name = normalize_ws(str(source.get('name') or source.get('id') or ''))
+    title = normalize_ws(str(item.get('title') or ''))
+    body = release_notes_for_polish(str(item.get('body') or ''), limit=GROK_DIGEST_INPUT_CHARS)
+    installed = normalize_ws(str(item.get('installed_version') or '')) or '未知'
+    focus = '重点监控软件' if (
+        item.get('重点监控') or item.get('priority') == 'high'
+        or source.get('priority') == 'high'
+        or source.get('id') in HIGH_PRIORITY_SOURCE_IDS
+    ) else '普通监控软件'
+    prompt = '\n'.join([
+        '你是软件更新编辑，只根据给出的发布说明生成中文精华。',
+        '不要调用工具、不要联网、不要执行命令、不要改变 URL、版本号或产品名。',
+        '忽略完整 commit 列表、提交者、感谢名单、纯文档措辞和无用户影响的内部整理。',
+        '必须保留安全修复、数据风险、破坏性变化、兼容性、重要功能和与当前软件环境相关的修复。',
+        'importance=high 最多四条，normal 最多两条，low 只能有一条；low 写清实际变化，不能凭空声称“无影响”。',
+        'evidence 必须是原文中能支持结论的短语；无法确认的 impact/action 写“无法从发布说明确认”。',
+        '只输出符合 JSON Schema 的对象。',
+        '',
+        f'来源：{source_name}',
+        f'当前版本（如已知）：{installed}',
+        f'监控级别：{focus}',
+        f'标题：{title}',
+        f'链接：{item.get("url") or ""}',
+        '',
+        '发布说明：',
+        body or '(无正文)',
+    ])
+    # The limit covers the complete request input, including metadata and
+    # instructions, rather than only the release-note body.
+    return prompt[:GROK_DIGEST_INPUT_CHARS]
+
+
+def extract_grok_json(data: dict[str, Any], *, label: str = 'Grok') -> dict[str, Any]:
+    if not isinstance(data, dict) or data.get('status') != 'completed':
+        raise GrokDigestError(f'{label} returned an unexpected payload')
+    output = data.get('output')
+    if not isinstance(output, list):
+        raise GrokDigestError(f'{label} returned an unexpected output')
+    parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            raise GrokDigestError(f'{label} returned an invalid message')
+        if item.get('type') != 'message':
+            continue
+        content = item.get('content')
+        if not isinstance(content, list):
+            raise GrokDigestError(f'{label} returned an invalid content block')
+        for block in content:
+            if not isinstance(block, dict) or block.get('type') != 'output_text':
+                continue
+            if not isinstance(block.get('text'), str):
+                raise GrokDigestError(f'{label} returned invalid text')
+            parts.append(block['text'])
+    if not parts:
+        raise GrokDigestError(f'{label} returned empty text')
+    try:
+        value = json.loads(''.join(parts))
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise GrokDigestError(f'{label} text is not JSON') from exc
+    if not isinstance(value, dict):
+        raise GrokDigestError(f'{label} text is not an object')
+    return value
+
+
+def validate_grok_digest(value: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise GrokDigestError('Grok digest is not an object')
+    importance = value.get('importance')
+    if importance not in {'high', 'normal', 'low'}:
+        raise GrokDigestError('Grok digest has invalid importance')
+    title = value.get('title_zh')
+    summary = value.get('summary_zh')
+    impact = value.get('impact_zh')
+    action = value.get('action_zh')
+    change_types = value.get('change_types')
+    evidence = value.get('evidence')
+    confidence = value.get('confidence')
+    if not isinstance(title, str) or not title.strip():
+        raise GrokDigestError('Grok digest missing title_zh')
+    if not isinstance(summary, list) or not summary or len(summary) > 4 or not all(isinstance(v, str) and v.strip() for v in summary):
+        raise GrokDigestError('Grok digest has invalid summary_zh')
+    if importance == 'low' and len(summary) != 1:
+        raise GrokDigestError('low importance digest must contain one summary')
+    if importance == 'normal' and len(summary) > 2:
+        raise GrokDigestError('normal importance digest must contain at most two summaries')
+    if not isinstance(impact, str) or not isinstance(action, str):
+        raise GrokDigestError('Grok digest missing impact/action')
+    if not isinstance(change_types, list) or not all(value in GROK_DIGEST_CHANGE_TYPES for value in change_types):
+        raise GrokDigestError('Grok digest has invalid change_types')
+    if not isinstance(evidence, list) or not evidence or not all(isinstance(v, str) and v.strip() for v in evidence):
+        raise GrokDigestError('Grok digest requires evidence')
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= float(confidence) <= 1:
+        raise GrokDigestError('Grok digest has invalid confidence')
+    return {
+        'title_zh': title.strip(),
+        'importance': importance,
+        'summary_zh': [str(value).strip() for value in summary],
+        'impact_zh': impact.strip(),
+        'action_zh': action.strip(),
+        'change_types': list(dict.fromkeys(change_types)),
+        'evidence': [str(value).strip() for value in evidence[:4]],
+        'confidence': round(float(confidence), 3),
+    }
+
+
+def _request_grok_structured(prompt: str, *, schema: dict[str, Any], name: str,
+                             timeout: int = GROK_DIGEST_TIMEOUT_SECONDS) -> tuple[dict[str, Any], str]:
+    env = read_env(GROK_ENDPOINT_ENV) | os.environ.copy()
+    base = env.get('GROK_MODELS_BASE_URL', '').rstrip('/')
+    key = env.get('XAI_API_KEY', '')
+    if not base or not key:
+        raise GrokDigestError('Grok API configuration is missing')
+    request_id = uuid.uuid4().hex
+    payload = {
+        'model': env.get('PYLON_GROK_MODEL', 'grok-4.7'),
+        'input': [{'role': 'user', 'content': prompt}],
+        'reasoning': {'effort': 'medium'},
+        'text': {'format': {'type': 'json_schema', 'name': name,
+                            'strict': True, 'schema': schema}},
+        'store': False,
+        'tools': [],
+        'stream': True,
+    }
+    try:
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            with client.stream('POST', base + '/responses', headers={
+                'Authorization': 'Bearer ' + key,
+                'X-Request-ID': request_id,
+            }, json=payload) as response:
+                if response.status_code != 200:
+                    raise GrokDigestError(f'Grok HTTP {response.status_code}')
+                data_lines: list[str] = []
+                for line in response.iter_lines():
+                    if line.startswith('data:'):
+                        data_lines.append(line[5:].lstrip())
+                    elif not line and data_lines:
+                        data = '\n'.join(data_lines)
+                        data_lines = []
+                        if data == '[DONE]':
+                            continue
+                        event = json.loads(data)
+                        if not isinstance(event, dict):
+                            raise GrokDigestError('Grok stream returned an invalid event')
+                        if event.get('type') == 'response.completed':
+                            return event.get('response'), request_id
+                        if event.get('type') in {'response.failed', 'response.incomplete', 'error'}:
+                            raise GrokDigestError('Grok stream failed')
+                raise GrokDigestError('Grok stream ended before completion')
+    except GrokDigestError:
+        raise
+    except (httpx.HTTPError, ValueError, OSError) as exc:
+        raise GrokDigestError(f'Grok request failed: {type(exc).__name__}') from exc
+
+
+def request_grok_digest(source: dict[str, Any], item: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    response, request_id = _request_grok_structured(
+        build_grok_digest_prompt(source, item),
+        schema=GROK_DIGEST_SCHEMA,
+        name='software_update_digest',
+    )
+    return validate_grok_digest(extract_grok_json(response, label='Grok digest')), request_id
+
+
+def load_translation_endpoints() -> list[dict[str, str]]:
+    config = load_json(TRANSLATION_CONFIG_FILE, default={})
+    raw = config.get('endpoints', []) if isinstance(config, dict) else []
+    if not isinstance(raw, list):
+        raw = []
+    env = read_env(TRANSLATION_ENDPOINT_ENV) | os.environ.copy()
+    env_url = str(env.get('PYLON_TRANSLATE_URL') or '').strip()
+    if env_url:
+        raw = [{'url': env_url, 'api_key_env': 'PYLON_TRANSLATE_API_KEY'}] + raw
+    endpoints: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for value in raw:
+        if isinstance(value, str):
+            value = {'url': value}
+        if not isinstance(value, dict):
+            continue
+        url = str(value.get('url') or '').strip().rstrip('/')
+        if not re.match(r'^https?://', url) or url in seen:
+            continue
+        seen.add(url)
+        endpoints.append({
+            'url': url,
+            'api_key_env': str(value.get('api_key_env') or 'PYLON_TRANSLATE_API_KEY'),
+        })
+    return endpoints
+
+
+class LibreTranslateClient:
+    def __init__(self, *, state: dict[str, Any] | None = None):
+        self.state = state if isinstance(state, dict) else {}
+        self.endpoints = load_translation_endpoints()
+
+    def translate(self, text: str, *, source_lang: str = 'en', target_lang: str = 'zh') -> str:
+        text = (text or '').strip()
+        if not text:
+            return ''
+        if not self.endpoints:
+            raise TranslationError('no LibreTranslate endpoint configured')
+        last_error: Exception | None = None
+        now = time.time()
+        backoffs = self.state.setdefault('endpoint_backoffs', {})
+        if not isinstance(backoffs, dict):
+            backoffs = {}
+            self.state['endpoint_backoffs'] = backoffs
+        for endpoint in self.endpoints:
+            endpoint_url = endpoint['url']
+            if float(backoffs.get(endpoint_url) or 0) > now:
+                last_error = TranslationError(f'LibreTranslate endpoint is in backoff: {endpoint_url}')
+                continue
+            api_key = str((read_env(TRANSLATION_ENDPOINT_ENV) | os.environ.copy()).get(endpoint['api_key_env']) or '')
+            payload = {'q': text, 'source': source_lang, 'target': target_lang, 'format': 'text'}
+            if api_key:
+                payload['api_key'] = api_key
+            try:
+                response = httpx.post(endpoint['url'], json=payload, timeout=TRANSLATE_TIMEOUT_SECONDS, trust_env=False)
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    retry_after = response.headers.get('Retry-After')
+                    delay = min(3600, max(30, int(float(retry_after)))) if retry_after and retry_after.replace('.', '', 1).isdigit() else 300
+                    backoffs[endpoint_url] = now + delay
+                    # Keep the legacy aggregate field for status/compatibility,
+                    # while allowing other configured endpoints to be tried.
+                    self.state['backoff_until'] = max(
+                        [float(value or 0) for value in backoffs.values()] + [0]
+                    )
+                    raise TranslationError(f'LibreTranslate HTTP {response.status_code}')
+                if response.status_code >= 400:
+                    raise TranslationError(f'LibreTranslate HTTP {response.status_code}')
+                value = response.json().get('translatedText')
+                if not isinstance(value, str) or not value.strip():
+                    raise TranslationError('LibreTranslate returned empty text')
+                self.state['last_success_at'] = utc_now_iso()
+                self.state['last_error'] = None
+                backoffs[endpoint_url] = 0
+                self.state['backoff_until'] = max(
+                    [float(value or 0) for value in backoffs.values()] + [0]
+                )
+                self.state['endpoint'] = endpoint_url
+                return value.strip()
+            except (httpx.HTTPError, ValueError, OSError, TranslationError) as exc:
+                last_error = exc
+                continue
+        raise TranslationError(str(last_error or 'LibreTranslate failed'))
+
+
+def local_fallback_digest(source: dict[str, Any], item: dict[str, Any], translated_title: str | None = None,
+                         translated_body: str | None = None) -> dict[str, Any]:
+    title = (translated_title or str(item.get('title') or '')).strip()
+    body = (translated_body or str(item.get('body') or '')).strip()
+    lines = [normalize_ws(line.lstrip('-*0123456789.) ')) for line in body.splitlines() if normalize_ws(line)]
+    lines = [line for line in lines if not re.match(r'^(?:full changelog|contributors?|thanks to)\b', line, re.I)]
+    summary = (lines[:2] or [body[:280] or title])
+    return {
+        'title_zh': title or str(item.get('title') or item.get('id') or ''),
+        'importance': 'normal',
+        'summary_zh': [value[:280] for value in summary[:2]],
+        'impact_zh': '无法从发布说明确认。',
+        'action_zh': '请查看原文后决定是否更新。',
+        'change_types': ['internal'],
+        'evidence': [summary[0][:280]],
+        'confidence': 0.2,
+    }
+
+
 class DeepLWebTranslator:
     def __init__(
         self,
@@ -2297,6 +2671,178 @@ def format_alerts(events: list[dict[str, Any]], *, translator: DeepLWebTranslato
     return message
 
 
+def format_digest_event(event: dict[str, Any], digest: dict[str, Any], *, provider: str = 'grok') -> str:
+    source = event.get('source') if isinstance(event.get('source'), dict) else {}
+    item = event.get('item') if isinstance(event.get('item'), dict) else {}
+    importance = str(digest.get('importance') or 'normal')
+    labels = {'high': '高价值', 'normal': '普通更新', 'low': '低价值精简'}
+    title = str(digest.get('title_zh') or item.get('title') or '(无标题)').strip()
+    lines = [f"## {source.get('name') or item.get('source_id') or '软件更新'} — {title} 【{labels.get(importance, '普通更新')}】", '']
+    if item.get('published_at'):
+        lines.append(f"发布时间：{item['published_at']}")
+    if item.get('url'):
+        lines.append(f"链接：{item['url']}")
+    summary = [str(value).strip() for value in digest.get('summary_zh', []) if str(value).strip()]
+    if importance == 'low':
+        lines.extend(['', '精简摘要：', summary[0] if summary else '更新说明较少，暂无更多可确认信息。'])
+    else:
+        lines.append('')
+        lines.append('中文精华：')
+        lines.extend(f'- {value}' for value in summary[:4])
+        impact = str(digest.get('impact_zh') or '').strip()
+        action = str(digest.get('action_zh') or '').strip()
+        if impact:
+            lines.extend(['', f'影响：{impact}'])
+        if action:
+            lines.append(f'建议：{action}')
+    if provider != 'grok':
+        lines.extend(['', f'处理方式：{provider}'])
+    return '\n'.join(lines).strip()
+
+
+def _translate_for_fallback(client: LibreTranslateClient, text: str) -> str:
+    cleaned = strip_markdown_emphasis(text).strip()
+    if not cleaned:
+        return ''
+    protected, slots = protect_literals(cleaned)
+    translated = client.translate(protected)
+    restored = translated
+    for index, value in enumerate(slots):
+        token = re.compile(re.escape(f'__PH{index}__'), re.IGNORECASE)
+        if len(token.findall(restored)) != 1:
+            raise TranslationError(f'LibreTranslate altered placeholder {index}')
+        restored = token.sub(lambda _match: value, restored)
+    return restored.strip()
+
+
+def enrich_event(event: dict[str, Any], *, state: dict[str, Any]) -> tuple[dict[str, Any], str, str | None, str | None]:
+    """Return digest, provider, request id, and a sanitized error if any."""
+    source = event.get('source') if isinstance(event.get('source'), dict) else {}
+    item = event.get('item') if isinstance(event.get('item'), dict) else {}
+    enrichment = state.setdefault('enrichment', {})
+    body = str(item.get('body') or '')
+    title = str(item.get('title') or '')
+    if chinese_text_is_majority(release_notes_for_polish(body) or title):
+        enrichment['last_provider'] = 'source'
+        enrichment['last_success_at'] = utc_now_iso()
+        return local_fallback_digest(source, item, translated_title=title, translated_body=release_notes_for_polish(body)), 'source', None, None
+
+    cached = event.get('enrichment_result')
+    if isinstance(cached, dict):
+        try:
+            return validate_grok_digest(cached), str(event.get('enrichment_provider') or 'cache'), str(event.get('enrichment_request_id') or '') or None, None
+        except GrokDigestError:
+            event.pop('enrichment_result', None)
+
+    cache_key = enrichment_cache_key(source, item)
+    cache = load_json(ENRICHMENT_CACHE_FILE, default={})
+    if isinstance(cache, dict) and isinstance(cache.get(cache_key), dict):
+        try:
+            digest = validate_grok_digest(cache[cache_key])
+            enrichment['cache_hits'] = int(enrichment.get('cache_hits') or 0) + 1
+            enrichment['last_provider'] = 'cache'
+            enrichment['last_success_at'] = utc_now_iso()
+            return digest, 'cache', None, None
+        except GrokDigestError:
+            cache.pop(cache_key, None)
+
+    request_id = None
+    grok_error = None
+    for attempt in range(GROK_DIGEST_MAX_ATTEMPTS):
+        try:
+            digest, request_id = request_grok_digest(source, item)
+            enrichment['grok_successes'] = int(enrichment.get('grok_successes') or 0) + 1
+            enrichment['last_provider'] = 'grok'
+            enrichment['last_success_at'] = utc_now_iso()
+            enrichment['last_error'] = None
+            if not isinstance(cache, dict):
+                cache = {}
+            cache[cache_key] = digest
+            save_json(ENRICHMENT_CACHE_FILE, cache)
+            return digest, 'grok', request_id, None
+        except (GrokDigestError, TranslationError, OSError, httpx.HTTPError) as exc:
+            grok_error = f'{type(exc).__name__}: {exc}'[:500]
+            if attempt + 1 < GROK_DIGEST_MAX_ATTEMPTS:
+                time.sleep(0.5 * (attempt + 1))
+    enrichment['grok_failures'] = int(enrichment.get('grok_failures') or 0) + 1
+    enrichment['last_error'] = grok_error
+
+    client = LibreTranslateClient(state=state.setdefault('translation', {}))
+    try:
+        translated_title = _translate_for_fallback(client, title)
+        translated_body = _translate_for_fallback(client, release_notes_for_polish(body))
+        digest = local_fallback_digest(source, item, translated_title=translated_title, translated_body=translated_body)
+        enrichment['fallback_translations'] = int(enrichment.get('fallback_translations') or 0) + 1
+        enrichment['last_provider'] = 'libretranslate'
+        enrichment['last_success_at'] = utc_now_iso()
+        return digest, 'libretranslate', request_id, grok_error
+    except (TranslationError, httpx.HTTPError, OSError, ValueError) as exc:
+        error = f'{grok_error}; fallback {type(exc).__name__}: {exc}'[:500]
+        digest = local_fallback_digest(source, item)
+        enrichment['original_fallbacks'] = int(enrichment.get('original_fallbacks') or 0) + 1
+        enrichment['last_provider'] = 'original'
+        enrichment['last_error'] = error
+        return digest, 'original', request_id, error
+
+
+def process_pending_enrichment(*, max_items: int = GROK_DIGEST_MAX_ITEMS_PER_RUN,
+                               dry_run: bool = False) -> dict[str, Any]:
+    state = load_state()
+    pending = state.get('pending_events')
+    if not isinstance(pending, list):
+        pending = []
+        state['pending_events'] = pending
+    processed = sent = 0
+    errors: list[str] = []
+    remaining: list[dict[str, Any]] = []
+    for event in pending:
+        if not isinstance(event, dict):
+            continue
+        if processed >= max(1, int(max_items)):
+            remaining.append(event)
+            continue
+        status = str(event.get('enrichment_status') or 'pending')
+        if status == 'sent':
+            continue
+        try:
+            digest, provider, request_id, error = enrich_event(event, state=state)
+            event['enrichment_status'] = 'ready'
+            event['enrichment_provider'] = provider
+            event['enrichment_request_id'] = request_id
+            event['enrichment_attempts'] = int(event.get('enrichment_attempts') or 0) + 1
+            event['enrichment_result'] = digest
+            event['enrichment_result_hash'] = hashlib.sha256(json.dumps(digest, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+            event['enrichment_completed_at'] = utc_now_iso()
+            if error:
+                event['enrichment_error'] = error
+            processed += 1
+            if not dry_run:
+                save_state(state)
+            message = format_digest_event(event, digest, provider=provider)
+            if dry_run:
+                remaining.append(event)
+                continue
+            key = f"software-update:{event_key(event)}:{event['enrichment_result_hash']}"
+            event_id = notification_events.publish(message, key=key)
+            if not event_id:
+                remaining.append(event)
+                errors.append(f"{event_key(event)}: outbox unavailable")
+                continue
+            sent += 1
+        except Exception as exc:
+            event['enrichment_status'] = 'error'
+            event['enrichment_error'] = f'{type(exc).__name__}: {exc}'[:500]
+            remaining.append(event)
+            errors.append(event['enrichment_error'])
+            processed += 1
+        if not dry_run:
+            save_state(state)
+    state['pending_events'] = remaining
+    if not dry_run:
+        save_state(state)
+    return {'processed': processed, 'sent': sent, 'pending': len(remaining), 'errors': errors}
+
+
 def fetch_url(url: str, *, timeout: int = SOURCE_TIMEOUT_SECONDS) -> bytes:
     req = urllib.request.Request(url, headers={
         'User-Agent': USER_AGENT,
@@ -2311,6 +2857,47 @@ def fetch_url(url: str, *, timeout: int = SOURCE_TIMEOUT_SECONDS) -> bytes:
         raise FetchError(f'network error from {url}: {exc}') from exc
 
 
+class SourceNotModified(Exception):
+    """The source returned 304 and its cached state is still valid."""
+
+
+def fetch_source(url: str, current: dict[str, Any]) -> tuple[bytes, dict[str, str]]:
+    """Fetch a source with conditional headers while keeping error text safe."""
+    req_headers = {
+        'User-Agent': USER_AGENT,
+        'Accept': 'application/atom+xml, application/rss+xml, application/xml, text/xml, text/plain, text/markdown, application/json, */*',
+    }
+    if current.get('etag'):
+        req_headers['If-None-Match'] = str(current['etag'])
+    if current.get('last_modified'):
+        req_headers['If-Modified-Since'] = str(current['last_modified'])
+    req = urllib.request.Request(canonical_source_url(url), headers=req_headers)
+    try:
+        with urllib.request.urlopen(req, timeout=SOURCE_TIMEOUT_SECONDS) as resp:
+            headers = {
+                'etag': str(resp.headers.get('ETag') or ''),
+                'last_modified': str(resp.headers.get('Last-Modified') or ''),
+                'final_url': str(resp.geturl() or url),
+            }
+            return resp.read(), headers
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            raise SourceNotModified from exc
+        retry_after = str(exc.headers.get('Retry-After') or '') if exc.headers else ''
+        suffix = f' retry_after={retry_after}' if retry_after else ''
+        raise FetchError(f'HTTP {exc.code} from {canonical_source_url(url)}{suffix}') from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise FetchError(f'network error from {canonical_source_url(url)}: {exc}') from exc
+
+
+def source_poll_interval(source: dict[str, Any]) -> int:
+    try:
+        configured = int(source.get('poll_interval_seconds'))
+    except (TypeError, ValueError):
+        configured = 0
+    return configured if configured > 0 else default_poll_interval(str(source.get('id') or ''))
+
+
 def due_for_source(current: dict[str, Any], now: float) -> bool:
     try:
         return max(float(current.get('backoff_until') or 0), float(current.get('next_poll_at') or 0)) <= now
@@ -2318,12 +2905,31 @@ def due_for_source(current: dict[str, Any], now: float) -> bool:
         return True
 
 
-def mark_source_failure(current: dict[str, Any], error: str, now: float) -> None:
+def mark_source_failure(current: dict[str, Any], error: str, now: float) -> bool:
     failures = int(current.get('consecutive_failures') or 0) + 1
+    first_failure = failures == 1
     current['consecutive_failures'] = failures
     current['last_error'] = error[:500]
+    current['last_failure_error'] = error[:500]
     current['last_failure_at'] = utc_now_iso()
     current['backoff_until'] = now + min(3600, 60 * failures)
+    current['failure_alerted'] = bool(current.get('failure_alerted')) or first_failure
+    return first_failure
+
+
+def mark_source_success(current: dict[str, Any], now: float, *, headers: dict[str, str] | None = None) -> bool:
+    recovered = int(current.get('consecutive_failures') or 0) > 0 or bool(current.get('failure_alerted'))
+    current['consecutive_failures'] = 0
+    current['last_success_at'] = utc_now_iso()
+    current['backoff_until'] = 0
+    current['next_poll_at'] = now
+    current['last_error'] = None
+    current['failure_alerted'] = False
+    if headers:
+        for key in ('etag', 'last_modified', 'final_url'):
+            if headers.get(key):
+                current[key] = headers[key]
+    return recovered
 
 
 def baseline_sources(sources: list[dict[str, str]]) -> dict[str, Any]:
@@ -2337,7 +2943,7 @@ def baseline_sources(sources: list[dict[str, str]]) -> dict[str, Any]:
         try:
             raw = fetch_url(source['url'])
             collect_source_items(state, source, raw, emit_existing=0)
-            current['next_poll_at'] = now + source_int(source, 'poll_interval_seconds', 0)
+            current['next_poll_at'] = now + source_poll_interval(source)
             baselined += 1
         except Exception as exc:
             mark_source_failure(current, repr(exc), now)
@@ -2347,33 +2953,117 @@ def baseline_sources(sources: list[dict[str, str]]) -> dict[str, Any]:
     return {'baselined': baselined, 'failed': failed, 'failures': failures}
 
 
-def run_monitor(*, emit_existing: int = 0, dry_run: bool = False) -> str:
+def _poll_sources_for_enqueue(state: dict[str, Any], sources: list[dict[str, Any]],
+                             events: list[dict[str, Any]], *, emit_existing: int = 0,
+                             now: float | None = None) -> tuple[list[str], list[str]]:
+    now = time.time() if now is None else now
+    due = []
+    for source in monitor_poll_sources(sources):
+        if len(events) >= MAX_EVENTS_PER_RUN:
+            break
+        current = source_state(state, source['id'])
+        if due_for_source(current, now):
+            due.append((source, dict(current)))
+    if not due:
+        return [], []
+
+    failures: list[str] = []
+    recoveries: list[str] = []
+    results: dict[str, tuple[dict[str, str], bytes | None, Exception | None]] = {}
+    with ThreadPoolExecutor(max_workers=min(4, len(due))) as pool:
+        future_map = {
+            pool.submit(fetch_source, source['url'], snapshot): source
+            for source, snapshot in due
+        }
+        for future, source in future_map.items():
+            try:
+                raw, headers = future.result()
+                results[source['id']] = (headers, raw, None)
+            except SourceNotModified:
+                results[source['id']] = ({}, None, None)
+            except Exception as exc:
+                results[source['id']] = ({}, None, exc)
+
+    for source, _snapshot in due:
+        if len(events) >= MAX_EVENTS_PER_RUN:
+            break
+        current = source_state(state, source['id'])
+        headers, raw, error = results[source['id']]
+        was_failed = int(current.get('consecutive_failures') or 0) > 0 or bool(current.get('failure_alerted'))
+        if error is not None:
+            if mark_source_failure(current, repr(error), now):
+                failures.append(f"{source['name']}（{str(error)[:180]}）")
+            continue
+        recovered = mark_source_success(current, now, headers=headers)
+        if recovered:
+            recoveries.append(source['name'])
+        current['next_poll_at'] = now + source_poll_interval(source)
+        if raw is None:
+            continue
+        try:
+            new_items = collect_source_items(state, source, raw, emit_existing=emit_existing)
+        except Exception as exc:
+            if mark_source_failure(current, repr(exc), now):
+                failures.append(f"{source['name']}（{str(exc)[:180]}）")
+            continue
+        for item in new_items:
+            save_raw_item(source, item)
+            events.append({
+                'source': source,
+                'item': item,
+                'enrichment_status': 'pending',
+                'enrichment_attempts': 0,
+            })
+    return failures, recoveries
+
+
+def run_monitor(*, emit_existing: int = 0, dry_run: bool = False,
+                enqueue_only: bool = False) -> str:
     state = load_state()
     sources = load_sources()
     prune_inactive_source_runtime(state, active_ids=active_source_ids(sources))
     events: list[dict[str, Any]] = list(state.get('pending_events') or [])
     now = time.time()
-    for source in monitor_poll_sources(sources):
-        if len(events) >= MAX_EVENTS_PER_RUN:
-            break
-        current = source_state(state, source['id'])
-        if not due_for_source(current, now):
-            continue
-        try:
-            raw = fetch_url(source['url'])
-            new_items = collect_source_items(state, source, raw, emit_existing=emit_existing)
-            current['next_poll_at'] = now + source_int(source, 'poll_interval_seconds', 0)
-            for item in new_items:
-                save_raw_item(source, item)
-                events.append({'source': source, 'item': item})
+    failures: list[str] = []
+    recoveries: list[str] = []
+    if enqueue_only:
+        failures, recoveries = _poll_sources_for_enqueue(state, sources, events, emit_existing=emit_existing, now=now)
+    else:
+        for source in monitor_poll_sources(sources):
             if len(events) >= MAX_EVENTS_PER_RUN:
                 break
-        except Exception as exc:
-            mark_source_failure(current, repr(exc), now)
+            current = source_state(state, source['id'])
+            if not due_for_source(current, now):
+                continue
+            try:
+                raw = fetch_url(source['url'])
+                was_failed = int(current.get('consecutive_failures') or 0) > 0 or bool(current.get('failure_alerted'))
+                new_items = collect_source_items(state, source, raw, emit_existing=emit_existing)
+                current['next_poll_at'] = now + source_poll_interval(source)
+                current['consecutive_failures'] = 0
+                current['failure_alerted'] = False
+                if was_failed:
+                    recoveries.append(source['name'])
+                for item in new_items:
+                    save_raw_item(source, item)
+                    events.append({'source': source, 'item': item})
+                if len(events) >= MAX_EVENTS_PER_RUN:
+                    break
+            except Exception as exc:
+                if mark_source_failure(current, repr(exc), now):
+                    failures.append(f"{source['name']}（{str(exc)[:180]}）")
 
-    failed = [s['name'] for s in sources if int(source_state(state, s['id']).get('consecutive_failures') or 0) > 0]
-    if failed and not dry_run:
-        notification_events.result('failed', '订阅源抓取失败：' + '、'.join(failed))
+    if failures and not dry_run:
+        notification_events.result('failed', '订阅源抓取失败：' + '、'.join(failures))
+    if recoveries and not dry_run:
+        recovery_key = hashlib.sha256(f"{'|'.join(recoveries)}:{int(now // 60)}".encode()).hexdigest()[:16]
+        notification_events.publish('软件更新监控源已恢复：' + '、'.join(recoveries), key='software-source-recovery:' + recovery_key)
+
+    state['pending_events'] = events
+    if enqueue_only:
+        if not dry_run:
+            save_state(state)
+        return WAKE_AGENT_FALSE
 
     if not events:
         if not dry_run:
@@ -2427,7 +3117,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--config', help='Custom sources config path for management commands.')
     parser.add_argument('--emit-existing', type=int, default=0, help='Emit N existing items per source; useful for manual testing.')
     parser.add_argument('--dry-run', action='store_true', help='Do not write monitor state.')
-    parser.add_argument('--probe-translate', action='store_true', help='Run a small DeepL Web translation probe.')
+    parser.add_argument('--probe-translate', action='store_true', help='Run a small configured public translation probe.')
+    parser.add_argument('--enqueue-only', action='store_true', help='Only fetch and persist new items for the enrichment worker.')
     parser.add_argument('--list-sources', action='store_true', help='List built-in and custom monitor sources without polling feeds.')
     parser.add_argument('--list-projects', action='store_true', help='List active monitor projects with stable numbers.')
     parser.add_argument('--validate-config', action='store_true', help='Validate custom monitor source config without polling feeds.')
@@ -2468,8 +3159,8 @@ def main(argv: list[str] | None = None) -> int:
         CUSTOM_SOURCES_FILE = Path(args.config).expanduser()
     try:
         if args.probe_translate:
-            translator = DeepLWebTranslator(cache_path=TRANSLATION_CACHE_FILE)
-            print(translator.translate('Hello, my friend. How are you?', source_lang='EN', target_lang='ZH'))
+            translator = LibreTranslateClient(state={})
+            print(translator.translate('Hello, my friend. How are you?'))
             return 0
         if args.list_sources:
             print_management_result({
@@ -2531,7 +3222,11 @@ def main(argv: list[str] | None = None) -> int:
             if not lock.acquired:
                 print(WAKE_AGENT_FALSE)
                 return 0
-            print(run_monitor(emit_existing=max(0, args.emit_existing), dry_run=args.dry_run))
+            print(run_monitor(
+                emit_existing=max(0, args.emit_existing),
+                dry_run=args.dry_run,
+                enqueue_only=args.enqueue_only,
+            ))
         return 0
     finally:
         CUSTOM_SOURCES_FILE = original_config

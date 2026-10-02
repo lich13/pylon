@@ -97,9 +97,23 @@
     "name": "软件更新监控",
     "profile": "webops",
     "schedule": "* * * * *",
-    "deliver": true,
+    "deliver": false,
     "timeout": 1800,
-    "module": "pylon.tasks.software.monitor"
+    "lock": "software-update-monitor",
+    "module": "pylon.tasks.software.monitor",
+    "args": [
+      "--enqueue-only"
+    ]
+  },
+  "software-update-enrich": {
+    "name": "软件更新翻译提炼",
+    "profile": "webops",
+    "schedule": "* * * * *",
+    "deliver": false,
+    "timeout": 720,
+    "lock": "software-update-monitor",
+    "failure_notify": true,
+    "module": "pylon.tasks.software.enrich"
   },
   "b7a84d1d9f21": {
     "name": "Linux.do 监控",

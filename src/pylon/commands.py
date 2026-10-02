@@ -95,6 +95,30 @@ def status_text() -> str:
         lines.append(review_status_text(box=box))
     except Exception as exc:
         lines.append('系统小包更新状态暂不可读：' + redact(str(exc))[:160])
+    try:
+        from .tasks.software import monitor as software_monitor
+        state = software_monitor.load_state()
+        pending = state.get('pending_events') if isinstance(state.get('pending_events'), list) else []
+        enrichment = state.get('enrichment') if isinstance(state.get('enrichment'), dict) else {}
+        lines.append(
+            '软件更新提炼：待处理 {}；Grok 成功 {}；降级翻译 {}；原文回退 {}；最近处理 {}'.format(
+                len(pending),
+                int(enrichment.get('grok_successes') or 0),
+                int(enrichment.get('fallback_translations') or 0),
+                int(enrichment.get('original_fallbacks') or 0),
+                enrichment.get('last_provider') or '暂无',
+            )
+        )
+        failed_sources = []
+        for source_id, source_state in (state.get('sources') or {}).items():
+            if int(source_state.get('consecutive_failures') or 0) > 0:
+                failed_sources.append(f"{source_id}：{str(source_state.get('last_failure_error') or source_state.get('last_error') or '未知原因')[:120]}")
+        if failed_sources:
+            lines.append('软件源失败：' + '；'.join(failed_sources[:6]))
+        if enrichment.get('last_error'):
+            lines.append('翻译/提炼最近错误：' + redact(str(enrichment['last_error']))[:180])
+    except Exception as exc:
+        lines.append('软件更新提炼状态暂不可读：' + redact(str(exc))[:160])
     from .tasks.quotes.health import status_text as quote_status
     lines.append(quote_status(box=box))
     return "\n".join(lines)
@@ -288,6 +312,19 @@ def handle(profile: str, text: str) -> str:
                 if key == 'software-update-review':
                     from .software_updates import review_logs_text
                     output += '\n' + review_logs_text(box=Outbox())
+                if key in {'fa27c561ded6', 'software-update-enrich'}:
+                    from .tasks.software import monitor as software_monitor
+                    state = software_monitor.load_state()
+                    enrichment = state.get('enrichment') if isinstance(state.get('enrichment'), dict) else {}
+                    output += '\n软件更新提炼状态：' + json.dumps({
+                        'pending': len(state.get('pending_events') or []),
+                        'grok_successes': enrichment.get('grok_successes', 0),
+                        'grok_failures': enrichment.get('grok_failures', 0),
+                        'fallback_translations': enrichment.get('fallback_translations', 0),
+                        'original_fallbacks': enrichment.get('original_fallbacks', 0),
+                        'last_provider': enrichment.get('last_provider'),
+                        'last_error': redact(str(enrichment.get('last_error') or ''))[:180],
+                    }, ensure_ascii=False)
                 return output[-12000:]
             return jobs()[key]['name'] + '：' + scheduler.start(key)
         if item.route == 'ssh':

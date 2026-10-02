@@ -1,6 +1,6 @@
 # pylon
 
-Python 机器人服务、SQLite 待发队列和 systemd timers。维护 16 项任务：Gmail、线报、V2EX、Linux.do、Chiphell、日港 iTunes、KDocs 报价、软件更新、数据清理、SSH 白名单、每周维护汇总和系统小包更新审查。
+Python 机器人服务、SQLite 待发队列和 systemd timers。维护 17 项任务：Gmail、线报、V2EX、Linux.do、Chiphell、日港 iTunes、KDocs 报价、软件更新抓取与翻译提炼、数据清理、SSH 白名单、每周维护汇总和系统小包更新审查。
 
 ```sh
 pylon status
@@ -35,6 +35,8 @@ Gmail 的 `/gmail_candidates` 只展示尚未确认的新类型；已确认的�
 Agent 由 `pylon-agent.service` 按需执行，无常驻 Agent。全局串行，与 Codex/Grok 更新器共用安装锁；每轮退出后回收专属后台及工具进程。默认累计执行 60 分钟、等待回答 24 小时，root 可在 `/etc/pylon/agents.json` 调整。完成必须通过独立版本、服务状态或文件哈希复核；无独立检查时显示结果待核验。结果先进入持久化 outbox，随后按原生会话 ID 删除线程和临时文件；清理失败独立提示并重试，发送失败不会重做业务操作。取消不撤销已有修改，中断不自动重跑；脱敏结果保留 30 天，原始输入和线程在清理时删除。
 
 `/update_codex` 和 `/update_grok` 通过固定 sudo 入口运行原生更新，只使用 stable 版本；对应会话进程占用时不执行。更新由独立 systemd 服务执行，最长 15 分钟，不阻塞机器人。重复请求合并，完成后向请求所在机器人回报实装版本和结果；发送失败只重试通知，执行结果不确定时不自动重复安装。CLI 发起的更新向 WebOps 回报。
+
+软件更新监控先抓取并保存原始条目，再由独立 worker 调用现有 Grok 一次完成英文翻译和价值提炼；高价值、普通更新和低价值精简更新均保留通知。Grok 不使用工具且不保存请求；失败时依次回退到配置的 LibreTranslate 兼容公共端点和原文，不影响源站抓取。`/status` 与 `/logs` 显示待处理、Grok 成功、降级翻译和原文回退状态。
 
 `/updates [all]` 查询软件、系统包候选和最近更新结果，最多缓存 10 分钟。默认机器人只对 `libegl-mesa0`、`libgbm1`、`libgl1-mesa-dri`、`libglx-mesa0`、`mesa-libgallium`、`sosreport`、`thermald` 逐包显示确认按钮；点击前不会安装，库库干不收到确认卡片。FRP、PostgreSQL、Redis、Sub2API、npm 主版本、pylon 依赖和 PyMuPDF/lxml 仍只展示检查结果。sub2api 读取容器内程序自报版本，并核对其与运行进程一致；easy_proxies 无版本接口，仅在确认程序未被替换或挂载覆盖时按镜像标签推定，并标明来源。版本读取失败不会退回旧镜像标签。APT 候选采用系统自动维护的软件源索引，显示索引时间；Docker 只按 Ubuntu 软件源候选判断更新。每 6 小时审查一次候选；没有新候选时静默。安装经过单包模拟升级和白名单校验，不执行 autoremove，不自动重启主机；thermald 和需要重启的结果会明确回报。
 
