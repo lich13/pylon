@@ -121,6 +121,11 @@ def status_text() -> str:
         lines.append('软件更新提炼状态暂不可读：' + redact(str(exc))[:160])
     from .tasks.quotes.health import status_text as quote_status
     lines.append(quote_status(box=box))
+    try:
+        from .tasks.chiphell.categories import policy_status_line
+        lines.append(policy_status_line())
+    except Exception as exc:
+        lines.append('CHH 分类策略暂不可读：' + redact(str(exc))[:160])
     return "\n".join(lines)
 
 
@@ -196,7 +201,15 @@ def ssh_text(action: str, address: str = '') -> str:
             f"待恢复事务：{'有' if data['transaction_pending'] else '无'}")
 
 
-def chiphell_text(action: str) -> str:
+def chiphell_text(action: str, argument: str = '') -> str:
+    if action in {'categories', 'silence', 'unsilence'}:
+        from .tasks.chiphell import categories
+        profile = os.environ.get('PYLON_COMMAND_PROFILE', 'default')
+        try:
+            text, markup = categories.command(action, argument, profile)
+        except ValueError as exc:
+            return str(exc) + '\n\n' + help_text('chiphell_' + action)
+        return encode_response(text, markup)
     failure = None
     try:
         output = scheduler.admin('chiphell', action, timeout=150)
@@ -330,7 +343,7 @@ def handle(profile: str, text: str) -> str:
         if item.route == 'ssh':
             return ssh_text(item.action, argument)
         if item.route == 'chiphell':
-            return chiphell_text(item.action)
+            return chiphell_text(item.action, argument) if argument else chiphell_text(item.action)
         if item.route == 'gmail':
             return gmail_text(item.action, argument)
         if item.route == 'monitor':
@@ -346,6 +359,9 @@ def handle_callback(profile: str, payload: dict) -> str:
     if value.startswith('su1|'):
         from . import software_updates
         result = software_updates.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
+    elif value.startswith('ch1|'):
+        from .tasks.chiphell import categories
+        result = categories.callback(profile, payload)
     else:
         from .tasks.gmail import review
         result = review.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))

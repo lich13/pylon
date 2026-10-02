@@ -134,7 +134,11 @@ def format_telegram_message(posts: list[dict[str, Any]], fid: str = DEFAULT_FID)
     for i, post in enumerate(posts, 1):
         title = str(post.get("title") or "无标题").strip()
         url = str(post.get("url") or "").strip()
-        excerpt = compact_excerpt(str(post.get("body_excerpt") or ""), 180)
+        segments = post.get("category_segments")
+        if isinstance(segments, list) and segments:
+            excerpt = compact_excerpt("；".join(str(item.get("text") or "") for item in segments), 180)
+        else:
+            excerpt = compact_excerpt(str(post.get("body_excerpt") or ""), 180)
         item = f"{i}. [{title}]({url})"
         if excerpt:
             item += f" 摘要：{excerpt}"

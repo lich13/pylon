@@ -12,6 +12,7 @@ from typing import Any
 
 
 from pylon.tasks.chiphell import monitor as base
+from pylon.tasks.chiphell import categories
 from pylon.tasks.chiphell.runtime import (
     CHIPHELL_ALERT_SOURCE,
     CHIPHELL_FID,
@@ -163,14 +164,19 @@ def _collect_proxy_once(
             else:
                 for post in candidates:
                     post["body_excerpt"] = ""
-            notify_candidates = [post for post in candidates if base.should_notify_post(post)]
+            base_candidates = [post for post in candidates if base.should_notify_post(post)]
+            # Category policy is only for the ordinary feed.  The caller
+            # derives quote candidates from the full candidate list so a
+            # silent category can never suppress a strict price alert.
+            notify_candidates = categories.filter_normal_posts(base_candidates)
             return "OK", candidates, notify_candidates, diagnostics
         finally:
             context.close()
 
 
-def _format_notification(posts: list[dict[str, Any]], fid: str) -> str:
-    arbitrage = base.format_alerts(base.collect_arbitrage_messages("chiphell", posts))
+def _format_notification(posts: list[dict[str, Any]], fid: str, quote_posts: list[dict[str, Any]] | None = None) -> str:
+    quote_posts = quote_posts if quote_posts is not None else posts
+    arbitrage = base.format_alerts(base.collect_arbitrage_messages("chiphell", quote_posts))
     normal = base.format_telegram_message(posts, fid)
     return f"{arbitrage}\n\n{normal}".strip() if arbitrage else normal
 
@@ -257,9 +263,10 @@ def _run_cycle(args: argparse.Namespace, *, observe: bool) -> int:
     queue = DeliveryQueue(QUEUE_PATH)
 
     if status == "OK":
-        if not observe and posts:
+        quote_posts = [post for post in candidates if base.should_notify_post(post)]
+        if not observe and (posts or quote_posts):
             ids = [str(post["id"]) for post in candidates]
-            queue.enqueue(f"posts:{','.join(ids)}", _format_notification(posts, args.fid), now=now)
+            queue.enqueue(f"posts:{','.join(ids)}", _format_notification(posts, args.fid, quote_posts), now=now)
         if not observe and candidates:
             merged = apply_baseline(state, [post["id"] for post in candidates], max_ids=args.max_stored_ids)
             state.update(merged)

@@ -127,6 +127,17 @@ def command_resume() -> int:
     return 0
 
 
+def command_category(action: str, category: str = '') -> int:
+    # This entrypoint is root-owned; execute the writable policy code as the
+    # service user so the policy remains owned by pylon.
+    command = [PYLON_PYTHON, '-m', 'pylon.tasks.chiphell.categories', action]
+    if category:
+        command.append(category)
+    result = run(command, capture=True)
+    print(result.stdout.strip())
+    return 0
+
+
 def command_reconcile() -> int:
     # Read desired state under the same lock as explicit pause/resume/import.
     # Reconciliation changes only the poller, never the user's timer state.
@@ -520,12 +531,14 @@ def command_import_cookies() -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["status", "test", "baseline", "pause", "resume", "reconcile", "import-cookies"])
+    parser.add_argument("command", choices=["status", "test", "baseline", "pause", "resume", "reconcile", "import-cookies", "categories", "silence", "unsilence"])
+    parser.add_argument("category", nargs="?")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    command = build_parser().parse_args(argv).command
+    parsed = build_parser().parse_args(argv)
+    command = parsed.command
     handlers = {
         "status": command_status,
         "test": command_test,
@@ -534,6 +547,9 @@ def main(argv: list[str] | None = None) -> int:
         "resume": command_resume,
         "reconcile": command_reconcile,
         "import-cookies": command_import_cookies,
+        "categories": lambda: command_category("categories"),
+        "silence": lambda: command_category("silence", parsed.category or ""),
+        "unsilence": lambda: command_category("unsilence", parsed.category or ""),
     }
     return handlers[command]()
 

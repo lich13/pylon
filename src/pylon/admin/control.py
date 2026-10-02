@@ -30,7 +30,11 @@ def main(args=None):
     if args == ['chiphell-reconcile']:
         from .chiphell import main as chiphell_main
         return chiphell_main(['reconcile'])
-    if len(args) == 2 and args[0] == 'chiphell' and args[1] in {'status', 'test', 'baseline', 'pause', 'resume', 'import-cookies'}:
+    if len(args) >= 2 and args[0] == 'chiphell' and args[1] in {'status', 'test', 'baseline', 'pause', 'resume', 'import-cookies', 'categories', 'silence', 'unsilence'}:
+        if args[1] in {'status', 'test', 'baseline', 'pause', 'resume', 'import-cookies', 'categories'} and len(args) != 2:
+            raise ValueError('unsupported Chiphell arguments')
+        if args[1] in {'silence', 'unsilence'} and len(args) != 3:
+            raise ValueError('category is required')
         from .chiphell import main as chiphell_main
         return chiphell_main(args[1:])
     if args and args[0] == 'ssh':
