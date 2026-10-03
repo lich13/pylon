@@ -114,6 +114,27 @@ def test_waiting_reply_resumes_same_task(files, monkeypatch):
     assert invoke.call_args.args[:2] == ('gmail-reply', 'b' * 32)
 
 
+def test_failed_batch_can_retry_without_editing_samples(files, monkeypatch):
+    prepare(files, monkeypatch)
+    invoke = Mock(return_value={'id': 'b' * 32})
+    monkeypatch.setattr(agent_tasks, 'invoke', invoke)
+    bid = batch.state()['active']
+    batch.submit(bid, 'default')
+    first_key = invoke.call_args.args[3]
+    event = {'id': 'b' * 32, 'status': 'uncertain', 'result': {'summary': 'fixture provider error'}}
+    batch.consume_agent_result(event)
+    revision = batch.state()['batches'][bid]['revision']
+    batch.consume_agent_result({**event, 'cleanup': 'done'})
+    assert batch.state()['batches'][bid]['revision'] == revision
+    invoke.side_effect = lambda action, *a, **kw: [{'status': 'uncertain'}] if action == 'status' else {'id': 'c' * 32}
+    batch.submit(bid, 'default')
+    assert invoke.call_args.args[:2] == ('gmail-run', 'grok')
+    assert invoke.call_args.args[3] != first_key
+    count = invoke.call_count
+    assert '已经提交' in batch.submit(bid, 'default')
+    assert invoke.call_count == count
+
+
 def test_batch_preview_apply_preserves_existing_rules(files, monkeypatch):
     messages = prepare(files, monkeypatch)
     monkeypatch.setattr(agent_tasks, 'invoke', lambda *a, **kw: {'id': 'b' * 32})

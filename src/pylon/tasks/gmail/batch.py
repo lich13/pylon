@@ -335,6 +335,10 @@ def consume_agent_result(row):
         else:
             batch.update(status='error', last_error=str(result.get('summary') or 'Grok 未返回规则草案')[:1200])
             info.update(status='error', error=batch['last_error'])
+        if batch['status'] == 'error':
+            # A deliberate retry gets a new request identity. Repeated result
+            # events return above, so cleanup notices cannot multiply retries.
+            batch['revision'] += 1
         batch['consumed_task_status'] = row.get('status')
         batch['result_info'] = info
         save(data)
