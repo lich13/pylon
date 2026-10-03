@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from .config import home, jobs, profile_env, redact
-from .command_catalog import COMMANDS, help_text
+from .command_catalog import COMMANDS, RETIRED, RETIRED_MESSAGE, help_text
 from . import scheduler
 from .outbox import Outbox
 from .runner import task_environment
@@ -263,29 +263,33 @@ def handle(profile: str, text: str) -> str:
     os.environ['PYLON_COMMAND_PROFILE'] = profile
     value = text.strip()
     reply_id = os.environ.get('PYLON_REPLY_MESSAGE_ID', '')
-    if reply_id.isdigit() and not value.startswith('/'):
+    if not value.startswith('/'):
         from .tasks.gmail import review as gmail_review
-        result = gmail_review.bind_reason(profile, int(reply_id), value)
+        result = gmail_review.bind_reason(profile, int(reply_id) if reply_id.isdigit() else 0, value)
         if result is not None:
             return result
         from .agent_tasks import reply_to
-        result = reply_to(profile, int(reply_id), value)
+        result = reply_to(profile, int(reply_id), value) if reply_id.isdigit() else None
         if result is not None:
             return result
     if value == '任务状态':
-        return status_text()
+        return RETIRED_MESSAGE
     if value.startswith('/'):
         token, *rest = value.split(maxsplit=1)
         name, argument = token[1:].split('@', 1)[0].lower(), rest[0].strip() if rest else ''
         if name == 'start':
             return help_text()
-        if name in {'gmail', 'ssh', 'chiphell'}:
+        if name.startswith('gmail_') or (name == 'gmail' and argument):
+            return 'Gmail 操作已合并，请使用 /gmail'
+        if name in {'ssh', 'chiphell'}:
             parts = argument.split(maxsplit=1)
-            action = parts[0] if parts else ('list' if name == 'gmail' else 'status')
+            action = parts[0] if parts else 'status'
             argument = parts[1] if len(parts) > 1 else ''
-            name = name + '_' + ('candidates' if name == 'gmail' and action == 'list' else action)
+            name = name + '_' + action
         if name in {'chiphell_categories', 'chiphell_silence', 'chiphell_unsilence'}:
             return 'CHH 分类管理入口已移除，推送偏好在维护时统一调整。'
+        if name in RETIRED:
+            return RETIRED_MESSAGE
         item = COMMANDS.get(name)
         if item is None:
             return '没有这个命令。发送 /help 查看可用命令。'
@@ -295,10 +299,6 @@ def handle(profile: str, text: str) -> str:
             return help_text(name)
         if not item.argument and argument:
             raise ValueError('此操作不接受参数；用法：' + item.usage)
-        if item.route == 'status':
-            return status_text()
-        if item.route == 'outbox':
-            return outbox_text()
         if item.route == 'updates':
             if argument not in {'', 'all'}:
                 return help_text(name)
@@ -310,34 +310,12 @@ def handle(profile: str, text: str) -> str:
         if item.route == 'agent':
             from .agent_tasks import command
             return command(item.action, argument, profile)
-        if item.route == 'task':
-            key = 'all' if argument == 'all' and item.action in {'pause', 'resume'} else resolve_job(argument)
-            if item.action in {'pause', 'resume'}:
-                return control_task(key, item.action == 'pause')
-            if item.action == 'logs':
-                output = scheduler.logs(key)
-                if key == 'software-update-review':
-                    from .software_updates import review_logs_text
-                    output += '\n' + review_logs_text(box=Outbox())
-                if key in {'fa27c561ded6', 'software-update-enrich'}:
-                    from .tasks.software import monitor as software_monitor
-                    state = software_monitor.load_state()
-                    enrichment = state.get('enrichment') if isinstance(state.get('enrichment'), dict) else {}
-                    output += '\n软件更新提炼状态：' + json.dumps({
-                        'pending': len(state.get('pending_events') or []),
-                        'grok_successes': enrichment.get('grok_successes', 0),
-                        'grok_failures': enrichment.get('grok_failures', 0),
-                        'fallback_translations': enrichment.get('fallback_translations', 0),
-                        'original_fallbacks': enrichment.get('original_fallbacks', 0),
-                        'last_provider': enrichment.get('last_provider'),
-                        'last_error': redact(str(enrichment.get('last_error') or ''))[:180],
-                    }, ensure_ascii=False)
-                return output[-12000:]
-            return jobs()[key]['name'] + '：' + scheduler.start(key)
+        if item.route == 'ssh_travel':
+            from .ssh_travel import command
+            result = command(profile, argument)
+            return encode_response(result['text'], result.get('reply_markup'))
         if item.route == 'ssh':
             return ssh_text(item.action, argument)
-        if item.route == 'chiphell':
-            return chiphell_text(item.action, argument) if argument else chiphell_text(item.action)
         if item.route == 'gmail':
             return gmail_text(item.action, argument)
         if item.route == 'monitor':
@@ -350,13 +328,22 @@ def handle(profile: str, text: str) -> str:
 
 def handle_callback(profile: str, payload: dict) -> str:
     value = str(payload.get('data') or '')
-    if value.startswith('su1|'):
+    if value.startswith('st1|'):
+        from . import ssh_travel
+        result = ssh_travel.callback(profile, payload)
+    elif value.startswith('g3|'):
+        from .tasks.gmail import batch
+        result = batch.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
+    elif value.startswith('su1|'):
         from . import software_updates
         result = software_updates.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
     elif value.startswith('ch1|') or value.startswith('ch2|'):
         from .tasks.chiphell import categories
         result = categories.callback(profile, payload)
     else:
+        from .inline import owns_callback
+        if not owns_callback(profile, payload):
+            raise ValueError('按钮不属于本人会话或原始机器人消息')
         from .tasks.gmail import review
         result = review.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
     return encode_response(result.get('text', ''), result.get('reply_markup'))

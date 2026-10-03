@@ -144,6 +144,11 @@ def reconcile(box=None):
         else:
             text = render(row)
         payload = {'text': text, 'agent_task': row['id'], 'agent_state': row['status']}
+        if gmail_review and gmail_review.get('batch_id') and not gmail_review.get('proposal_id') and row['cleanup'] not in {'done', 'failed'}:
+            from .tasks.gmail.batch import dashboard_payload
+            card = dashboard_payload(event['profile'])
+            payload['text'] = card['text']
+            payload['reply_markup'] = card.get('reply_markup')
         if gmail_review and gmail_review.get('proposal_id'):
             try:
                 from .tasks.gmail.review import proposal_payload

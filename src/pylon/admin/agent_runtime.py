@@ -207,7 +207,7 @@ def validate_gmail_proposal(proposal):
         raise ValueError('Gmail 规则草案字段异常')
     if not isinstance(proposal['title'], str) or not isinstance(proposal['summary'], str):
         raise ValueError('Gmail 规则草案说明异常')
-    if not isinstance(proposal['operations'], list) or not 1 <= len(proposal['operations']) <= 10:
+    if not isinstance(proposal['operations'], list) or not 1 <= len(proposal['operations']) <= 20:
         raise ValueError('Gmail 规则草案操作数量异常')
     if not all(isinstance(x, str) for x in proposal['impact'] + proposal['verification']):
         raise ValueError('Gmail 规则草案影响说明异常')

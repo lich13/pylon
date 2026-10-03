@@ -463,7 +463,7 @@ class GmailCleanupDynamicCandidatesTests(unittest.TestCase):
                 with contextlib.redirect_stdout(out):
                     self.assertEqual(gmail_cleanup.main(["--accept-candidate", cid, "--format", "text"]), 0)
                 self.assertIn("已加入 Gmail 自动清理规则", out.getvalue())
-                self.assertTrue(gmail_cleanup.EXTRA_RULES_PATH.exists())
+                self.assertTrue(gmail_cleanup.load_extra_rules())
         finally:
             gmail_cleanup.build_gmail_service = original_build
             gmail_cleanup.NEW_TYPE_STATE_PATH = original_state

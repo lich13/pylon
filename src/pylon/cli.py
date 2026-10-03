@@ -19,7 +19,7 @@ def main():
         if name == 'execute':
             p.add_argument('--trigger', choices=['manual', 'scheduled'], default='scheduled')
     ssh = sub.add_parser('ssh')
-    ssh.add_argument('action', choices=['status', 'check', 'sync', 'refresh'], default='status', nargs='?')
+    ssh.add_argument('action', choices=['status', 'check', 'sync', 'refresh', 'travel'], default='status', nargs='?')
     ssh.add_argument('address', nargs='?')
     chiphell = sub.add_parser('chiphell')
     chiphell.add_argument('action', choices=['status', 'test', 'baseline', 'pause', 'resume', 'import-cookies'])
@@ -74,7 +74,11 @@ def main():
     elif args.command == 'status':
         print(status_text())
     elif args.command == 'ssh':
-        if args.action in {'sync', 'refresh'}:
+        if args.action == 'travel':
+            if args.address not in {None, 'status', 'open', 'close'}:
+                parser.error('用法：pylon ssh travel [status|open|close]')
+            print(json.dumps(scheduler.ssh('travel', args.address or 'status'), ensure_ascii=False))
+        elif args.action in {'sync', 'refresh'}:
             if args.address:
                 parser.error('此操作不接受 IP 参数')
             print(scheduler.start('ssh-admin-sync' if args.action == 'sync' else 'ssh-beijing-refresh'))

@@ -69,12 +69,12 @@ def test_management_commands_do_not_run_shell_or_accept_unscoped_arguments(monke
     monkeypatch.setattr(commands, 'jobs', lambda: {'abc': {'name': '任务'}})
     start = Mock(return_value='已提交执行')
     monkeypatch.setattr(scheduler, 'start', start)
-    assert commands.handle('default', '/run 1') == '任务：已提交执行'
+    assert '已下线' in commands.handle('default', '/run 1')
+    start.assert_not_called()
     assert commands.handle('default', '/ssh refresh') == '已提交执行'
     with pytest.raises(ValueError):
         commands.handle('default', '/ssh refresh https://example.com')
-    assert start.call_args_list[0].args == ('abc',)
-    assert start.call_args_list[1].args == ('ssh-beijing-refresh',)
+    assert start.call_args_list[0].args == ('ssh-beijing-refresh',)
 
 
 def test_trusted_login_learning_requires_exact_user_and_fingerprint():

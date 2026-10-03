@@ -35,6 +35,11 @@ def main(args=None):
             raise ValueError('unsupported Chiphell arguments')
         from .chiphell import main as chiphell_main
         return chiphell_main(args[1:])
+    if len(args) >= 2 and args[:2] == ['ssh', 'travel']:
+        if len(args) != 3 or args[2] not in {'status', 'open', 'close'}:
+            raise ValueError('unsupported SSH travel action')
+        from .ssh_travel import main as travel_main
+        return travel_main(args[2:])
     if args and args[0] == 'ssh':
         if len(args) < 2 or args[1] not in {'status', 'check', 'sync', 'refresh'}:
             raise ValueError('unsupported SSH action')

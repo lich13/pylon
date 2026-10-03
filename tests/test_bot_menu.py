@@ -15,12 +15,12 @@ from pylon.transport import DeliveryError
 
 
 def test_catalog_is_valid_chinese_and_has_detailed_help():
-    assert len(COMMANDS) == 39
+    assert len(COMMANDS) == 19
     assert len({row['command'] for row in menu_commands()}) == sum(item.menu for item in COMMANDS.values())
-    assert {'gmail_review', 'gmail_rules'} <= {row['command'] for row in menu_commands()}
+    assert [row['command'] for row in menu_commands()] == ['gmail', 'updates', 'monitors', 'add_monitor', 'remove_monitor', 'ssh_travel', 'agent_codex', 'agent_grok', 'update_codex', 'update_grok', 'help']
     assert 'gmail_feedback' not in {row['command'] for row in menu_commands()}
     assert not {'chiphell_categories', 'chiphell_silence', 'chiphell_unsilence'} & {row['command'] for row in menu_commands()}
-    assert len(menu_commands()) == 29
+    assert len(menu_commands()) == 11
     for item in COMMANDS.values():
         assert re.fullmatch('[a-z0-9_]{1,32}', item.name)
         assert 1 <= len(item.description) <= 256
@@ -46,7 +46,9 @@ def test_missing_arguments_only_return_specific_help(name, monkeypatch):
 @pytest.mark.parametrize('name', COMMANDS)
 def test_every_menu_entry_reaches_its_existing_operation(name, monkeypatch):
     item = COMMANDS[name]
-    from pylon import software_updates
+    from pylon import software_updates, ssh_travel
+    travel = Mock(return_value={'text': '旅行状态'})
+    monkeypatch.setattr(ssh_travel, 'command', travel)
     inventory, update = Mock(return_value='清单'), Mock(return_value='已提交')
     monkeypatch.setattr(software_updates, 'inventory_text', inventory)
     monkeypatch.setattr(software_updates, 'request_update', update)
@@ -76,6 +78,8 @@ def test_every_menu_entry_reaches_its_existing_operation(name, monkeypatch):
     elif item.route == 'monitor':
         value = {'list': '/monitors', 'add': '增加监控 owner/repo', 'remove': '移除监控'}[item.action]
         calls['monitor_command'].assert_called_once_with(value, '123')
+    elif item.route == 'ssh_travel':
+        travel.assert_called_once_with('default', '')
     elif item.route == 'updates':
         inventory.assert_called_once_with(full=False)
     elif item.route == 'software_update':
@@ -88,7 +92,7 @@ def test_every_menu_entry_reaches_its_existing_operation(name, monkeypatch):
         calls[item.route + '_text'].assert_called_once_with()
 
 
-@pytest.mark.parametrize('old,new', [('/gmail', '/gmail_candidates'), ('/gmail list', '/gmail_candidates'),
+@pytest.mark.parametrize('old,new', [('/gmail list', '/gmail_candidates'),
     ('/gmail accept gmail-nt-a', '/gmail_accept gmail-nt-a'), ('/gmail ignore gmail-nt-a', '/gmail_ignore gmail-nt-a'),
     ('/ssh', '/ssh_status'), ('/ssh check 1.2.3.4', '/ssh_check 1.2.3.4'), ('/ssh sync', '/ssh_sync'),
     ('/ssh refresh', '/ssh_refresh'), ('/chiphell', '/chiphell_status'), ('/chiphell test', '/chiphell_test'),
@@ -103,7 +107,7 @@ def test_retired_commands_and_extra_arguments_do_not_execute(monkeypatch):
     monkeypatch.setattr(scheduler, 'start', Mock(side_effect=AssertionError('must not execute')))
     for name in ('model', 'new', 'sessions', 'agents', 'approve', 'yolo'):
         assert '没有这个命令' in commands.handle('default', '/' + name)
-    for text in ('/ssh_refresh arbitrary', '/chiphell_pause now', '/remove_monitor 1', '/gmail_candidates gmail-nt-x'):
+    for text in ('/ssh_refresh arbitrary', '/remove_monitor 1'):
         with pytest.raises(ValueError, match='不接受参数'):
             commands.handle('default', text)
 
@@ -131,11 +135,9 @@ def test_monitors_does_not_arm_or_change_numbered_removal(tmp_path, monkeypatch)
 def test_gmail_and_ssh_validate_before_fixed_operations(monkeypatch):
     execute = Mock(return_value='已加入规则')
     monkeypatch.setattr(commands, 'locked_command', execute)
-    assert '格式不正确' in commands.handle('default', '/gmail_accept ../../rules')
+    assert '/gmail' in commands.handle('default', '/gmail_accept ../../rules')
+    assert '/gmail' in commands.handle('default', '/gmail_accept gmail-nt-fixture')
     execute.assert_not_called()
-    assert '本次未删除邮件' in commands.handle('default', '/gmail_accept gmail-nt-abc123')
-    args = execute.call_args.args[1]
-    assert args[1:] == ['-m', 'pylon.tasks.gmail.cleanup', '--accept-candidate', 'gmail-nt-abc123', '--format', 'text']
     check = Mock()
     monkeypatch.setattr(scheduler, 'ssh', check)
     assert '有效的 IPv4' in commands.handle('default', '/ssh_check 1.2.3.4;id')
@@ -147,15 +149,15 @@ def test_chiphell_paused_busy_failed_and_fresh_success_are_distinct(monkeypatch)
     admin = Mock(side_effect=scheduler.AdminError(SimpleNamespace(returncode=1, stdout=json.dumps(data), stderr='')))
     monkeypatch.setattr(scheduler, 'admin', admin)
     monkeypatch.setattr(scheduler, 'paused', lambda _: True)
-    assert '已暂停' in commands.handle('default', '/chiphell_status')
+    assert '已暂停' in commands.chiphell_text('status')
     admin.side_effect = scheduler.AdminError(SimpleNamespace(returncode=1, stdout='POLLER_LOCKED', stderr=''))
-    assert '未执行测试' in commands.handle('default', '/chiphell_test')
+    assert '未执行测试' in commands.chiphell_text('test')
     admin.side_effect = scheduler.AdminError(SimpleNamespace(returncode=1, stdout='POLL_FAULT status=LOGIN_REQUIRED', stderr=''))
-    assert '操作失败' in commands.handle('default', '/chiphell_test')
+    assert '操作失败' in commands.chiphell_text('test')
     admin.side_effect, admin.return_value = None, 'POLL_OK candidates=0 observe=1'
-    assert '测试通过' in commands.handle('default', '/chiphell_test')
+    assert '测试通过' in commands.chiphell_text('test')
     admin.return_value = ''
-    assert '未确认' in commands.handle('default', '/chiphell_test')
+    assert '未确认' in commands.chiphell_text('test')
 
 
 def test_outbox_is_read_only_and_keeps_uncertain_notifications(tmp_path, monkeypatch):
@@ -165,7 +167,7 @@ def test_outbox_is_read_only_and_keeps_uncertain_notifications(tmp_path, monkeyp
     box.finish(event['id'], 'uncertain', error='network error')
     monkeypatch.setattr(commands, 'Outbox', lambda: box)
     before = box.counts()
-    text = commands.handle('default', '/outbox')
+    text = commands.outbox_text()
     assert '回执不确定：1' in text and '不会自动重发' in text
     assert 'private content' not in text
     assert box.counts() == before
@@ -266,3 +268,21 @@ def test_real_transport_metadata_failure_remains_retryable(response, monkeypatch
     assert failure.value.status == 'pending'
     assert failure.value.delay == (55 if response == 'rate_limit' else 30)
     assert 'SecretToken' not in str(failure.value)
+
+
+@pytest.mark.parametrize('value', ['/status', '/run 1', '/pause all', '/resume all', '/logs 1', '/outbox',
+                                  '/chiphell_status', '/chiphell_test', '/chiphell_pause', '/chiphell_resume',
+                                  '/chiphell', '/chiphell test', '/chiphell pause', '/chiphell resume'])
+def test_retired_routes_never_perform_operations(value, monkeypatch):
+    for name in ('start', 'suspend', 'admin', 'ssh', 'logs'):
+        monkeypatch.setattr(scheduler, name, Mock(side_effect=AssertionError('retired route ran')))
+    assert commands.handle('default', value) == '该入口已下线，请使用 /help'
+
+
+def test_plain_reason_binds_to_batch_without_reply_id(monkeypatch):
+    from pylon.tasks.gmail import review
+    monkeypatch.delenv('PYLON_REPLY_MESSAGE_ID', raising=False)
+    reply = Mock(return_value='原因已记录')
+    monkeypatch.setattr(review, 'bind_reason', reply)
+    assert commands.handle('default', '构建成功通知没有价值') == '原因已记录'
+    reply.assert_called_once_with('default', 0, '构建成功通知没有价值')

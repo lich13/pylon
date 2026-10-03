@@ -193,8 +193,8 @@ def gmail_input(target, profile, key, value, *, resume=False):
     if not isinstance(bundle, dict) or set(bundle) != {'prompt', 'examples'} or not isinstance(bundle['examples'], list):
         raise ValueError('invalid Gmail review input')
     prompt_text(bundle['prompt'])
-    if len(bundle['examples']) > 12:
-        raise ValueError('一次最多分析 12 个完整样本')
+    if len(bundle['examples']) > 20:
+        raise ValueError('一次最多分析 20 个完整样本')
     with database() as db:
         previous = db.execute('SELECT task_id FROM requests WHERE id=?', (key,)).fetchone()
         if previous:

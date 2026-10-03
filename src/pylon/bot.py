@@ -90,7 +90,7 @@ def command_once(box: Outbox) -> bool:
         reply = proc.stdout.strip() or '操作失败，请查看 pylon 日志'
         status = 'done' if proc.returncode == 0 else 'failed'
     except Exception as exc:
-        reply, status = '操作结果不确定，请用 /status 或查询列表核对后再操作', 'uncertain'
+        reply, status = '操作结果不确定，请重新打开对应入口核对后再操作', 'uncertain'
         log.warning("command %s: %s", row['update_id'], redact(str(exc)))
     # Persist the reply before completion. A crash never silently replays
     # a mutating user command (especially a numbered removal).

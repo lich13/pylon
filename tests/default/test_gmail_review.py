@@ -10,10 +10,10 @@ from pylon.admin import agent_runtime
 
 def candidate(cid='gmail-nt-test1234'):
     return {
-        'id': cid, 'from': 'alerts@example.com', 'subject_family': '登录提醒',
-        'suggested_query': '-is:starred from:alerts@example.com subject:"登录提醒"',
+        'id': cid, 'from': 'alerts@example.invalid', 'subject_family': '登录提醒',
+        'suggested_query': '-is:starred from:alerts@example.invalid subject:"登录提醒"',
         'sample_count': 2, 'sample': {
-            'id': 'message-1', 'from': 'alerts@example.com', 'subject': '登录提醒',
+            'id': 'message-1', 'from': 'alerts@example.invalid', 'subject': '登录提醒',
             'date': 'Thu, 1 Oct 2026 10:00:00 +0800', 'snippet': '你的账号有一次登录活动',
             'labels': ['INBOX'],
         }, 'status': 'pending',
@@ -47,7 +47,7 @@ def proposal(operation='add'):
             'operation': operation, 'target_rule': '' if operation == 'add' else 'promotions_social',
             'name': 'login_notice' if operation == 'add' else 'promotions_social',
             'description': '登录通知',
-            'query': '-is:starred from:alerts@example.com subject:"登录提醒"' if operation != 'disable' else '',
+            'query': '-is:starred from:alerts@example.invalid subject:"登录提醒"' if operation != 'disable' else '',
             'reason': '本人意见',
         }],
         'impact': ['只影响非星标邮件'], 'verification': ['预览匹配数量'],
@@ -57,7 +57,7 @@ def proposal(operation='add'):
 def test_validate_requires_star_protection(files):
     value = proposal()
     assert review.validate_proposal(value)['operations'][0]['query'].startswith('-is:starred')
-    value['operations'][0]['query'] = 'from:alerts@example.com'
+    value['operations'][0]['query'] = 'from:alerts@example.invalid'
     with pytest.raises(ValueError, match='-is:starred'):
         review.validate_proposal(value)
 
@@ -66,7 +66,7 @@ def test_logic_proposal_requires_narrow_query_exclusion(files):
     value = proposal()
     value['operations'][0]['logic'] = {
         'version': 1,
-        'all': [{'field': 'from', 'op': 'equals', 'value': 'alerts@example.com'}],
+        'all': [{'field': 'from', 'op': 'equals', 'value': 'alerts@example.invalid'}],
         'any': [],
         'none': [{'field': 'subject', 'op': 'contains', 'value': '安全'}],
     }
@@ -104,7 +104,7 @@ def test_feedback_is_idempotent_and_starts_one_grok_task(files, monkeypatch):
     assert [call[0] for call in calls] == ['run']
     state = json.loads((files / 'new_type_candidates.json').read_text())
     assert state['candidates']['gmail-nt-test1234']['status'] == 'reviewing'
-    review_state = json.loads((files / 'reviews.json').read_text())
+    review_state = review._state()
     assert len(review_state['reviews']['gmail-nt-test1234']['feedback']) == 1
 
 
@@ -121,7 +121,7 @@ def test_new_feedback_clears_previous_error(files, monkeypatch):
     monkeypatch.setattr(agent_tasks, 'invoke', lambda action, *args, text='':
                          [] if action == 'status' else {'id': 'b' * 32, 'status': 'queued'})
     review.start_feedback('gmail-nt-test1234', '请重新审查这类通知', 'default', 'telegram:default:2')
-    saved_review = json.loads((files / 'reviews.json').read_text())['reviews']['gmail-nt-test1234']
+    saved_review = review._state()['reviews']['gmail-nt-test1234']
     saved_candidate = json.loads((files / 'new_type_candidates.json').read_text())['candidates']['gmail-nt-test1234']
     assert 'last_error' not in saved_review
     assert 'last_error' not in saved_candidate
@@ -135,7 +135,7 @@ def test_agent_result_creates_pending_proposal_without_deleting_mail(files):
     review._save(review.REVIEWS_PATH, data)
     result = review.consume_agent_result({'id': 'b' * 32, 'status': 'succeeded', 'result': {'gmail_proposal': proposal()}})
     assert result['status'] == 'proposal_pending'
-    proposals = json.loads((files / 'proposals.json').read_text())['proposals']
+    proposals = review._proposals()['proposals']
     assert len(proposals) == 1
     candidate_state = json.loads((files / 'new_type_candidates.json').read_text())
     assert candidate_state['candidates']['gmail-nt-test1234']['status'] == 'proposal_pending'
@@ -148,7 +148,7 @@ def test_preview_and_apply_are_read_only_then_future_only(files, monkeypatch):
     review._save(review.PROPOSALS_PATH, {'version': 1, 'proposals': {proposal_id: record}})
     monkeypatch.setattr(cleanup, 'build_gmail_service', lambda: object())
     monkeypatch.setattr(cleanup, 'list_message_ids', lambda service, query, max_messages=None: ['m1', 'm2'])
-    monkeypatch.setattr(cleanup, 'get_message_metadata', lambda service, mid: {'id': mid, 'subject': '登录提醒', 'from': 'alerts@example.com'})
+    monkeypatch.setattr(cleanup, 'get_message_metadata', lambda service, mid: {'id': mid, 'subject': '登录提醒', 'from': 'alerts@example.invalid'})
     batch_delete = Mock(side_effect=AssertionError('review must never delete mail'))
     monkeypatch.setattr(cleanup, 'batch_delete', batch_delete)
     preview_text = review.preview(proposal_id)
@@ -157,7 +157,7 @@ def test_preview_and_apply_are_read_only_then_future_only(files, monkeypatch):
     assert '本次没有删除邮件' in review.apply(proposal_id)
     batch_delete.assert_not_called()
     assert any(rule['name'] == 'login_notice' for rule in cleanup.all_rules())
-    saved = json.loads((files / 'proposals.json').read_text())['proposals'][proposal_id]
+    saved = review._proposals()['proposals'][proposal_id]
     assert saved['status'] == 'applied'
     candidate_state = json.loads((files / 'new_type_candidates.json').read_text())
     assert candidate_state['candidates']['gmail-nt-test1234']['status'] == 'applied'
@@ -171,7 +171,7 @@ def test_apply_requires_same_preview_snapshot(files, monkeypatch):
     monkeypatch.setattr(cleanup, 'build_gmail_service', lambda: object())
     phase = {'value': 0}
     monkeypatch.setattr(cleanup, 'list_message_ids', lambda service, query, max_messages=None: ['m1'] if phase['value'] == 0 else ['m2'])
-    monkeypatch.setattr(cleanup, 'get_message_metadata', lambda service, mid: {'id': mid, 'subject': mid, 'from': 'alerts@example.com'})
+    monkeypatch.setattr(cleanup, 'get_message_metadata', lambda service, mid: {'id': mid, 'subject': mid, 'from': 'alerts@example.invalid'})
     review.preview(proposal_id)
     phase['value'] = 1
     with pytest.raises(ValueError, match='变化'):
@@ -191,7 +191,7 @@ def test_reject_returns_candidate_to_pending(files):
 def test_button_signature_and_sample_reason_flow(files, monkeypatch):
     profile = 'default'
     data = review.dashboard_payload(profile)
-    assert 'Gmail 清理向导' in data['text']
+    assert 'Gmail 清理' in data['text']
     callback = {
         'id': 'callback-1',
         'data': review.callback_data(profile, 'delete', 'gmail-nt-test1234'),
@@ -203,7 +203,7 @@ def test_button_signature_and_sample_reason_flow(files, monkeypatch):
     callback['data'] = review.callback_data(profile, 'reason_delete', 'gmail-nt-test1234')
     review.callback(profile, callback, 'telegram:default:78')
     assert '已记录' in review.bind_reason(profile, 77, '这是营销通知，没有安全或账单价值。')
-    state = json.loads((files / 'reviews.json').read_text())
+    state = review._state()
     sample = state['reviews']['gmail-nt-test1234']['examples']['delete'][0]
     assert sample['reason'].startswith('这是营销')
 
@@ -212,7 +212,7 @@ def test_logic_proposal_is_persisted_and_preview_uses_local_filter(files, monkey
     value = proposal()
     value['operations'][0]['logic'] = {
         'version': 1,
-        'all': [{'field': 'from', 'op': 'contains', 'value': 'alerts@example.com'}],
+        'all': [{'field': 'from', 'op': 'contains', 'value': 'alerts@example.invalid'}],
         'any': [{'field': 'subject', 'op': 'contains', 'value': '登录'}],
         'none': [{'field': 'subject', 'op': 'contains', 'value': '安全'}],
     }
@@ -223,7 +223,7 @@ def test_applied_logic_proposal_can_be_rolled_back(files, monkeypatch):
     proposal_id = 'gmail-rp-' + 'e' * 12
     value = proposal()
     value['operations'][0]['logic'] = {
-        'version': 1, 'all': [{'field': 'from', 'op': 'contains', 'value': 'alerts@example.com'}],
+        'version': 1, 'all': [{'field': 'from', 'op': 'contains', 'value': 'alerts@example.invalid'}],
         'any': [{'field': 'subject', 'op': 'contains', 'value': '登录'}], 'none': [],
     }
     record = {'id': proposal_id, 'candidate_id': 'gmail-nt-test1234', 'status': 'applied',
@@ -231,4 +231,4 @@ def test_applied_logic_proposal_can_be_rolled_back(files, monkeypatch):
     review._save(review.PROPOSALS_PATH, {'version': 1, 'proposals': {proposal_id: record}})
     cleanup.save_json(cleanup.RULE_OVERRIDES_PATH, {'version': 2, 'operations': [{'operation': 'add', 'target_rule': 'login_notice', 'name': 'login_notice', 'description': 'x', 'query': value['operations'][0]['query'], 'logic': value['operations'][0]['logic'], 'proposal_id': proposal_id}]})
     assert '已回滚' in review.rollback(proposal_id)
-    assert json.loads((files / 'rule_overrides.json').read_text())['operations'] == []
+    assert cleanup.load_rule_overrides()['operations'] == []

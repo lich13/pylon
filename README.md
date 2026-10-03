@@ -26,11 +26,15 @@ pylon bot-menu sync
 pylon bot-menu check
 ```
 
-两个 Telegram 机器人提供相同的 29 项中文菜单。`/help` 查看全部入口，`/help 命令` 查看参数、示例和操作影响。菜单保留日常状态、更新、监控和必要维护入口；CHH 商品分类不再提供日常管理命令。
+两个 Telegram 机器人提供相同的 11 项中文菜单。`/help` 查看全部入口，`/help 命令` 查看参数、示例和操作影响。菜单只保留 Gmail、更新、监控、Agent 和 SSH 旅行模式。日常状态、任务运行、启停、日志、outbox 和 Chiphell 运维命令已从 Telegram 下线；CLI 与自动调度继续可用。
 
 CHH 分类策略由 `src/pylon/tasks/chiphell/categories.py` 中的 `SILENT_CATEGORIES` 维护，当前为空，不新增类别静默。混合和未归类帖子继续保留，重点比价独立运行。抓取到完整正文仍无法归类的新商品时，向默认本人会话发送一次询问卡片；按钮只记录“继续保留”或“建议静默”，后续由维护者更新规则。相同标题模式不重复询问，同时最多一条待答、每天最多一条新询问；历史帖子不补问。意见和投递记录共用现有 SQLite outbox。
 
-Gmail 的 `/gmail_candidates` 只展示尚未确认的新类型；已确认的内置和自定义类型继续自动清理。对候选使用 `/gmail_candidate 候选ID` 查看元数据，再用 `/gmail_feedback 候选ID 意见` 交给 Grok 生成规则草案。草案通过 `/gmail_rule_preview 提案ID` 预览、`/gmail_rule_apply 提案ID` 确认后写入运行时覆盖层，下一次排程才会按新规则清理；反馈、预览和应用命令都不会删除当前邮件。`/gmail_accept` 和 `/gmail_ignore` 保留为兼容入口。
+`/gmail` 打开批量清理向导。一批最多选择 20 个样本，可来自不同发件人或主题族；分别标记“应删除”或“必须保留”并直接回复原因，整批一次交给 Grok。草案通过按钮查看逻辑、预览、应用、补充样本或拒绝；已应用提案可从“已生效规则”回滚。Grok 只生成受限逻辑 DSL，邮件全文不进入审查数据库。已确认规则继续自动清理，新逻辑规则只匹配生效之后收到的邮件。分析、预览和应用均不删除当前邮件。旧 Gmail 命令统一引导到 `/gmail`。
+
+Gmail 审查、批次、原因、草案和规则覆盖层保存在 `review.sqlite3`。升级只导入一次旧 JSON；旧文件不会覆盖数据库。完成迁移核对后可移除已导入的 JSON，候选与业务去重仍使用原有状态。规则与提案更新共用 SQLite 事务。
+
+`/ssh_travel` 显示当前状态和开启/关闭按钮，也支持 `/ssh_travel 开启`、`/ssh_travel 关闭`。开启后持续放行所有外部 IPv4 的 TCP/22，直到手动关闭；不设置到期时间。保留 SSH 密钥认证、Fail2ban 和北京白名单。CLI 对应 `pylon ssh travel status|open|close`。固定 root 入口只操作 `pylon-ssh-travel` UFW 规则，修改失败自动回滚，启动服务按持久状态恢复。
 
 `/agent_codex 任务描述`、`/agent_grok 任务描述` 收集相关信息后以 sudo 启动指定 CLI，沿用现有登录和模型配置；修改类要求会实际执行。`/agent_status [编号]`、`/agent_logs 编号` 查询进度与结果，`/agent_reply 编号 内容` 或直接回复任务消息可继续同一会话，`/agent_cancel 编号` 停止任务。运行中的补充内容在本轮结束后处理；完成后线程不能恢复，须发起新任务。CLI 任务默认向 WebOps 回报。
 
@@ -38,13 +42,13 @@ Agent 由 `pylon-agent.service` 按需执行，无常驻 Agent。全局串行，
 
 `/update_codex` 和 `/update_grok` 通过固定 sudo 入口运行原生更新，只使用 stable 版本；对应会话进程占用时不执行。更新由独立 systemd 服务执行，最长 15 分钟，不阻塞机器人。重复请求合并，完成后向请求所在机器人回报实装版本和结果；发送失败只重试通知，执行结果不确定时不自动重复安装。CLI 发起的更新向 WebOps 回报。
 
-软件更新监控先抓取并保存原始条目，再由独立 worker 调用现有 Grok 一次完成英文翻译和价值提炼；高价值、普通更新和低价值精简更新均保留通知。Grok 不使用工具且不保存请求；失败时依次回退到配置的 LibreTranslate 兼容公共端点和原文，不影响源站抓取。订阅源网络抖动只记录到状态和日志，连续 3 次失败后才告警；只有已经告警的持续故障恢复时才发送恢复通知。`/status` 与 `/logs` 显示待处理、Grok 成功、降级翻译和原文回退状态。
+软件更新监控先抓取并保存原始条目，再由独立 worker 调用现有 Grok 一次完成英文翻译和价值提炼；高价值、普通更新和低价值精简更新均保留通知。Grok 不使用工具且不保存请求；失败时依次回退到配置的 LibreTranslate 兼容公共端点和原文，不影响源站抓取。订阅源网络抖动只记录到状态和日志，连续 3 次失败后才告警；只有已经告警的持续故障恢复时才发送恢复通知。`pylon status` 与 `pylon logs` 显示待处理、Grok 成功、降级翻译和原文回退状态。
 
 `/updates [all]` 查询软件、系统包候选和最近更新结果，最多缓存 10 分钟。默认机器人只对 `libegl-mesa0`、`libgbm1`、`libgl1-mesa-dri`、`libglx-mesa0`、`mesa-libgallium`、`sosreport`、`thermald` 逐包显示确认按钮；点击前不会安装，库库干不收到确认卡片。FRP、PostgreSQL、Redis、Sub2API、npm 主版本、pylon 依赖和 PyMuPDF/lxml 仍只展示检查结果。sub2api 读取容器内程序自报版本，并核对其与运行进程一致；easy_proxies 无版本接口，仅在确认程序未被替换或挂载覆盖时按镜像标签推定，并标明来源。版本读取失败不会退回旧镜像标签。APT 候选采用系统自动维护的软件源索引，显示索引时间；Docker 只按 Ubuntu 软件源候选判断更新。每 6 小时审查一次候选；没有新候选时静默。安装经过单包模拟升级和白名单校验，不执行 autoremove，不自动重启主机；thermald 和需要重启的结果会明确回报。
 
 关键服务监控涵盖 FRP、OpenList、sing-box、easy_proxies、Certbot、PostgreSQL 18、Redis 8.6，各源每小时拉取一次。首次登记只建立基线，不回放历史消息。首次部署时在暂停软件监控且等待在途执行结束后，以 webops profile 环境运行 `python -m pylon.tasks.software.infrastructure`；后续部署不重新登记已移除的订阅。
 
-原 `/ssh`、`/chiphell`、`/gmail list|accept|ignore` 及“增加监控 URL”“加监控 owner/repo”“移除监控→回复编号”继续可用。`/monitors` 只查看列表，`/remove_monitor` 开启编号移除。Gmail 接受候选只修改后续清理规则。已移除 CHH 分类命令和 root 分类管理入口，旧分类按钮只返回入口已移除，不会修改策略。
+“增加监控 URL”“加监控 owner/repo”“移除监控→回复编号”继续可用。`/monitors` 只查看列表，`/remove_monitor` 开启编号移除。旧 CHH 分类按钮只返回入口已移除，不修改策略。
 
 机器人启动时后台核对默认、所有私聊和本人会话的默认/中文/英文菜单，统一使用中文，自动替换旧命令并设置菜单按钮。网络失败或限流按退避策略重试，不阻塞消息收发。`bot-menu check` 只读核对，不一致时退出码为 1；`bot-menu sync` 仅更新差异并读回确认。命令定义统一维护在 `src/pylon/command_catalog.py`。
 

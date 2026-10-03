@@ -657,6 +657,9 @@ def utc_now() -> str:
 
 
 def load_json(path: Path, default: Any) -> Any:
+    if path in {RULE_OVERRIDES_PATH, EXTRA_RULES_PATH}:
+        from pylon.tasks.gmail import store
+        return store.read(path, default)
     if not path.exists():
         return default
     try:
@@ -666,6 +669,10 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def save_json(path: Path, data: Any) -> None:
+    if path in {RULE_OVERRIDES_PATH, EXTRA_RULES_PATH}:
+        from pylon.tasks.gmail import store
+        store.write(path, data)
+        return
     if path == NEW_TYPE_STATE_PATH and events.defer_json(path, data):
         return
     from pylon.shared.state_json import save_atomic
@@ -1205,9 +1212,9 @@ def get_message_metadata(service, message_id: str) -> dict[str, Any]:
 def filter_logic_message_ids(service, rule: dict[str, Any], ids: list[str]) -> tuple[list[str], int]:
     """Apply a reviewed rule locally after Gmail's narrow coarse query."""
     program = rule.get("logic")
-    if not program:
+    if not program and not rule.get("effective_after_utc"):
         return ids, 0
-    from .logic import get_message_full, matches, parse_date_ms
+    from pylon.tasks.gmail.logic import get_message_full, matches, parse_date_ms
     effective_ms = parse_date_ms(str(rule.get("effective_after_utc") or ""))
     accepted: list[str] = []
     rejected = 0
@@ -1220,7 +1227,7 @@ def filter_logic_message_ids(service, rule: dict[str, Any], ids: list[str]) -> t
             if effective_ms and int(message.get("received_at_ms") or 0) < effective_ms:
                 rejected += 1
                 continue
-            if matches(program, message):
+            if not program or matches(program, message):
                 accepted.append(mid)
             else:
                 rejected += 1
@@ -1311,7 +1318,7 @@ def main(argv: list[str] | None = None) -> int:
     for rule in rules:
         ids = list_message_ids(service, rule["query"], args.max_per_rule)
         logic_rejected = 0
-        if rule.get("logic"):
+        if rule.get("logic") or rule.get("effective_after_utc"):
             ids, logic_rejected = filter_logic_message_ids(service, rule, ids)
         new_ids = [mid for mid in ids if mid not in seen_ids]
         for mid in new_ids:

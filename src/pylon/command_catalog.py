@@ -24,20 +24,7 @@ class Command:
 
 COMMANDS = {item.name: item for item in (
     Command('help', '查看全部功能；使用 /help 命令查看详细用法与示例', 'help', argument='[命令]',
-            example='/help run', detail='省略命令时列出全部入口；命令前的 / 可省略。'),
-    Command('status', '查看全部任务的运行状态、下次执行时间及通知异常', 'status',
-            detail='时间均为北京时间；已暂停、运行中、无变化、业务失败、待补发分别显示。任务编号也可用于运行、启停和日志查询。'),
-    Command('run', '立即运行指定任务，支持任务编号或任务 ID', 'task', 'run', '任务编号或任务ID', '/run 8',
-            '提交一次正式执行，可用 /status 和 /logs 核对结果。同一任务不重叠；暂停排程后仍可手动运行，且不会恢复排程。'
-            '报价任务会绕过时段限制。Gmail 和数据清理任务会按既定规则实际删除邮件或过期数据。'),
-    Command('pause', '暂停指定任务或全部排程；Chiphell 同时暂停抓取', 'task', 'pause', '任务编号或任务ID或all', '/pause 7',
-            'all 表示全部定时任务。普通任务只暂停后续排程，不强杀在途执行；Chiphell 联动停止抓取和定时投递。已入队的通知仍会发送。'),
-    Command('resume', '恢复指定任务或全部排程；Chiphell 同时恢复抓取', 'task', 'resume', '任务编号或任务ID或all', '/resume 7',
-            'all 表示全部定时任务。恢复后可能合并补跑错过的排程；Chiphell 同时恢复抓取和投递。Cookie 或健康状态不满足要求时会提示失败。'),
-    Command('logs', '查看指定任务的最近执行日志', 'task', 'logs', '任务编号或任务ID', '/logs 8',
-            '显示最近的脱敏日志，内容过长时保留末尾；只查询，不运行任务。'),
-    Command('outbox', '查看待发、失败和回执不确定的通知', 'outbox',
-            detail='显示待发送、发送中、失败和回执不确定的数量及最近记录。只查询；网络失败按队列策略补发，回执不确定不会自动重发。'),
+            example='/help gmail', detail='省略命令时列出全部入口；命令前的 / 可省略。'),
     Command('updates', '查看腾讯云可更新软件、系统包和最近升级结果', 'updates', argument='[all]', example='/updates\n/updates all',
             detail='省略参数查看摘要；all 展示全部软件及系统包候选。默认机器人会为允许点选的系统小包显示更新和跳过按钮。检查结果最多缓存 10 分钟并注明时间，APT 使用系统自动刷新的软件源索引。检查失败显示未确认，不会当作最新版。查询不安装软件。每周一北京时间 09:00 向库库干汇总维护事项，无更新且无异常时静默。'),
     Command('update_codex', '使用 sudo 更新腾讯云 Codex CLI，完成后自动回报', 'software_update', 'codex',
@@ -69,38 +56,11 @@ COMMANDS = {item.name: item for item in (
             '识别支持的发布源，保存后校验配置；重复源不会重复添加。不支持的网站会明确提示。原“增加监控 URL”“加监控 owner/repo”仍可使用。'),
     Command('remove_monitor', '列出可移除的监控，回复对应编号完成移除', 'monitor', 'remove',
             detail='先发送此命令取得列表，再单独回复编号。编号对应此次列表中的项目；成功后结束本次选择。原“移除监控”仍可使用。'),
-    Command('gmail_candidates', '查看待确认的新邮件类型候选', 'gmail', 'list',
-            detail='兼容入口：只列出待确认候选及元数据。日常操作请使用 /gmail_review。', menu=False),
-    Command('gmail_review', '打开 Gmail 清理向导（按钮操作）', 'gmail', 'review',
-            detail='按卡片选择样本，标记应删除或必须保留，回复原因后交给 Grok 生成受限逻辑规则。预览和分析不会删除邮件；应用按钮只影响下一次排程。'),
-    Command('gmail_rules', '查看已生效 Gmail 规则及版本', 'gmail', 'rules',
-            detail='查看内置规则、已确认规则和运行时逻辑覆盖层版本；只读，不删除邮件。'),
-    Command('gmail_candidate', '查看单条新邮件类型的元数据和摘要', 'gmail', 'candidate', '候选ID', '/gmail_candidate gmail-nt-abc123',
-            '兼容入口：显示发件人、主题族、日期、摘要、标签和样本数。向导中可直接查看完整文本样本。', menu=False),
-    Command('gmail_feedback', '提交一条意见并交给 Grok 生成规则草案', 'gmail', 'feedback', '候选ID 意见', '/gmail_feedback gmail-nt-abc123 这是登录提醒，保留安全告警，删除普通通知',
-            '兼容入口：每个候选独立处理；重复消息不会重复启动任务。Grok 只生成草案，不删除邮件。', menu=False),
-    Command('gmail_review_status', '查看 Gmail 候选的 Grok 审查和草案状态', 'gmail', 'review_status', '[候选ID]', '/gmail_review_status gmail-nt-abc123',
-            '兼容入口：显示意见、Grok 任务、提案编号和失败原因。向导入口请用 /gmail_review。', menu=False),
-    Command('gmail_rule_preview', '预览 Gmail 规则草案的当前影响', 'gmail', 'rule_preview', '提案ID', '/gmail_rule_preview gmail-rp-abc123456789',
-            '兼容入口：重新读取 Gmail，展示预计匹配数量和样本；只读，不删除邮件。', menu=False),
-    Command('gmail_rule_apply', '确认应用 Gmail 规则草案', 'gmail', 'rule_apply', '提案ID', '/gmail_rule_apply gmail-rp-abc123456789',
-            '兼容入口：再次校验规则并写入覆盖层；只影响下一次排程，当前不会删除邮件。', menu=False),
-    Command('gmail_rule_reject', '拒绝 Gmail 规则草案并保留候选', 'gmail', 'rule_reject', '提案ID', '/gmail_rule_reject gmail-rp-abc123456789',
-            '兼容入口：拒绝后不修改规则、不删除邮件，候选回到待确认状态。', menu=False),
-    Command('gmail_rule_rollback', '回滚已应用的 Gmail 规则提案', 'gmail', 'rule_rollback', '提案ID', '/gmail_rule_rollback gmail-rp-abc123456789',
-            '兼容维护入口：移除指定提案写入的运行时覆盖层；不会删除邮件。', menu=False),
-    Command('gmail_accept', '接受指定候选，加入后续清理规则，本次不删除邮件', 'gmail', 'accept', '候选ID',
-            '/gmail_accept gmail-nt-abc123', '兼容旧的简单接受快捷方式，不经过 Grok；只修改未来清理规则。', menu=False),
-    Command('gmail_ignore', '忽略指定候选，保留现有清理规则', 'gmail', 'ignore', '候选ID',
-            '/gmail_ignore gmail-nt-abc123', '兼容旧入口：记录忽略选择，不新增清理规则、不删除邮件。', menu=False),
-    Command('chiphell_status', '查看 Chiphell 抓取、待发队列和健康状态', 'chiphell', 'status',
-            detail='显示抓取与投递排程、待发数量、最近健康结果。已暂停是运行状态，不等于抓取失败。'),
-    Command('chiphell_test', '测试 Chiphell 实际页面抓取及登录、代理状态', 'chiphell', 'test',
-            detail='通过现有家宽代理执行一次页面检查并更新健康结果。抓取锁被占用时提示忙碌，不会显示为测试通过；不会重置历史去重。'),
-    Command('chiphell_pause', '暂停 Chiphell 抓取和定时投递', 'chiphell', 'pause',
-            detail='联动停止抓取服务与投递排程，保留 Cookie、去重和待发记录。已进入公共通知队列的消息仍可发送。'),
-    Command('chiphell_resume', '恢复 Chiphell 抓取和定时投递', 'chiphell', 'resume',
-            detail='检查现有 Cookie、健康与去重状态后恢复抓取和投递；条件不满足时返回失败原因。'),
+    Command('gmail', '批量选择邮件样本、生成逻辑规则并预览应用', 'gmail', 'review',
+            detail='一批最多 20 个样本，可跨多个发件人；点击应删除或必须保留后直接发送原因，选好后一次提交 Grok。预览和应用不删除当前邮件，新规则只用于后续收到的邮件；已确认规则照常自动清理。'),
+    Command('ssh_travel', '查看或切换外地 SSH 放行状态', 'ssh_travel', argument='[开启|关闭]',
+            example='/ssh_travel\n/ssh_travel 开启\n/ssh_travel 关闭',
+            detail='开启后持续允许所有外部 IPv4 访问 SSH TCP/22，不自动关闭；使用关闭按钮或命令撤销。保留密钥认证、Fail2ban 和北京白名单，不开放其他端口。'),
     Command('ssh_status', '查看 SSH 白名单及维护状态', 'ssh', 'status',
             detail='只读查看北京网段数量、内核生效数量、可信登录来源及是否存在待恢复事务。'),
     Command('ssh_check', '检查指定 IPv4 是否符合当前 SSH 白名单规则', 'ssh', 'check', 'IPv4', '/ssh_check 111.201.1.2',
@@ -110,6 +70,15 @@ COMMANDS = {item.name: item for item in (
     Command('ssh_refresh', '更新北京 IP 段；校验成功后替换，失败保留原白名单', 'ssh', 'refresh',
             detail='提交一次下载与校验，检查网段格式、数量和当前管理来源后原子替换；失败保留旧数据。结果通过 /status 或该任务日志查看。'),
 )}
+
+MENU = ('gmail', 'updates', 'monitors', 'add_monitor', 'remove_monitor', 'ssh_travel',
+        'agent_codex', 'agent_grok', 'update_codex', 'update_grok', 'help')
+from dataclasses import replace
+COMMANDS = {name: replace(COMMANDS[name], menu=name in MENU)
+            for name in (*MENU, *(key for key in COMMANDS if key not in MENU))}
+RETIRED = {'status', 'run', 'pause', 'resume', 'logs', 'outbox', 'chiphell_status',
+           'chiphell_test', 'chiphell_pause', 'chiphell_resume'}
+RETIRED_MESSAGE = '该入口已下线，请使用 /help'
 
 
 def menu_commands() -> list[dict[str, str]]:
@@ -123,7 +92,11 @@ def task_list() -> str:
 def help_text(name: str = '') -> str:
     name = name.strip().removeprefix('/').split('@', 1)[0]
     if not name:
-        return 'pylon 命令\n\n' + '\n'.join(f'/{c.name} — {c.description}' for c in COMMANDS.values()) + '\n\n详细用法：/help 命令，例如 /help run'
+        return 'pylon 命令\n\n' + '\n'.join(f'/{c.name} — {c.description}' for c in COMMANDS.values() if c.menu) + '\n\n详细用法：/help 命令，例如 /help gmail'
+    if name in RETIRED:
+        return RETIRED_MESSAGE
+    if name.startswith('gmail_'):
+        return 'Gmail 操作已合并，请使用 /gmail'
     item = COMMANDS.get(name)
     if item is None:
         return '没有这个命令。发送 /help 查看可用命令。'
