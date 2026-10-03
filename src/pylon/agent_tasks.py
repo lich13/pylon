@@ -39,7 +39,7 @@ def render(row, *, details=True):
         if isinstance(review, dict):
             if review.get('proposal_id'):
                 lines.append(f"Gmail 规则草案 {review['proposal_id']}：{review.get('summary', '已生成')}\n"
-                             f"请先使用 /gmail_rule_preview {review['proposal_id']}，确认后使用 /gmail_rule_apply {review['proposal_id']}。")
+                             "请打开 /gmail，先预览再通过按钮确认应用。")
             elif review.get('status') == 'waiting' and review.get('question'):
                 lines.append('Gmail 审查需要补充：' + review['question'])
             elif review.get('error'):

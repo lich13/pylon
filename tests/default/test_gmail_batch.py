@@ -56,6 +56,9 @@ def test_cross_candidate_batch_one_task_and_restart(files, monkeypatch):
     assert invoke.call_count == 1
     args = invoke.call_args
     assert args.args[:2] == ('gmail-run', 'grok')
+    from pylon.admin.agent_state import request_key, prompt_text
+    request_key(args.args[3], args.args[2])
+    prompt_text(json.loads(args.kwargs['text'])['prompt'])
     bundle = json.loads(args.kwargs['text'])
     assert len(bundle['examples']) == 3
     assert all('body' in x for x in bundle['examples'])

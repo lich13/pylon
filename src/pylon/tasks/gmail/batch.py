@@ -274,7 +274,7 @@ def submit(batch_id, profile):
                      'sample_count': len(content), 'sample': {}}
         prompt = review._prompt(candidate, batch['feedback'])
         prompt += '\n这是一次整批审查，包含多个发件人和主题族。为本批所有应删除样本生成 1 至 20 个窄范围规则单元，所有必须保留样本都不能命中。每项 sample_validation.keep 必须列出本批全部保留样本。每个规则的 from 粗筛与逻辑 from 条件必须一致。不要按候选逐个提交。'
-        request = 'cli:' + hashlib.sha256(f'gmail-batch:{batch_id}:{batch["revision"]}'.encode()).hexdigest()
+        request = 'cli:' + hashlib.sha256(f'gmail-batch:{batch_id}:{batch["revision"]}'.encode()).hexdigest()[:32]
         task_id = batch.get('task_id')
         active = False
         if task_id:
