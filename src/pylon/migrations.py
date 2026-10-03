@@ -57,14 +57,18 @@ def migrate_profile(root: Path) -> None:
         save_atomic(alert, migrated)
 
 
-def main() -> None:
-    migrate_profile(profile_root('default'))
-    rename_xianbao(Outbox())
+def migrate_gmail() -> None:
     from .tasks.gmail import review, cleanup, store
     store.migrate([(review.REVIEWS_PATH, {"version": 1, "reviews": {}}),
                    (review.PROPOSALS_PATH, {"version": 1, "proposals": {}}),
                    (cleanup.RULE_OVERRIDES_PATH, {"version": 1, "operations": []}),
                    (cleanup.EXTRA_RULES_PATH, {"version": 1, "rules": []})])
+
+
+def main() -> None:
+    migrate_profile(profile_root('default'))
+    rename_xianbao(Outbox())
+    migrate_gmail()
     from .tasks.quotes.health import suppress_legacy_notices
     suppress_legacy_notices(Outbox())
     old_lock = home() / 'run' / (OLD_XIANBAO + '.lock')
@@ -74,4 +78,8 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gmail-only', action='store_true')
+    args = parser.parse_args()
+    migrate_gmail() if args.gmail_only else main()

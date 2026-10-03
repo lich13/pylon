@@ -272,7 +272,7 @@ def run_turn(row, inputs, remaining):
             if path.is_symlink() or path.stat().st_uid != os.geteuid() or path.stat().st_mode & 0o077:
                 raise PermissionError('unsafe Gmail sample input')
             bundle = json.loads(path.read_text())
-            expanded.append(bundle['prompt'] + '\n<untrusted_mail_samples>\n' + json.dumps(bundle['examples'], ensure_ascii=False) + '\n</untrusted_mail_samples>')
+            expanded.append(bundle['prompt'] + '\n<gmail_rule_context>\n' + json.dumps(bundle.get('context') or {}, ensure_ascii=False) + '\n</gmail_rule_context>\n<untrusted_mail_samples>\n' + json.dumps(bundle['examples'], ensure_ascii=False) + '\n</untrusted_mail_samples>')
         else:
             expanded.append(value)
     inputs = expanded

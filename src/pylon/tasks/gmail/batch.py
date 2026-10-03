@@ -272,7 +272,7 @@ def submit(batch_id, profile):
         content = examples(batch)
         candidate = {'id': batch_id, 'from': '本批跨发件人样本', 'subject_family': '批量逻辑规则',
                      'sample_count': len(content), 'sample': {}}
-        prompt = review._prompt(candidate, batch['feedback'])
+        prompt = review._prompt(candidate, batch['feedback'], include_rules=False)
         prompt += '\n这是一次整批审查，包含多个发件人和主题族。为本批所有应删除样本生成 1 至 20 个窄范围规则单元，所有必须保留样本都不能命中。每项 sample_validation.keep 必须列出本批全部保留样本。每个规则的 from 粗筛与逻辑 from 条件必须一致。不要按候选逐个提交。'
         request = 'cli:' + hashlib.sha256(f'gmail-batch:{batch_id}:{batch["revision"]}'.encode()).hexdigest()[:32]
         task_id = batch.get('task_id')
@@ -283,7 +283,7 @@ def submit(batch_id, profile):
         if active and batch.get('profile') != profile:
             raise ValueError('请回到发起本批分析的机器人继续提交')
         result = agent_tasks.invoke('gmail-reply' if active else 'gmail-run', task_id if active else 'grok', profile, request,
-                                    text=json.dumps({'prompt': prompt, 'examples': content}, ensure_ascii=False))
+                                    text=json.dumps({'prompt': prompt, 'examples': content, 'context': {'current_rules': cleanup.all_rules()}}, ensure_ascii=False))
         batch.update(task_id=result['id'], profile=profile, status='reviewing',
                      analysis_hash=_digest(batch), analysis_rules_hash=review._rule_digest(),
                      analysis_samples={x['message_id']: fingerprint(x) for x in content})

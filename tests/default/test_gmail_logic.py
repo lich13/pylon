@@ -81,3 +81,9 @@ def test_full_message_reads_text_attachment_and_decodes_headers():
     assert result['from'].startswith('发件')
     assert '你好' in result['body'] and 'Text attachment' in result['body']
     assert result['attachment_names'] == ['note.txt']
+
+
+def test_sender_address_equality_handles_display_name():
+    from pylon.tasks.gmail.logic import matches
+    assert matches({'version': 1, 'all': [{'field': 'from', 'op': 'equals', 'value': 'fixture@example.invalid'}], 'any': [], 'none': []},
+                   {'from': 'Fixture Name <fixture@example.invalid>'})

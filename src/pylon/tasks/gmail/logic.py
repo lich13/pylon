@@ -216,6 +216,10 @@ def validate_program(program: Any, *, require_exclusion: bool = False) -> dict[s
 
 
 def _values(message: dict[str, Any], field: str) -> list[str]:
+    if field in {"from", "to", "cc"}:
+        from email.utils import getaddresses
+        raw = str(message.get(field) or "")
+        return [raw, *[address for _, address in getaddresses([raw]) if address]]
     if field == "body":
         return [str(message.get("body") or ""), str(message.get("body_text") or ""), str(message.get("body_html_text") or "")]
     if field == "labels":

@@ -32,7 +32,7 @@ CHH 分类策略由 `src/pylon/tasks/chiphell/categories.py` 中的 `SILENT_CATE
 
 `/gmail` 打开批量清理向导。一批最多选择 20 个样本，可来自不同发件人或主题族；分别标记“应删除”或“必须保留”并直接回复原因，整批一次交给 Grok。草案通过按钮查看逻辑、预览、应用、补充样本或拒绝；已应用提案可从“已生效规则”回滚。Grok 只生成受限逻辑 DSL，邮件全文不进入审查数据库。已确认规则继续自动清理，新逻辑规则只匹配生效之后收到的邮件。分析、预览和应用均不删除当前邮件。旧 Gmail 命令统一引导到 `/gmail`。
 
-Gmail 审查、批次、原因、草案和规则覆盖层保存在 `review.sqlite3`。升级只导入一次旧 JSON；旧文件不会覆盖数据库。完成迁移核对后可移除已导入的 JSON，候选与业务去重仍使用原有状态。规则与提案更新共用 SQLite 事务。
+Gmail 审查、批次、原因、草案和规则覆盖层保存在 `review.sqlite3`。升级只导入一次旧 JSON；旧文件不会覆盖数据库。本次仅迁移 Gmail 时使用 `python -m pylon.migrations --gmail-only`；完成核对后可移除已导入的 JSON，候选与业务去重仍使用原有状态。规则与提案更新共用 SQLite 事务。
 
 `/ssh_travel` 显示当前状态和开启/关闭按钮，也支持 `/ssh_travel 开启`、`/ssh_travel 关闭`。开启后持续放行所有外部 IPv4 的 TCP/22，直到手动关闭；不设置到期时间。保留 SSH 密钥认证、Fail2ban 和北京白名单。CLI 对应 `pylon ssh travel status|open|close`。固定 root 入口只操作 `pylon-ssh-travel` UFW 规则，修改失败自动回滚，启动服务按持久状态恢复。
 

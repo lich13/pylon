@@ -146,3 +146,14 @@ def test_button_authorization_and_replay(files, monkeypatch):
     payload['data'] = payload['data'][:-1] + ('0' if payload['data'][-1] != '0' else '1')
     with pytest.raises(ValueError, match='失效'):
         batch.callback('default', payload)
+
+
+def test_large_production_rule_context_uses_private_bundle(files, monkeypatch):
+    prepare(files, monkeypatch)
+    long_rules = [{"name": "fixture_rule", "query": "-is:starred from:fixture@example.invalid " + "subject:fixture " * 1800}]
+    monkeypatch.setattr(cleanup, 'all_rules', lambda: long_rules)
+    invoke = Mock(return_value={'id': 'c' * 32}); monkeypatch.setattr(agent_tasks, 'invoke', invoke)
+    batch.submit(batch.state()['active'], 'default')
+    bundle = json.loads(invoke.call_args.kwargs['text'])
+    assert len(bundle['prompt'].encode()) < 16000
+    assert bundle['context']['current_rules'] == long_rules

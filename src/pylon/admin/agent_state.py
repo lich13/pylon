@@ -190,8 +190,10 @@ def gmail_input(target, profile, key, value, *, resume=False):
     if not isinstance(value, str) or len(value.encode()) > GMAIL_INPUT_LIMIT or '\0' in value:
         raise ValueError('完整样本过大，请减少选定样本后重试；未截断原文')
     bundle = json.loads(value)
-    if not isinstance(bundle, dict) or set(bundle) != {'prompt', 'examples'} or not isinstance(bundle['examples'], list):
+    if not isinstance(bundle, dict) or not {'prompt', 'examples'} <= set(bundle) or set(bundle) - {'prompt', 'examples', 'context'} or not isinstance(bundle.get('examples'), list):
         raise ValueError('invalid Gmail review input')
+    if 'context' in bundle and (not isinstance(bundle['context'], dict) or set(bundle['context']) != {'current_rules'} or not isinstance(bundle['context']['current_rules'], list)):
+        raise ValueError('invalid Gmail rule context')
     prompt_text(bundle['prompt'])
     if len(bundle['examples']) > 20:
         raise ValueError('一次最多分析 20 个完整样本')
