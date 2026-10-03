@@ -26,6 +26,25 @@ ALLOWED_OPS = {"contains", "equals", "starts_with", "ends_with", "not_contains",
 MAX_DEPTH = 5
 MAX_NODES = 40
 
+# Share the evaluator's vocabulary with the agent-facing output contract.
+NODE_SCHEMA = {'anyOf': [
+    {'type': 'object', 'additionalProperties': False,
+     'properties': {'field': {'type': 'string', 'enum': sorted(ALLOWED_FIELDS)},
+                    'op': {'type': 'string', 'enum': sorted(ALLOWED_OPS)},
+                    'value': {'type': ['string', 'boolean', 'number']}},
+     'required': ['field', 'op', 'value']},
+    *[{'type': 'object', 'additionalProperties': False,
+       'properties': {key: {'type': 'array', 'minItems': 1, 'maxItems': MAX_NODES,
+                            'items': {'$ref': '#/$defs/gmail_node'}}},
+       'required': [key]} for key in ('all', 'any', 'none')],
+]}
+PROGRAM_SCHEMA = {'type': 'object', 'additionalProperties': False,
+                  'properties': {'version': {'type': 'integer', 'const': 1},
+                                 **{key: {'type': 'array', 'maxItems': MAX_NODES,
+                                          'items': {'$ref': '#/$defs/gmail_node'}}
+                                    for key in ('all', 'any', 'none')}},
+                  'required': ['version', 'all', 'any', 'none']}
+
 
 class _TextParser(HTMLParser):
     def __init__(self):

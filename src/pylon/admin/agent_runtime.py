@@ -17,12 +17,14 @@ from urllib.parse import quote
 
 from . import agent_state as state
 from . import software
+from ..tasks.gmail.logic import NODE_SCHEMA, PROGRAM_SCHEMA
 
 CODEX_HOME = Path('/root/.codex')
 GROK_HOME = Path('/root/.grok')
 UNIT = 'pylon-agent.service'
 SCHEMA = {
     'type': 'object', 'additionalProperties': False,
+    '$defs': {'gmail_node': NODE_SCHEMA},
     'properties': {
         'status': {'type': 'string', 'enum': ['completed', 'needs_input', 'failed']},
         'summary': {'type': 'string'}, 'question': {'type': 'string'},
@@ -40,8 +42,12 @@ SCHEMA = {
                         'target_rule': {'type': 'string'}, 'name': {'type': 'string'},
                         'description': {'type': 'string'}, 'query': {'type': 'string'},
                         'reason': {'type': 'string'},
-                        'logic': {'type': 'object'}, 'effective_after_utc': {'type': 'string'},
-                        'sample_validation': {'type': 'object'},
+                        'logic': PROGRAM_SCHEMA, 'effective_after_utc': {'type': 'string'},
+                        'sample_validation': {'type': 'object', 'additionalProperties': False,
+                            'properties': {'delete': {'type': 'array', 'items': {'type': 'string'}},
+                                           'keep': {'type': 'array', 'items': {'type': 'string'}},
+                                           'difference': {'type': 'string'}},
+                            'required': ['delete', 'keep', 'difference']},
                     },
                     'required': ['operation', 'target_rule', 'name', 'description', 'query', 'reason']}},
                 'impact': {'type': 'array', 'items': {'type': 'string'}},

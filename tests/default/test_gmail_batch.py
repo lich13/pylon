@@ -45,6 +45,22 @@ def generated():
             'impact': ['未来自动通知'], 'verification': ['验证正反样本']}
 
 
+def test_agent_contract_includes_executable_nested_dsl_example(files):
+    from pylon.tasks.gmail.logic import validate_program, matches
+    from pylon.admin import agent_runtime
+    prompt = review._prompt(candidate(), [], include_rules=False)
+    program = json.loads(next(line for line in prompt.splitlines() if line.startswith('{"version":1')))
+    validate_program(program, require_exclusion=True)
+    message = {'from': 'Fixture <sender@example.invalid>', 'subject': '自动构建成功 fixture',
+               'body': 'fixture', 'attachment_names': []}
+    assert matches(program, message)
+    assert not matches(program, {**message, 'attachment_names': ['fixture.pdf']})
+    node = agent_runtime.SCHEMA['$defs']['gmail_node']['anyOf'][0]
+    assert set(node['required']) == {'field', 'op', 'value'}
+    assert node['additionalProperties'] is False
+    assert 'exists' in node['properties']['op']['enum']
+
+
 def test_cross_candidate_batch_one_task_and_restart(files, monkeypatch):
     prepare(files, monkeypatch)
     invoke = Mock(return_value={'id': 'b' * 32})

@@ -101,7 +101,11 @@ def test_feedback_is_idempotent_and_starts_one_grok_task(files, monkeypatch):
     assert '提交 Grok' in result
     duplicate = review.start_feedback('gmail-nt-test1234', '这是登录提醒，保留安全告警', 'default', 'telegram:default:1')
     assert '已经受理' in duplicate
-    assert [call[0] for call in calls] == ['run']
+    assert [call[0] for call in calls] == ['gmail-run']
+    bundle = json.loads(calls[0][2])
+    from pylon.admin.agent_state import prompt_text
+    prompt_text(bundle['prompt'])
+    assert len(bundle['context']['current_rules']) == len(cleanup.all_rules())
     state = json.loads((files / 'new_type_candidates.json').read_text())
     assert state['candidates']['gmail-nt-test1234']['status'] == 'reviewing'
     review_state = review._state()
