@@ -6,7 +6,14 @@ ARTIFACT_DIR="${2:-/tmp/chiphell-frp-proxy-artifacts}"
 FRPC_IMAGE='chiphell-frpc:20260713'
 ADMIN_IMAGE='chiphell-proxy-admin:20260713'
 
-rm -rf -- "$ARTIFACT_DIR"
+if [[ "$SOURCE_DIR" != /* || "$ARTIFACT_DIR" != /* ]]; then
+  printf 'Source and artifact directories must be absolute.\n' >&2
+  exit 64
+fi
+if [[ -e "$ARTIFACT_DIR" || -L "$ARTIFACT_DIR" ]]; then
+  printf 'Choose a new artifact directory; existing outputs are preserved.\n' >&2
+  exit 64
+fi
 install -d -m 755 "$ARTIFACT_DIR"
 
 docker buildx build \
