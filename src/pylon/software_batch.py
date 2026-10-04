@@ -284,4 +284,3 @@ def recover_submissions(box):
         else:
             sync_result(box, {'id': '', 'request_id': batch['request_id'], 'target': 'apt-batch:',
                               'status': 'uncertain', 'detail': '提交中断，root 未找到原批次；未自动重复安装，请核对。'})
-
