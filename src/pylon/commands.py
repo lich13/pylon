@@ -302,8 +302,9 @@ def handle(profile: str, text: str) -> str:
         if item.route == 'updates':
             if argument not in {'', 'all'}:
                 return help_text(name)
-            from .software_updates import inventory_text, pending_keyboard
-            return encode_response(inventory_text(full=argument == 'all'), pending_keyboard(profile))
+            from .software_updates import inventory_payload
+            payload = inventory_payload(profile, full=argument == 'all')
+            return encode_response(payload['text'], payload['reply_markup'])
         if item.route == 'software_update':
             from .software_updates import request_update
             return request_update(item.action, profile)
@@ -334,7 +335,7 @@ def handle_callback(profile: str, payload: dict) -> str:
     elif value.startswith('g3|'):
         from .tasks.gmail import batch
         result = batch.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
-    elif value.startswith('su1|'):
+    elif value.startswith(('su1|', 'su2|')):
         from . import software_updates
         result = software_updates.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
     elif value.startswith('ch1|') or value.startswith('ch2|'):

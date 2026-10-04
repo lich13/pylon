@@ -63,6 +63,15 @@ class Outbox:
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS software_update_batches (
+                    id TEXT PRIMARY KEY, profile TEXT NOT NULL, items TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'draft', request_id TEXT NOT NULL UNIQUE,
+                    root_id TEXT, detail TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS software_update_views (
+                    id TEXT PRIMARY KEY, profile TEXT NOT NULL, candidates TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS software_reviews_status
                     ON software_reviews(status,updated_at);
             """)
@@ -79,6 +88,17 @@ class Outbox:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():
                         raise
+            columns = {row[1] for row in db.execute("PRAGMA table_info(software_reviews)")}
+            for column, definition in (("selected", "INTEGER NOT NULL DEFAULT 0"),
+                                       ("selection_epoch", "INTEGER NOT NULL DEFAULT 0"),
+                                       ("batch_id", "TEXT"),
+                                       ("available", "INTEGER NOT NULL DEFAULT 1")):
+                if column not in columns:
+                    try:
+                        db.execute(f"ALTER TABLE software_reviews ADD COLUMN {column} {definition}")
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
         os.chmod(self.path, 0o600)
 
     @contextlib.contextmanager
@@ -220,7 +240,7 @@ class Outbox:
 
     def update_software_review(self, review_id: str, **changes) -> dict:
         allowed = {"status", "request_id", "event_id", "detail", "candidate_version",
-                   "installed_version", "risk", "source"}
+                   "installed_version", "risk", "source", "selected", "selection_epoch", "batch_id", "available"}
         unknown = set(changes) - allowed
         if unknown:
             raise ValueError("unsupported software review fields")
@@ -239,3 +259,15 @@ class Outbox:
                 raise KeyError(review_id)
             row = db.execute("SELECT * FROM software_reviews WHERE id=?", (review_id,)).fetchone()
             return dict(row)
+
+    def software_selection(self, profile: str = 'default') -> list[dict]:
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM software_reviews WHERE profile=? AND selected=1 AND available=1 ORDER BY id",
+                (profile,))]
+
+    def software_batches(self, profile: str = 'default') -> list[dict]:
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM software_update_batches WHERE profile=? ORDER BY created_at DESC LIMIT 20",
+                (profile,))]

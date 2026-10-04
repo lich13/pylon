@@ -49,8 +49,8 @@ def test_every_menu_entry_reaches_its_existing_operation(name, monkeypatch):
     from pylon import software_updates, ssh_travel
     travel = Mock(return_value={'text': '旅行状态'})
     monkeypatch.setattr(ssh_travel, 'command', travel)
-    inventory, update = Mock(return_value='清单'), Mock(return_value='已提交')
-    monkeypatch.setattr(software_updates, 'inventory_text', inventory)
+    inventory, update = Mock(return_value={'text': '清单', 'reply_markup': None}), Mock(return_value='已提交')
+    monkeypatch.setattr(software_updates, 'inventory_payload', inventory)
     monkeypatch.setattr(software_updates, 'request_update', update)
     from pylon import agent_tasks
     agent = Mock(return_value='Agent 已提交')
@@ -81,7 +81,7 @@ def test_every_menu_entry_reaches_its_existing_operation(name, monkeypatch):
     elif item.route == 'ssh_travel':
         travel.assert_called_once_with('default', '')
     elif item.route == 'updates':
-        inventory.assert_called_once_with(full=False)
+        inventory.assert_called_once_with('default', full=False)
     elif item.route == 'software_update':
         update.assert_called_once_with(item.action, 'default')
     elif item.route == 'agent':

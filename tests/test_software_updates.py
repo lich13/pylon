@@ -8,10 +8,17 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
-from pylon import commands, software_inventory as inventory, software_updates as updates
+from pylon import commands, software_batch, software_inventory as inventory, software_updates as updates
 from pylon.admin import software as admin
 from pylon.outbox import Outbox
 from pylon.tasks.software import infrastructure, maintenance, monitor
+
+
+@pytest.fixture(autouse=True)
+def software_batch_profile(monkeypatch):
+    monkeypatch.setattr(software_batch, 'profile_env',
+                        lambda profile: {'TELEGRAM_BOT_TOKEN': 'fixture-token',
+                                         'TELEGRAM_HOME_CHANNEL': '123'})
 
 
 @pytest.fixture
@@ -206,11 +213,12 @@ def test_update_routes_do_not_accept_arguments(monkeypatch):
 
 
 def test_inventory_optional_argument_is_read_only(monkeypatch):
-    read = Mock(return_value='list')
-    monkeypatch.setattr(updates, 'inventory_text', read)
+    read = Mock(return_value={'text': 'list', 'reply_markup': None})
+    monkeypatch.setattr(updates, 'inventory_payload', read)
     assert commands.handle('default', '/updates') == 'list'
     assert commands.handle('default', '/updates all') == 'list'
     assert '用法：' in commands.handle('default', '/updates upgrade')
+    assert [x.args for x in read.call_args_list] == [('default',), ('default',)]
     assert [x.kwargs for x in read.call_args_list] == [{'full': False}, {'full': True}]
 
 
@@ -245,7 +253,7 @@ def test_publish_candidates_is_one_card_per_fingerprint_and_idempotent(tmp_path)
         event = db.execute('SELECT profile,job_id,payload FROM events').fetchone()
     payload = json.loads(event['payload'])
     assert event['profile'] == 'default' and event['job_id'] == 'software-update-review'
-    assert payload['reply_markup']['inline_keyboard'][0][0]['text'] == '更新此包'
+    assert payload['reply_markup']['inline_keyboard'][0][0]['text'] == '加入批量'
     assert payload['reply_markup']['inline_keyboard'][0][1]['text'] == '跳过此版本'
 
 
@@ -268,7 +276,8 @@ def test_software_review_callback_requires_owner_signature_and_skip_is_idempoten
     }
     assert '已跳过' in updates.callback('default', payload)['text']
     assert '已跳过' in updates.callback('default', payload)['text']
-    assert updates.pending_keyboard('default') is None
+    keyboard = updates.pending_keyboard('default')
+    assert keyboard and keyboard['inline_keyboard'][0][0]['callback_data'].startswith('su2|select|')
     with pytest.raises(ValueError, match='本人默认机器人私聊'):
         updates.callback('webops', payload)
     payload['data'] = 'su1|skip|' + candidate['id'] + '|bad'
@@ -328,10 +337,10 @@ def test_failed_or_uncertain_review_cannot_be_retried_by_click(tmp_path, monkeyp
 
 def test_apt_simulation_safety_rejects_extra_changes_and_phased_updates():
     assert admin._apt_simulation_safe(
-        'Inst sosreport (4.8.1 Ubuntu:24.04/stable)\n0 upgraded, 0 newly installed, 0 to remove.',
+        'Inst sosreport [4.8.0] (4.8.1 Ubuntu:24.04/stable)\n1 upgraded, 0 newly installed, 0 to remove.',
         'sosreport')[0]
     assert not admin._apt_simulation_safe(
-        'Inst sosreport (4.8.1)\nInst bash (5.2.0)\n', 'sosreport')[0]
+        'Inst sosreport [4.8.0] (4.8.1 Ubuntu:24.04/stable)\nInst bash [5.2.0] (5.2.1 Ubuntu:24.04/stable)\n2 upgraded, 0 newly installed, 0 to remove.', 'sosreport')[0]
     assert not admin._apt_simulation_safe(
         'The following packages will be newly installed:\n  evil\n', 'sosreport')[0]
     ok, reason = admin._apt_simulation_safe(

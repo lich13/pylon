@@ -44,7 +44,7 @@ Agent 由 `pylon-agent.service` 按需执行，无常驻 Agent。全局串行，
 
 软件更新监控先抓取并保存原始条目，再由独立 worker 调用现有 Grok 一次完成英文翻译和价值提炼；高价值、普通更新和低价值精简更新均保留通知。Grok 不使用工具且不保存请求；失败时依次回退到配置的 LibreTranslate 兼容公共端点和原文，不影响源站抓取。订阅源网络抖动只记录到状态和日志，连续 3 次失败后才告警；只有已经告警的持续故障恢复时才发送恢复通知。`pylon status` 与 `pylon logs` 显示待处理、Grok 成功、降级翻译和原文回退状态。
 
-`/updates [all]` 查询软件、系统包候选和最近更新结果，最多缓存 10 分钟。默认机器人只对 `libegl-mesa0`、`libgbm1`、`libgl1-mesa-dri`、`libglx-mesa0`、`mesa-libgallium`、`sosreport`、`thermald` 逐包显示确认按钮；点击前不会安装，库库干不收到确认卡片。FRP、PostgreSQL、Redis、Sub2API、npm 主版本、pylon 依赖和 PyMuPDF/lxml 仍只展示检查结果。sub2api 读取容器内程序自报版本，并核对其与运行进程一致；easy_proxies 无版本接口，仅在确认程序未被替换或挂载覆盖时按镜像标签推定，并标明来源。版本读取失败不会退回旧镜像标签。APT 候选采用系统自动维护的软件源索引，显示索引时间；Docker 只按 Ubuntu 软件源候选判断更新。每 6 小时审查一次候选；没有新候选时静默。安装经过单包模拟升级和白名单校验，不执行 autoremove，不自动重启主机；thermald 和需要重启的结果会明确回报。
+`/updates [all]` 查询软件、系统包候选和最近更新结果，最多缓存 10 分钟。默认机器人只对 `libegl-mesa0`、`libgbm1`、`libgl1-mesa-dri`、`libglx-mesa0`、`mesa-libgallium`、`sosreport`、`thermald` 提供多选与批量确认按钮；最终确认前不会安装，库库干不收到确认卡片。FRP、PostgreSQL、Redis、Sub2API、npm 主版本、pylon 依赖和 PyMuPDF/lxml 仍只展示检查结果。sub2api 读取容器内程序自报版本，并核对其与运行进程一致；easy_proxies 无版本接口，仅在确认程序未被替换或挂载覆盖时按镜像标签推定，并标明来源。版本读取失败不会退回旧镜像标签。APT 候选采用系统自动维护的软件源索引，显示索引时间；Docker 只按 Ubuntu 软件源候选判断更新。每 6 小时审查一次候选；没有新候选时静默。安装经过所选包精确事务模拟和白名单校验，不执行 autoremove，不自动重启主机；thermald 和需要重启的结果会明确回报。
 
 关键服务监控涵盖 FRP、OpenList、sing-box、easy_proxies、Certbot、PostgreSQL 18、Redis 8.6，各源每小时拉取一次。首次登记只建立基线，不回放历史消息。首次部署时在暂停软件监控且等待在途执行结束后，以 webops profile 环境运行 `python -m pylon.tasks.software.infrastructure`；后续部署不重新登记已移除的订阅。
 
@@ -62,6 +62,10 @@ Agent 由 `pylon-agent.service` 按需执行，无常驻 Agent。全局串行，
 - `jobs.json`：任务编号、模块、时间和超时。
 - `profiles/`：生产配置、凭据和业务状态，不存放 Python 代码，不提交 Git。
 - `tools/chiphell/`：本机 Cookie 同步与 FRP 维护入口。
+
+系统小包可在默认机器人的 /updates 中勾选多个包，或全选当前候选，再点击“批量更新已选”。选择会保存，服务重启后仍可继续；已跳过版本不会被全选自动加入。旧单包卡片继续可用。Mesa 等关联包必须一并勾选；依赖不完整时明确列出需要补选的包。
+
+批次仅升级明确选择的白名单包，安装前核对版本、系统分阶段放行和精确 APT 事务；系统暂缓时整批不安装。安装后检查实际版本、dpkg 状态和相关服务。结果统一回报，失败或回执不确定不会自动重新安装；重试需重新打开 /updates 并再次确认。不执行 autoremove，不自动重启主机。
 
 ## 安装与升级
 

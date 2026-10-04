@@ -1,0 +1,16 @@
+[Unit]
+Description=pylon guarded APT batch %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/root
+ExecStart=/srv/pylon/venv/bin/python -I -m pylon.admin.software apt-batch-worker %i
+TimeoutStartSec=1000
+TimeoutStopSec=30
+KillMode=control-group
+PrivateTmp=true
