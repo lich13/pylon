@@ -1,10 +1,14 @@
 import contextlib
+import datetime as dt
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from pylon.outbox import Outbox
 from tests.helpers import load_script_module
 
 noagent = load_script_module("itunes_daily_noagent", "itunes_daily_noagent.py")
@@ -53,6 +57,14 @@ def empty_report_payload(market, date):
     payload["aggregation"]["unique_tracks_before_filter"] = 0
     payload["aggregation"]["tracks_after_filter"] = 0
     payload["aggregation"]["tracks"] = []
+    return payload
+
+
+def report_payload_with_switch(market, date, switch_detected_at_utc):
+    payload = report_payload(market, date)
+    payload["switch_info"] = {
+        "switch_detected_at_utc": switch_detected_at_utc,
+    }
     return payload
 
 
@@ -591,6 +603,347 @@ class ChartooItunesDailyNoAgentHtmlTests(unittest.TestCase):
 
         self.assertEqual(out.getvalue().strip(), '{"wakeAgent": false}')
         self.assertEqual(sent, [])
+
+    def test_partial_boundary_is_immediate_and_candidate_requires_switch_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reports = root / "reports"
+            reports.mkdir()
+            date = "2026-06-01"
+            report = reports / f"{date}-jp.json"
+            report.write_text(
+                json.dumps(report_payload_with_switch("jp", date, "2026-06-02T13:30:00Z")),
+                encoding="utf-8",
+            )
+
+            original_data_root = noagent.DATA_ROOT
+            original_now_utc = noagent.now_utc
+            try:
+                noagent.DATA_ROOT = root
+                noagent.now_utc = lambda: "2026-06-02T13:29:59Z"
+                before = dt.datetime(2026, 6, 2, 13, 29, 59, tzinfo=dt.timezone.utc)
+                at_switch = dt.datetime(2026, 6, 2, 13, 30, 0, tzinfo=dt.timezone.utc)
+                self.assertFalse(noagent._partial_report_ready([report], now=before))
+                self.assertTrue(noagent._partial_report_ready([report], now=at_switch))
+                self.assertEqual(noagent.candidate_dates(), [])
+                noagent.now_utc = lambda: "2026-06-02T13:30:00Z"
+                self.assertEqual(noagent.candidate_dates(), [date])
+            finally:
+                noagent.DATA_ROOT = original_data_root
+                noagent.now_utc = original_now_utc
+
+    def test_partial_requires_switch_metadata_and_does_not_invent_readiness(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reports = root / "reports"
+            reports.mkdir()
+            date = "2026-06-02"
+            report = reports / f"{date}-jp.json"
+            report.write_text(json.dumps(report_payload("jp", date)), encoding="utf-8")
+            sent = []
+
+            original_data_root = noagent.DATA_ROOT
+            original_notify_state = noagent.DEFAULT_NOTIFY_STATE
+            original_send_html_report = noagent.send_html_report
+            original_now_utc = noagent.now_utc
+            try:
+                noagent.DATA_ROOT = root
+                noagent.DEFAULT_NOTIFY_STATE = root / "html_notifications.json"
+                noagent.now_utc = lambda: "2026-06-03T00:00:00Z"
+                noagent.send_html_report = lambda result: sent.append(result)
+                self.assertEqual(noagent.candidate_dates(), [])
+                self.assertEqual(
+                    noagent.run_for_dates([date], finalizations=[], allow_partial=True),
+                    '{"wakeAgent": false}',
+                )
+            finally:
+                noagent.DATA_ROOT = original_data_root
+                noagent.DEFAULT_NOTIFY_STATE = original_notify_state
+                noagent.send_html_report = original_send_html_report
+                noagent.now_utc = original_now_utc
+
+            self.assertEqual(sent, [])
+            self.assertFalse((root / "html_notifications.json").exists())
+
+    def test_partial_sends_once_across_state_reload_then_full_once_on_market_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reports = root / "reports"
+            reports.mkdir()
+            date = "2026-06-03"
+            jp = reports / f"{date}-jp.json"
+            hk = reports / f"{date}-hk.json"
+            jp.write_text(
+                json.dumps(report_payload_with_switch("jp", date, "2026-06-04T13:30:00Z")),
+                encoding="utf-8",
+            )
+            sent = []
+
+            original_data_root = noagent.DATA_ROOT
+            original_notify_state = noagent.DEFAULT_NOTIFY_STATE
+            original_send_html_report = noagent.send_html_report
+            original_now_utc = noagent.now_utc
+            try:
+                noagent.DATA_ROOT = root
+                noagent.DEFAULT_NOTIFY_STATE = root / "html_notifications.json"
+                noagent.now_utc = lambda: "2026-06-04T13:30:00Z"
+                noagent.send_html_report = lambda result: sent.append(
+                    (result.artifact_key, result.missing_markets, result.caption)
+                )
+
+                self.assertEqual(
+                    noagent.run_for_dates([date], finalizations=[], allow_partial=True),
+                    '{"wakeAgent": false}',
+                )
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0][0:2], ("html-partial", ("hk",)))
+                self.assertIn("HK 数据尚未到齐", sent[0][2])
+
+                reloaded = load_script_module("itunes_daily_noagent_reloaded", "itunes_daily_noagent.py")
+                reloaded.DATA_ROOT = root
+                reloaded.DEFAULT_NOTIFY_STATE = root / "html_notifications.json"
+                reloaded.now_utc = lambda: "2026-06-04T13:30:00Z"
+                reloaded.fetch_livedoor_entries = lambda release_date: []
+                reloaded.send_html_report = lambda result: sent.append(
+                    (result.artifact_key, result.missing_markets, result.caption)
+                )
+                self.assertEqual(
+                    reloaded.run_for_dates([date], finalizations=[], allow_partial=True),
+                    '{"wakeAgent": false}',
+                )
+                self.assertEqual(len(sent), 1)
+
+                hk.write_text(
+                    json.dumps(report_payload_with_switch("hk", date, "2026-06-04T13:35:00Z")),
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    reloaded.run_for_dates([date], finalizations=[], allow_partial=True),
+                    '{"wakeAgent": false}',
+                )
+                self.assertEqual(len(sent), 2)
+                self.assertEqual(sent[1][0:2], ("html", ()))
+
+                self.assertEqual(
+                    reloaded.run_for_dates([date], finalizations=[], allow_partial=True),
+                    '{"wakeAgent": false}',
+                )
+                self.assertEqual(len(sent), 2)
+            finally:
+                noagent.DATA_ROOT = original_data_root
+                noagent.DEFAULT_NOTIFY_STATE = original_notify_state
+                noagent.send_html_report = original_send_html_report
+                noagent.now_utc = original_now_utc
+
+            state = json.loads((root / "html_notifications.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(set(state[date]["markets"]), {"jp", "hk"})
+        self.assertEqual(state[date]["partial_markets"], ["jp"])
+        self.assertEqual(set(state[date]["artifacts"]), {"html-partial", "html"})
+
+    def test_existing_full_delivery_does_not_fall_back_to_partial(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reports = root / "reports"
+            reports.mkdir()
+            date = "2026-06-04"
+            jp = reports / f"{date}-jp.json"
+            jp.write_text(
+                json.dumps(report_payload_with_switch("jp", date, "2026-06-05T13:30:00Z")),
+                encoding="utf-8",
+            )
+            state_path = root / "html_notifications.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        date: {
+                            "markets": ["jp", "hk"],
+                            "sent_at_utc": "2026-06-04T02:00:00Z",
+                            "artifacts": {
+                                "html": {
+                                    "sent_at_utc": "2026-06-04T02:00:00Z",
+                                },
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sent = []
+
+            original_data_root = noagent.DATA_ROOT
+            original_notify_state = noagent.DEFAULT_NOTIFY_STATE
+            original_send_html_report = noagent.send_html_report
+            original_now_utc = noagent.now_utc
+            try:
+                noagent.DATA_ROOT = root
+                noagent.DEFAULT_NOTIFY_STATE = state_path
+                noagent.now_utc = lambda: "2026-06-05T13:30:00Z"
+                noagent.send_html_report = lambda result: sent.append(result)
+                self.assertEqual(
+                    noagent.run_for_dates([date], finalizations=[], allow_partial=True),
+                    '{"wakeAgent": false}',
+                )
+            finally:
+                noagent.DATA_ROOT = original_data_root
+                noagent.DEFAULT_NOTIFY_STATE = original_notify_state
+                noagent.send_html_report = original_send_html_report
+                noagent.now_utc = original_now_utc
+
+        self.assertEqual(sent, [])
+
+    def test_outbox_stage_key_deduplicates_after_state_save_failure_and_content_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reports = root / "reports"
+            reports.mkdir()
+            date = "2026-06-05"
+            jp = reports / f"{date}-jp.json"
+            jp.write_text(
+                json.dumps(report_payload_with_switch("jp", date, "2026-06-06T13:30:00Z")),
+                encoding="utf-8",
+            )
+            hk = reports / f"{date}-hk.json"
+            outbox_path = root / "outbox.sqlite3"
+            sent = []
+
+            original_data_root = noagent.DATA_ROOT
+            original_notify_state = noagent.DEFAULT_NOTIFY_STATE
+            original_send_html_report = noagent.send_html_report
+            original_save_notified = noagent.save_notified
+            original_now_utc = noagent.now_utc
+
+            def fail_save(*args, **kwargs):
+                raise OSError("injected state save failure")
+
+            def document_count():
+                with Outbox(outbox_path).connect() as db:
+                    return db.execute("SELECT count(*) FROM events WHERE kind='document'").fetchone()[0]
+
+            try:
+                noagent.DATA_ROOT = root
+                noagent.DEFAULT_NOTIFY_STATE = root / "html_notifications.json"
+                noagent.now_utc = lambda: "2026-06-06T13:30:00Z"
+                noagent.send_html_report = original_send_html_report
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "PYLON_OUTBOX": str(outbox_path),
+                        "PYLON_PROFILE": "webops",
+                        "PYLON_JOB_ID": "itunes-daily-test",
+                    },
+                    clear=False,
+                ):
+                    noagent.save_notified = fail_save
+                    with self.assertRaisesRegex(OSError, "injected state save failure"):
+                        noagent.run_for_dates([date], finalizations=[], allow_partial=True)
+                    self.assertEqual(document_count(), 1)
+
+                    jp_payload = json.loads(jp.read_text(encoding="utf-8"))
+                    jp_payload["aggregation"]["tracks"][0]["title"] = "JP Song v2"
+                    jp.write_text(json.dumps(jp_payload), encoding="utf-8")
+
+                    noagent.save_notified = original_save_notified
+                    self.assertEqual(
+                        noagent.run_for_dates([date], finalizations=[], allow_partial=True),
+                        '{"wakeAgent": false}',
+                    )
+                    self.assertEqual(document_count(), 1)
+
+                    hk.write_text(
+                        json.dumps(report_payload_with_switch("hk", date, "2026-06-06T13:35:00Z")),
+                        encoding="utf-8",
+                    )
+                    noagent.save_notified = fail_save
+                    with self.assertRaisesRegex(OSError, "injected state save failure"):
+                        noagent.run_for_dates([date], finalizations=[], allow_partial=True)
+                    self.assertEqual(document_count(), 2)
+
+                    hk_payload = json.loads(hk.read_text(encoding="utf-8"))
+                    hk_payload["aggregation"]["tracks"][0]["title"] = "HK Song v2"
+                    hk.write_text(json.dumps(hk_payload), encoding="utf-8")
+
+                    noagent.save_notified = original_save_notified
+                    self.assertEqual(
+                        noagent.run_for_dates([date], finalizations=[], allow_partial=True),
+                        '{"wakeAgent": false}',
+                    )
+                    self.assertEqual(document_count(), 2)
+            finally:
+                noagent.DATA_ROOT = original_data_root
+                noagent.DEFAULT_NOTIFY_STATE = original_notify_state
+                noagent.send_html_report = original_send_html_report
+                noagent.save_notified = original_save_notified
+                noagent.now_utc = original_now_utc
+
+            state = json.loads((root / "html_notifications.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(set(state[date]["artifacts"]), {"html-partial", "html"})
+
+    def test_old_partial_state_stays_a_candidate_until_market_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            reports = root / "reports"
+            reports.mkdir()
+            date = "2026-05-01"
+            jp = reports / f"{date}-jp.json"
+            hk = reports / f"{date}-hk.json"
+            jp.write_text(
+                json.dumps(report_payload_with_switch("jp", date, "2026-05-02T13:30:00Z")),
+                encoding="utf-8",
+            )
+            (root / "html_notifications.json").write_text(
+                json.dumps(
+                    {
+                        date: {
+                            "partial_markets": ["jp"],
+                            "partial_missing_markets": ["hk"],
+                            "partial_sent_at_utc": "2026-05-02T13:30:00Z",
+                            "artifacts": {
+                                "html-partial": {
+                                    "sent_at_utc": "2026-05-02T13:30:00Z",
+                                },
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sent = []
+
+            original_data_root = noagent.DATA_ROOT
+            original_notify_state = noagent.DEFAULT_NOTIFY_STATE
+            original_send_html_report = noagent.send_html_report
+            original_now_utc = noagent.now_utc
+            try:
+                noagent.DATA_ROOT = root
+                noagent.DEFAULT_NOTIFY_STATE = root / "html_notifications.json"
+                noagent.now_utc = lambda: "2026-10-05T00:00:00Z"
+                noagent.send_html_report = lambda result: sent.append(
+                    (result.artifact_key, result.caption)
+                )
+                self.assertIn(date, noagent.candidate_dates())
+
+                hk.write_text(
+                    json.dumps(report_payload_with_switch("hk", date, "2026-10-05T00:00:00Z")),
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    noagent.run_for_dates([date], finalizations=[], allow_partial=True),
+                    '{"wakeAgent": false}',
+                )
+            finally:
+                noagent.DATA_ROOT = original_data_root
+                noagent.DEFAULT_NOTIFY_STATE = original_notify_state
+                noagent.send_html_report = original_send_html_report
+                noagent.now_utc = original_now_utc
+
+            state = json.loads((root / "html_notifications.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], "html")
+        self.assertIn("补全", sent[0][1])
+        self.assertEqual(set(state[date]["markets"]), {"jp", "hk"})
 
 
 if __name__ == "__main__":

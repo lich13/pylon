@@ -31,6 +31,7 @@ class HtmlReportResult:
     livedoor_unmatched: list[livedoor_reference.LivedoorEntry]
     livedoor_suppressed: list[livedoor_reference.LivedoorEntry]
     path: Path | None = None
+    missing_markets: tuple[str, ...] = ()
 
 
 def _text(value: Any, default: str = "") -> str:
@@ -346,7 +347,16 @@ def _market_section(
             audio_index += 1
     cards_html = "\n".join(cards)
     if not cards_html:
-        cards_html = '<div class="empty-market">跨市场重复折叠后，本市场没有单独展示曲目。</div>'
+        availability = _text(reports.get(market, {}).get("availability"))
+        if availability:
+            empty_message = availability
+        elif not _int_value(_aggregation(reports[market]).get("unique_tracks_before_filter")):
+            empty_message = "截至日报结算时间，未观察到该发行日期的上榜歌曲。"
+        elif not _report_tracks(reports[market]):
+            empty_message = "该发行日期的上榜歌曲均未达到现有保留条件。"
+        else:
+            empty_message = "跨市场重复折叠后，本市场没有单独展示曲目。"
+        cards_html = f'<div class="empty-market">{_esc(empty_message)}</div>'
     return f"""
       <section class="market-section" id="{market}">
         <div class="section-heading">
@@ -520,6 +530,15 @@ def _html_document(
     hk_art = (tracks_by_market.get("hk") or [{}])[0].get("artwork_url", "")
     hero_art = _apple_artwork_variant(jp_art or hk_art, 300)
     generated_label = _esc(release_date)
+    missing_markets = [
+        market for market in ("jp", "hk")
+        if _text(reports.get(market, {}).get("availability"))
+    ]
+    market_summary = (
+        "JP + HK 双市场总文件"
+        if not missing_markets
+        else f"JP + HK（{', '.join(MARKET_LABELS[market] for market in missing_markets)} 数据待补）"
+    )
     jp_section, next_audio_index = _market_section(reports, tracks_by_market["jp"], "jp", 0, livedoor_matches)
     hk_section, _ = _market_section(reports, tracks_by_market["hk"], "hk", next_audio_index, livedoor_matches)
     livedoor_unmatched_section = _livedoor_unmatched_section(livedoor_unmatched)
@@ -692,9 +711,10 @@ def _html_document(
         <p class="eyebrow">Chartoo iTunes Daily</p>
         <h1>{generated_label}</h1>
         <div class="hero-meta">
-          <span>JP + HK 双市场总文件</span>
+          <span>{_esc(market_summary)}</span>
           <span>{total_visible} 首展示</span>
           <span>{len(folded)} 首跨市场折叠</span>
+          {'<span>完整数据到齐后自动补发</span>' if missing_markets else ''}
         </div>
       </div>
       <div class="cover-pair">
@@ -716,6 +736,8 @@ def render_daily_report(
     report_paths: Iterable[Path | str],
     livedoor_entries: Iterable[livedoor_reference.LivedoorEntry] | None = None,
     livedoor_history_report_paths: Iterable[Path | str] | None = None,
+    *,
+    allow_missing_markets: bool = False,
 ) -> HtmlReportResult:
     reports: dict[str, dict[str, Any]] = {}
     dates: set[str] = set()
@@ -730,11 +752,24 @@ def render_daily_report(
         if release_date:
             dates.add(release_date)
 
-    if set(reports) != REQUIRED_MARKETS:
+    missing_markets = sorted(REQUIRED_MARKETS - set(reports))
+    if set(reports) - REQUIRED_MARKETS or (missing_markets and not allow_missing_markets):
         raise ValueError("daily HTML report requires both JP and HK reports")
     if len(dates) != 1:
         raise ValueError(f"daily HTML report requires one release date, got {sorted(dates)}")
     release_date = next(iter(dates))
+    for market in missing_markets:
+        reports[market] = {
+            "availability": f"{MARKET_LABELS[market]} 日报尚未完成，本次先展示已完成市场；数据到齐后自动补发完整报告。",
+            "aggregation": {
+                "market": market,
+                "release_date": release_date,
+                "unique_tracks_before_filter": 0,
+                "tracks_after_filter": 0,
+                "dropped_count": 0,
+                "tracks": [],
+            },
+        }
     tracks_by_market, folded = _dedupe_tracks(reports)
     tune_result = tunemymusic_text.render_from_tracks(release_date, tracks_by_market)
     livedoor_matches, livedoor_unmatched = livedoor_reference.match_entries_by_track(
@@ -766,6 +801,7 @@ def render_daily_report(
         livedoor_matches=livedoor_matches,
         livedoor_unmatched=livedoor_unmatched,
         livedoor_suppressed=livedoor_suppressed,
+        missing_markets=tuple(missing_markets),
     )
 
 
@@ -774,11 +810,14 @@ def write_daily_report(
     output_dir: Path | str,
     livedoor_entries: Iterable[livedoor_reference.LivedoorEntry] | None = None,
     livedoor_history_report_paths: Iterable[Path | str] | None = None,
+    *,
+    allow_missing_markets: bool = False,
 ) -> HtmlReportResult:
     result = render_daily_report(
         report_paths,
         livedoor_entries=livedoor_entries,
         livedoor_history_report_paths=livedoor_history_report_paths,
+        allow_missing_markets=allow_missing_markets,
     )
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

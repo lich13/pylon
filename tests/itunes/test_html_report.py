@@ -96,6 +96,40 @@ class HtmlReportTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "both JP and HK"):
                 html_report.render_daily_report([jp])
 
+    def test_render_partial_report_marks_missing_market_and_recovery_hint(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jp = root / "2026-05-31-jp.json"
+            jp.write_text(json.dumps(report_payload("jp", "JP Song", apple_track_id="1")), encoding="utf-8")
+
+            result = html_report.render_daily_report([jp], allow_missing_markets=True)
+
+        self.assertEqual(result.missing_markets, ("hk",))
+        self.assertEqual(len(result.tracks_by_market["jp"]), 1)
+        self.assertEqual(result.tracks_by_market["hk"], [])
+        self.assertIn("HK 日报尚未完成", result.html)
+        self.assertIn("自动补发完整报告", result.html)
+        self.assertIn("JP + HK（HK 数据待补）", result.html)
+        self.assertIn("完整数据到齐后自动补发", result.html)
+
+    def test_render_complete_empty_market_is_distinct_from_missing_market(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jp = root / "2026-05-31-jp.json"
+            hk = root / "2026-05-31-hk.json"
+            jp.write_text(json.dumps(report_payload("jp", "JP Song", apple_track_id="1")), encoding="utf-8")
+            hk.write_text(
+                json.dumps(report_payload_with_tracks("hk", "2026-05-31", [])),
+                encoding="utf-8",
+            )
+
+            result = html_report.render_daily_report([jp, hk])
+
+        self.assertEqual(result.missing_markets, ())
+        self.assertIn("截至日报结算时间，未观察到该发行日期的上榜歌曲。", result.html)
+        self.assertNotIn("日报尚未完成，本次先展示已完成市场", result.html)
+        self.assertIn("JP + HK 双市场总文件", result.html)
+
     def test_render_daily_report_contains_music_fields_and_audio(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
