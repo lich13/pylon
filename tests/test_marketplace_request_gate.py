@@ -1,11 +1,14 @@
 import json
 import multiprocessing
+import sys
 import time
 from pathlib import Path
+from types import ModuleType
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from pylon.tasks.marketplace import request_gate
+from pylon.tasks.marketplace import request_gate, sources
 
 
 def _navigate(root, ready, output, number):
@@ -64,6 +67,7 @@ def test_persisted_request_and_cooldown_survive_a_new_invocation(tmp_path, monke
     with pytest.raises(request_gate.SourceRateLimited, match='shared_cooldown'):
         with request_gate.request_slot(15):
             pytest.fail('cooldown must prevent navigation')
+    assert json.loads((tmp_path / 'run/marketplace-nga-rate.json').read_text())['cooldown_until'] == 190
     clock['now'] = 191
     with request_gate.request_slot(15):
         pass
@@ -79,3 +83,22 @@ def test_late_limit_and_corrupt_budget_fail_closed(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match='invalid NGA request budget'):
         with request_gate.request_slot(15):
             pytest.fail('corrupt state must not bypass the request budget')
+
+
+def test_browser_cleanup_does_not_extend_an_existing_shared_cooldown(tmp_path, monkeypatch):
+    monkeypatch.setenv('PYLON_NGA_COOKIES', str(tmp_path/'absent.json'))
+    manager=MagicMock()
+    api=ModuleType('playwright.sync_api')
+    api.sync_playwright=lambda: manager
+    engine=manager.__enter__.return_value.chromium.launch.return_value
+    with (
+        patch.dict(sys.modules, {'playwright.sync_api':api}),
+        patch('pylon.shared.playwright_env.ensure'),
+        patch.object(request_gate, 'cooldown') as postpone,
+    ):
+        with pytest.raises(request_gate.SourceRateLimited, match='shared_cooldown'):
+            with sources.browser('nga'):
+                raise request_gate.SourceRateLimited('nga_shared_cooldown')
+    postpone.assert_not_called()
+    engine.new_context.return_value.close.assert_called_once()
+    engine.close.assert_called_once()

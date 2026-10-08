@@ -122,10 +122,6 @@ def browser(source: str):
                 ctx.add_cookies(cookies)
         try:
             yield ctx
-        except SourceRateLimited:
-            if source == 'nga':
-                request_gate.cooldown()
-            raise
         finally:
             ctx.close()
             if source != 'chiphell':
