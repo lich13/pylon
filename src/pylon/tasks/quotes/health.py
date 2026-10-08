@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from pylon import events
 from pylon.config import profile_root, redact
 from pylon.outbox import Outbox
+from .validation import valid_quote
 
 KEY = 'quotes:health'
 JOB_IDS = ('f3ec3ec24210', 'e961da51fe69')
@@ -39,7 +40,8 @@ def inspect(path: Path, *, now: float | None = None) -> dict:
         if not path.is_file():
             raise OSError(f'报价数据库不存在：{path}')
         with sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=5) as db:
-            result['count'] = db.execute('SELECT count(*) FROM quotes WHERE quote_price BETWEEN 50 AND 50000').fetchone()[0]
+            db.row_factory = sqlite3.Row
+            result['count'] = sum(valid_quote(row) for row in db.execute('SELECT * FROM quotes'))
             meta = dict(db.execute("SELECT key,value FROM meta WHERE key IN ('quotes_validated_at','last_success_slot','last_quote_error')"))
         validated = _timestamp(meta.get('quotes_validated_at', ''))
         if not validated:

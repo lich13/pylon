@@ -231,6 +231,7 @@ def _json_meta(conn, key: str, default: Any) -> Any:
 
 
 def update_quotes(timeout_ms: int = 60000, min_entries: int = 20) -> dict[str, Any]:
+    from .validation import valid_quote
     sources = fetch_quote_sources_via_browser(timeout_ms=timeout_ms)
     svg = sources["svg"]
     open_et = sources["open_et"]
@@ -246,7 +247,9 @@ def update_quotes(timeout_ms: int = 60000, min_entries: int = 20) -> dict[str, A
         last_count = int(get_meta(conn, "quotes_count", "0") or "0")
         parser_version = get_meta(conn, "quotes_parser_version", "")
         pending_missing = _json_meta(conn, "quotes_category_missing_streaks", {})
-        if last_hash == snapshot_hash and last_count > 0 and parser_version == QUOTE_PARSER_VERSION and not pending_missing:
+        stored_rows = list(conn.execute('SELECT * FROM quotes'))
+        stored_valid = bool(stored_rows) and all(valid_quote(row) for row in stored_rows)
+        if last_hash == snapshot_hash and last_count > 0 and stored_valid and parser_version == QUOTE_PARSER_VERSION and not pending_missing:
             set_meta(conn, "quotes_validated_at", now_iso())
             return {"status": "unchanged", "quote_count": last_count, "db_path": str(DB_PATH), "snapshot_hash": snapshot_hash, **fetch_meta}
     svg_entries = parse_quotes_from_svg(svg)
@@ -262,7 +265,7 @@ def update_quotes(timeout_ms: int = 60000, min_entries: int = 20) -> dict[str, A
         raise RuntimeError(f"parsed too few valid quote entries: {len(entries)}")
     if last_count >= 100 and len(entries) < last_count * .8:
         raise RuntimeError(f"报价快照不完整：原有 {last_count} 条，本次仅 {len(entries)} 条；保留旧库")
-    if any(not str(e['model_spec']).strip() or not 50 <= int(e['quote_price']) <= 50000 for e in entries):
+    if any(not valid_quote(e) for e in entries):
         raise RuntimeError('报价快照含无效型号或价格；保留旧库')
     unknown_hash = hashlib.sha1(json.dumps(unknown_candidates, ensure_ascii=False, sort_keys=True).encode()).hexdigest() if unknown_candidates else ''
     with connect(DB_PATH) as conn:

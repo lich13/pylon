@@ -11,6 +11,8 @@ from .outbox import Outbox
 def main():
     parser = argparse.ArgumentParser(prog='pylon')
     sub = parser.add_subparsers(dest='command', required=True)
+    marketplace = sub.add_parser('marketplace', add_help=False, help='二手交易历史分类与离线分析')
+    marketplace.add_argument('arguments', nargs=argparse.REMAINDER)
     for name in ('daemon', 'status', 'outbox', 'reconcile'):
         sub.add_parser(name)
     for name in ('run', 'pause', 'resume', 'logs', 'execute'):
@@ -40,6 +42,9 @@ def main():
         if name == 'reply':
             action.add_argument('text', nargs='+')
     args = parser.parse_args()
+    if args.command == 'marketplace':
+        from .tasks.marketplace.__main__ import main as marketplace_main
+        return marketplace_main(args.arguments)
     if args.command == 'agent':
         from .agent_tasks import command
         argument = (' '.join(args.text) if args.action == 'run' else

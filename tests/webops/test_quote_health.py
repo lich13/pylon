@@ -11,8 +11,22 @@ class QuoteHealthTests(unittest.TestCase):
     def make_db(self, root: Path, *, validated_at: str = "", count: int = 120) -> Path:
         path = root / "quotes.sqlite3"
         with sqlite3.connect(path) as db:
-            db.executescript("CREATE TABLE quotes(quote_price INTEGER); CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);")
-            db.executemany("INSERT INTO quotes VALUES(?)", [(1000,)] * count)
+            db.executescript("""
+                CREATE TABLE quotes(
+                    sku_key TEXT PRIMARY KEY, brand TEXT NOT NULL, model_spec TEXT NOT NULL,
+                    color TEXT NOT NULL, product_name TEXT NOT NULL, quote_price INTEGER NOT NULL,
+                    normalized TEXT NOT NULL, source_url TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            """)
+            db.executemany(
+                "INSERT INTO quotes VALUES(?,?,?,?,?,?,?,?,?)",
+                [
+                    (f"sku-{index}", "测试品牌", f"测试型号 {index}", "黑", f"测试品牌 测试型号 {index} 黑",
+                     1000, f"测试品牌测试型号{index}黑", "https://example.invalid/quotes", "2026-09-30T05:00:00Z")
+                    for index in range(count)
+                ],
+            )
             if validated_at:
                 db.execute("INSERT INTO meta VALUES('quotes_validated_at',?)", (validated_at,))
         return path
@@ -52,6 +66,16 @@ class QuoteHealthTests(unittest.TestCase):
             path = self.make_db(Path(td), validated_at="2026-09-30T05:00:00Z", count=0)
             result = health.inspect(path, now=health._timestamp("2026-09-30T06:00:00Z"))
             self.assertFalse(result["available"])
+            self.assertEqual("没有有效报价", result["reason"])
+
+    def test_catalog_with_only_invalid_quote_identity_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self.make_db(Path(td), validated_at="2026-09-30T05:00:00Z", count=1)
+            with sqlite3.connect(path) as db:
+                db.execute("UPDATE quotes SET sku_key='',product_name=''")
+            result = health.inspect(path, now=health._timestamp("2026-09-30T06:00:00Z"))
+            self.assertFalse(result["available"])
+            self.assertEqual(result["count"], 0)
             self.assertEqual("没有有效报价", result["reason"])
 
     def test_small_valid_catalog_is_available(self):

@@ -25,7 +25,7 @@ from pylon.admin import control as admin, ssh
 
 def test_all_jobs_keep_schedule_and_native_catchup():
     catalog = json.loads((ROOT / 'jobs.json').read_text())
-    assert len(catalog) == 17
+    assert len(catalog) == 18
     for key, job in catalog.items():
         unit = bootstrap.timer_text(key, job)
         assert f'Unit=pylon-task@{key}.service' in unit
@@ -36,7 +36,13 @@ def test_all_jobs_keep_schedule_and_native_catchup():
     assert 'RandomizedDelaySec=30m' in bootstrap.timer_text('refresh', catalog['ssh-beijing-refresh'])
     assert 'OnCalendar=Mon *-*-* 9:0:00 Asia/Shanghai' in bootstrap.timer_text('software-maintenance', catalog['software-maintenance'])
     assert 'OnCalendar=*-*-* 0/6:15:00 Asia/Shanghai' in bootstrap.timer_text('software-update-review', catalog['software-update-review'])
-    assert list(catalog)[-1] == 'software-update-review'
+    assert list(catalog)[-2] == 'software-update-review'
+    assert list(catalog)[-1] == 'marketplace-poll'
+    assert catalog['marketplace-poll'] == {
+        'name': '三平台二手交易', 'profile': 'webops', 'schedule': '* * * * *',
+        'deliver': False, 'failure_notify': False, 'timeout': 240,
+        'module': 'pylon.tasks.marketplace.poll',
+    }
     assert catalog['software-update-review']['profile'] == 'default'
     assert '--apply' in catalog['xianbao-retention-cleanup']['args']
     assert catalog['f3ec3ec24210']['lock'] == catalog['e961da51fe69']['lock']

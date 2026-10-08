@@ -168,5 +168,14 @@
     "timeout": 300,
     "failure_notify": true,
     "module": "pylon.tasks.software.review"
+  },
+  "marketplace-poll": {
+    "name": "三平台二手交易",
+    "profile": "webops",
+    "schedule": "* * * * *",
+    "deliver": false,
+    "failure_notify": false,
+    "timeout": 240,
+    "module": "pylon.tasks.marketplace.poll"
   }
 }

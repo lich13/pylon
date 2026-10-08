@@ -15,6 +15,7 @@ from pylon.tasks.quotes.arbitrage import (
     discover_unknown_quote_candidates,
     format_contact_note,
     format_decoded_base64_contact_note,
+    format_alerts,
     has_device_newness,
     is_excluded_device_deal,
     make_alert_message,
@@ -43,6 +44,11 @@ AVAILABLE_CHIPHELL_BODY = CHIPHELL_BODY.replace("3楼预定，明日面交", "�
 
 
 class ElectronicsArbitrageTests(unittest.TestCase):
+    def test_format_alerts_suppresses_empty_and_title_only_messages(self):
+        self.assertEqual(format_alerts([]), "")
+        self.assertEqual(format_alerts([""]), "")
+        self.assertEqual(format_alerts(["## iPhone 17 Pro 报价提醒\n\n"]), "")
+
     def test_money_candidates_ignores_chiphell_supplement_timestamp(self):
         prices = money_candidates(f"{CHIPHELL_TITLE}\n{CHIPHELL_BODY}")
         self.assertIn(3088, prices)

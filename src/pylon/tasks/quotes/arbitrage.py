@@ -15,6 +15,7 @@ from typing import Any
 
 from pylon.shared import paths
 from pylon.shared.bark import BarkResult, send_critical_push
+from .validation import valid_quote, valid_match
 
 DATA_ROOT = paths.DATA_DIR / "electronics_quotes"
 DB_PATH = DATA_ROOT / "electronics_quotes.sqlite3"
@@ -790,6 +791,8 @@ def replace_quotes(
     category_absence_confirmations: int = 2,
     before_commit=None,
 ) -> dict[str, Any]:
+    if not entries or any(not valid_quote(entry) for entry in entries):
+        raise ValueError('报价快照为空或含无效商品；保留旧库')
     ts = now_iso()
     existing_rows = list(
         conn.execute(
@@ -947,7 +950,7 @@ def replace_quotes(
 
 
 def load_quotes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return list(conn.execute("SELECT * FROM quotes ORDER BY quote_price DESC"))
+    return [row for row in conn.execute("SELECT * FROM quotes ORDER BY quote_price DESC") if valid_quote(row)]
 
 
 def strip_non_price_numbers(text: str) -> str:
@@ -1341,6 +1344,8 @@ def _as_repeat_alert_message(message: str) -> str:
 
 
 def make_alert_message(title: str, url: str, match: dict[str, Any], repeat: bool = False, contact_note: str = "") -> str:
+    if not valid_match(match):
+        return ''
     head = "## 重点比价预警（重复提醒）" if repeat else "## 重点比价预警"
     contact_suffix = f"{contact_note}。" if contact_note else ""
     return (
@@ -1472,7 +1477,7 @@ def _record_arbitrage_if_match_conn(
         return None
     assume_sale = source.lower().startswith("chiphell")
     match = best_arbitrage_match_from_quotes(quotes, title, body, assume_sale=assume_sale)
-    if not match:
+    if not valid_match(match):
         return None
     alert_key = hashlib.sha1(f"{source}|{source_id}|{match['sku_key']}".encode("utf-8")).hexdigest()[:24]
     contact_note = format_contact_note(f"{title}\n{body}")
@@ -1596,6 +1601,7 @@ def collect_arbitrage_messages(source: str, posts: list[dict[str, Any]], db_path
 
 
 def format_alerts(messages: list[str]) -> str:
+    messages = [message for message in messages if message and any(line.strip() and not line.lstrip().startswith('#') for line in message.splitlines())]
     if not messages:
         return ""
     if len(messages) == 1:

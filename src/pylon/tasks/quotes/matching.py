@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from . import arbitrage as catalog
+from .validation import valid_quote
 
 UNAVAILABLE = re.compile(r"已售|已出(?!售中)|售出|售罄|已预[订定]|已被预[订定]|\d+楼预[订定]|预[订定]了|封贴|结贴|勿拍|求购|想收|收一个|收个|求收|打包价|打包出|一起出|合计", re.I)
 USED = re.compile(r"几乎全新|接近全新|近乎全新|充新|充全新|靓机|[九八七六五四三二一\d][成\.\d]*新|成色如图|二手自用|自用机|使用全程|全程(?:带|戴)壳|(?:买来|一直)贴膜|过保|电池(?:健康|寿命|手机显示|效率)?\s*[:：]?\s*(?:[1-9]\d|100)\s*%?|循环\s*\d+|激活.*?保修", re.I)
@@ -158,7 +159,7 @@ def select_match(quotes: list[Any], title: str, body: str, *, assume_sale: bool 
         price = asking_price(text)
         if not price:
             continue
-        candidates = [q for q in quotes if strict_quote_matches(q, text)]
+        candidates = [q for q in quotes if valid_quote(q) and strict_quote_matches(q, text)]
         # Color may be omitted only when it cannot change the quote value.
         colors = {c for c in catalog.COLOR_TOKENS if c in re.sub(r'金属|顺丰|包邮', '', catalog.normalize_match_text(text))}
         if not colors and len({int(q['quote_price']) for q in candidates}) > 1:

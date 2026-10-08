@@ -290,9 +290,10 @@ def format_offer_detail_note(text: str) -> str:
     return note
 
 
-def extract_topic_body(page_html: str) -> str:
+def extract_topic_body(page_html: str, *, include_supplements: bool = False) -> str:
     from pylon.shared.html_text import body_text
-    return strip_invisible_prompt_chars(body_text(page_html, classes={'topic_content'}))
+    classes = {'topic_content','subtle'} if include_supplements else {'topic_content'}
+    return strip_invisible_prompt_chars(body_text(page_html, classes=classes))
 
 
 def extract_topic_excerpt(page_html: str) -> str:
@@ -342,7 +343,7 @@ def enrich_posts_with_topic_excerpt(posts: List[Post], *, deadline: float | None
                         timeout=TOPIC_REQUEST_TIMEOUT,
                         attempts=TOPIC_FETCH_MAX_ATTEMPTS,
                         phase="v2ex_topic",
-                    )
+                    ), include_supplements='二手交易' in post.tags
                 )
             except Exception as exc:
                 print(f"v2ex_topic_enrich_failed id={post.message_id} error={type(exc).__name__}", file=sys.stderr)
@@ -3173,6 +3174,15 @@ def run_once(*, dry_run: bool = False) -> int:
         print(output.wake_agent_false())
         return 0
 
+    from pylon.tasks.marketplace import pipeline as marketplace
+    if marketplace.enabled():
+        trade_posts = [post for post in candidate_posts if marketplace.is_v2ex_trade(post)]
+        if not dry_run:
+            marketplace.ingest('v2ex', [
+                {'id':str(post.message_id),'title':post.title,'url':post.v2ex_url,'posted_at':post.posted_at,
+                 'body_excerpt':post.body_excerpt,'body_full':post.body_full,'body_complete':post.body_complete}
+                for post in trade_posts])
+        candidate_posts = [post for post in candidate_posts if not marketplace.is_v2ex_trade(post)]
     enrich_posts_with_topic_excerpt(candidate_posts, deadline=deadline)
     route_decisions = route_decisions_by_message_id(candidate_posts)
     arbitrage_posts = arbitrage_scan_posts(candidate_posts, route_decisions)
