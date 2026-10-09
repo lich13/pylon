@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import re
-from .taxonomy import RULES, VERSION, canonical
+from .taxonomy import RULES, canonical
+
+VERSION = 3
 
 PATTERNS = [(key, re.compile(pattern, re.I)) for key, _, pattern in RULES]
 SOLD = re.compile(r'已售|已出售(?!中)|已出(?!售)|已预[订定]|售罄|已被预[订定]|预[订定]给|封帖|封贴|结贴|勿拍')
@@ -281,10 +283,10 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
                                        for line in re.split(r'[\n。；;，,]',body)))
     from pylon.tasks.quotes.arbitrage import is_excluded_device_deal
     from pylon.tasks.quotes.matching import newness_evidence
-    from pylon.tasks.forums.v2ex import build_locality_facts
+    from .locality import build_locality_facts
     # Only transaction clauses may be inherited; never another item's price or condition.
     common_terms = '\n'.join(line for line in re.split(r'[\n。；;，,]', body)
-                             if re.search(r'邮寄|包邮|顺丰|自提|面交|不出外地', line)
+                             if re.search(r'邮寄|快递|包邮|顺丰|自提|面交|不出外地|本地|同城|全国|地区', line)
                              and category_for(line)[0] == 'unknown')
     # Unscoped, explicit all-or-nothing terms apply to every item. A named
     # system's bundle restriction must not affect another separately sold item.
@@ -308,18 +310,19 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
         if GIFT.search(text) and not SALE.search(text) and category != 'unknown':
             status = 'uncertain'
         context = text + '\n' + common_terms
-        # Location from a title is inherited, product descriptions are not.
-        title_locations = re.findall(r'[【\[]([^】\]]+)[】\]]',title)
-        context += '\n' + '\n'.join(title_locations)
-        locality = build_locality_facts(context)
+        # An item owns its location. Only an unscoped title restriction may
+        # apply to every item; another product's city must not leak across.
+        locality = build_locality_facts(context, title=title, category=canonical(category),
+                                       title_constraints=len(blocks) == 1 or category_for(title)[0] == 'unknown')
         only_local = locality.transaction_scope in {'non_beijing_local_only','unknown_region_local_only'}
         shipping = bool(locality.remote_trade_evidence) and not (only_local or locality.local_only_evidence)
-        pickup = bool(locality.local_only_evidence or locality.optional_pickup_evidence or re.search(r'自提|面交|不出外地',context))
+        pickup = bool(locality.local_only_evidence)
         attributes = {
             'intent': intent,
             'shipping': shipping, 'pickup_only': pickup and not shipping,
-            'beijing': bool(re.search(r'北京|帝都', context)),
+            'beijing': locality.transaction_scope == 'beijing_local_ok',
             'transaction_scope': locality.transaction_scope,
+            'regional_service': 'regional_service' in locality.local_only_evidence,
             'excluded_device': is_excluded_device_deal(text),
             'body_complete': body_complete, 'bundle': bundle_only or shared_bundle or bool(BUNDLE.search(text)),
             'bundle_only': bundle_only, 'bundle_price': bundle_price,

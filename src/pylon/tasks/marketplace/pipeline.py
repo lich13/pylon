@@ -7,6 +7,7 @@ import time
 import os
 import sqlite3
 from . import policy, wanted
+from .classifier import VERSION as CLASSIFIER_VERSION, classify_listing
 from .store import Store, key
 from .taxonomy import CATEGORIES
 from pylon import events
@@ -59,7 +60,8 @@ def format_message(post: dict, items: list[dict], matches: list[dict]) -> str:
     for item in items[:10]:
         price = f"{item['price']} 元" if item['price'] is not None else '价格未标'
         attrs = item['attributes']
-        trade = '可邮寄' if attrs['shipping'] else '北京自提' if attrs['pickup_only'] and attrs['beijing'] else '交易方式见原帖'
+        trade = ('仅北京可用' if attrs.get('regional_service') and attrs['beijing'] else
+                 '可邮寄' if attrs['shipping'] else '北京自提' if attrs['pickup_only'] and attrs['beijing'] else '交易方式见原帖')
         subject = re.sub(r'https?://\S+','',item['text'].split('\n',1)[0])
         subject = re.sub(r'[\[\]`*_]','',subject).strip()[:100]
         if item['status']=='buy':
@@ -105,6 +107,11 @@ def process(store: Store | None = None, *, current_policy: dict | None = None,
         for row in db.execute("SELECT * FROM marketplace_posts WHERE history=0 AND status='ready' AND (? IS NULL OR source=?) ORDER BY first_seen LIMIT ?",(source,source,limit)).fetchall():
             post = dict(row)
             parsed_items = json.loads(post['items'])
+            if any(item['attributes'].get('classifier_version', CLASSIFIER_VERSION) != CLASSIFIER_VERSION
+                   for item in parsed_items):
+                parsed_items = classify_listing(post['title'], post['body'], post['source'], bool(post['body_complete']))
+                db.execute('UPDATE marketplace_posts SET items=? WHERE source=? AND source_id=?',
+                           (json.dumps(parsed_items, ensure_ascii=False), post['source'], post['source_id']))
             items = policy.evaluate(parsed_items,current_policy) + wanted.evaluate(parsed_items,wanted_policy)
             matches = _quote_matches(items,bool(post['body_complete']),quotes)
             text = format_message(post,items,matches)
