@@ -26,6 +26,8 @@ from pylon.tasks.quotes import matching
     ('iPhone 16 Pro Max 256 国行', 'RMB6200，支持邮寄。', 6200),
     ('iPhone 16 Pro Max 256 国行', '人民币6200，支持邮寄。', 6200),
     ('出机械键盘', '售价89.9元，原价199元。', 89.9),
+    ('儿童电话手表 Z8', '定价1567，走平台验货。', 1567),
+    ('出耳机', '官网定价2399，我定价1567。', 1567),
 ])
 def test_item_context_identifies_prices_without_sale_keywords(source,title,body,price):
     items=classifier.classify_listing(title,body,source,True)
@@ -53,6 +55,9 @@ def test_item_context_identifies_prices_without_sale_keywords(source,title,body,
     'MacBook Air 2020',
     'iPad Pro 2021',
     '出耳机001234',
+    '电话手表 Z8，官方定价2399',
+    '出耳机，原定价2399',
+    '出耳机，厂商定价2399',
 ])
 def test_only_specifications_reference_prices_and_metadata_are_not_sale_prices(text):
     assert classifier.asking_price(text) is None

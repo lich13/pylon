@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from .taxonomy import RULES, canonical
 
-VERSION = 9
+VERSION = 10
 
 PATTERNS = [(key, re.compile(pattern, re.I)) for key, _, pattern in RULES]
 SOLD = re.compile(r'已售|已出售(?!中)|已出(?!售)|已预[订定]|售罄|已被预[订定]|预[订定]给|封帖|封贴|结贴|勿拍')

@@ -337,3 +337,36 @@ def test_marketplace_grok_cannot_reinterpret_excluded_price_roles(body):
 def test_marketplace_grok_prompt_removes_wx_contact():
     post,_=narrative();post['body']+='\nwx: fixture_contact'
     assert 'fixture_contact' not in enrich.build_prompt(post)
+
+
+@pytest.mark.parametrize('label', ['电话手表', '儿童手表', '儿童智能手表'])
+def test_marketplace_watch_subject_owns_its_model_and_price(label):
+    post=dict(source='chiphell',source_id='46',title=label+' Z8 白色',
+              body='平时使用不多，配件齐全。\n定价1567，走平台验货。',
+              body_complete=True,url='https://example.invalid/t/46',history=0)
+    items=classifier.classify_listing(post['title'],post['body'],post['source'])
+    assert len(items)==1 and items[0]['category']=='wearable.watch'
+    assert items[0]['price']==1567 and not enrich.needs_analysis(post,items)
+    value={'items':[dict(name=label+' Z8',category='wearable.watch',start_line=0,end_line=2,
+                        price=1567,price_line=2,status='available',link_ids=[])],
+           'common_lines':[],'shared_link_ids':[]}
+    assert enrich.validate(value,post)[0]['price']==1567
+    # A contradictory provider category still fails source verification.
+    value['items'][0]['category']='camera.body'
+    with pytest.raises(enrich.AnalysisError,match='unsupported_category'):
+        enrich.validate(value,post)
+
+
+def test_marketplace_contact_redaction_preserves_product_nouns_and_model_names():
+    post=example();post['title']='电话手表 Z8、电话卡、WX-1000 耳机、QQ音乐会员'
+    post['body']='电话: 12345678901\n微信fixture_contact\nVX: sample_handle\nQQ 123456\n电话手表可邮寄'
+    prompt=enrich.build_prompt(post)
+    for term in ['电话手表 Z8','电话卡','WX-1000','QQ音乐会员','电话手表可邮寄']:
+        assert term in prompt
+    for term in ['12345678901','fixture_contact','sample_handle','123456']:
+        assert term not in prompt
+
+
+def test_marketplace_watch_accessory_cannot_borrow_watch_classification():
+    assert classifier.category_for('电话手表 Z8 保护壳，售价29元')[0]=='accessory.phone_case'
+    assert classifier.category_for('尼康 Z8 相机，售价9000元')[0]=='camera.body'

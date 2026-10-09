@@ -96,7 +96,7 @@ RULES = [
     ('camera.drone', '影像/航拍/无人机', r'无人机|御\s*\d|Mavic|DJI\s*(?:Mini|Air|Avata)'),
     ('camera.gimbal', '影像/配件/稳定器与脚架', r'稳定器|三脚架|云台|曼富图'),
     ('camera.light', '影像/配件/补光与闪光设备', r'补光灯|闪光灯|摄影灯'),
-    ('wearable.watch', '穿戴/电子/智能手表', r'Watch|智能手表'),
+    ('wearable.watch', '穿戴/电子/智能手表', r'Watch|智能手表|电话手表|儿童(?:智能)?手表'),
     ('wearable.band', '穿戴/电子/手环', r'手环|\bBand\s*\d'),
     ('wearable.mechanical', '穿戴/传统/机械与石英表', r'机械表|石英表|卡西欧|劳力士|欧米茄|精工'),
     ('home.cleaning', '家电/清洁/扫地与洗地设备', r'扫地|洗地机|吸尘器'),
