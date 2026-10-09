@@ -328,11 +328,16 @@ def validate(value: dict, post: dict) -> list[dict]:
         if amount is not None:item['attributes']['facts']['price']=amount
         item['index']=len(output)
         owned_links=raw.get('link_ids',[])
-        if not isinstance(owned_links,list) or any(link not in urls or urls[link] not in evidence for link in owned_links):
+        evidence_links=set(links(evidence))
+        if not isinstance(owned_links,list) or any(link not in urls or urls[link] not in evidence_links for link in owned_links):
             raise AnalysisError('unbound_item_link')
+        # The verified, exclusive source span already establishes ownership.
+        # Preserve its original links even when the model omits a reference;
+        # links outside that span still require explicit shared ownership.
+        item_links=[url for key,url in urls.items() if url in evidence_links and key not in shared]
         item['attributes'].update(analysis_version=VERSION,price_status='identified' if amount is not None else 'missing',
             price_reason='verified_grok_evidence',price_evidence=lines[price_line] if price_line is not None else '',
-            links=[urls[k] for k in owned_links],shared_links=[urls[k] for k in shared])
+            links=item_links,shared_links=[urls[k] for k in shared])
         output.append(item)
     # A shared link must not secretly be another product's individual link.
     # For a single item, a whole-post link and an item link have the same owner.

@@ -171,6 +171,35 @@ def test_marketplace_item_link_cannot_leak_to_other_item():
     with pytest.raises(enrich.AnalysisError,match='unbound_item_link'):enrich.validate(value,post)
 
 
+def test_marketplace_preserves_omitted_reference_in_verified_item_span():
+    post=dict(source='chh',source_id='43',title='出售 iPhone 15 Pro',body_complete=True,
+              body='iPhone 15 Pro 256G 售价 4123元\n'
+                   '屏幕资料 https://example.invalid/manufacturer/display')
+    value={'items':[dict(name='iPhone 15 Pro',category='phone.smartphone',start_line=1,
+                        end_line=2,price=4123,price_line=1,status='available',link_ids=[])],
+           'common_lines':[],'shared_link_ids':[]}
+    items=enrich.validate(value,post)
+    assert items[0]['price']==4123
+    assert items[0]['attributes']['links']==['https://example.invalid/manufacturer/display']
+
+
+def test_marketplace_omitted_owned_link_stays_with_its_product():
+    post=example();post['body']=post['body'].replace('4,123 |','4,123 | https://example.invalid/phone')
+    value=answer();value['shared_link_ids']=['L1']
+    items=enrich.validate(value,post)
+    assert items[0]['attributes']['links']==['https://example.invalid/phone']
+    assert all(not item['attributes']['links'] for item in items[1:])
+    text=pipeline.format_message(post,items[1:],[])
+    assert 'example.invalid/phone' not in text and 'example.invalid/details' in text
+
+
+def test_marketplace_link_prefix_does_not_prove_item_ownership():
+    post=example();post['body']=post['body'].replace('4,123 |','4,123 | https://example.invalid/details-other')
+    value=answer();value['shared_link_ids']=['L1'];value['items'][0]['link_ids']=['L1']
+    with pytest.raises(enrich.AnalysisError,match='unbound_item_link'):
+        enrich.validate(value,post)
+
+
 def test_marketplace_analysis_restart_cache_and_delivery_once(tmp_path,monkeypatch):
     store,post=seed(tmp_path,monkeypatch)
     args=dict(current_policy={'enabled':True,'version':1,'groups':['phone'],'categories':[]},
