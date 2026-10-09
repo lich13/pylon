@@ -120,6 +120,7 @@
     "profile": "webops",
     "schedule": "* * * * *",
     "deliver": false,
+    "wait_for_delivery": false,
     "timeout": 180,
     "module": "pylon.tasks.linuxdo",
     "args": ["collect"]
@@ -129,6 +130,7 @@
     "profile": "webops",
     "schedule": "* * * * *",
     "deliver": false,
+    "wait_for_delivery": false,
     "timeout": 360,
     "module": "pylon.tasks.linuxdo",
     "args": ["review"]

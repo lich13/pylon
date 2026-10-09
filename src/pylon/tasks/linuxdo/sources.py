@@ -19,6 +19,7 @@ class Observation:
     published_at: str
     source_url: str
     links: list[str] = field(default_factory=list)
+    edited_at: str = ''
 
     def payload(self) -> dict:
         return asdict(self)

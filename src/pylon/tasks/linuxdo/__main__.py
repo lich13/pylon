@@ -15,18 +15,51 @@ from .store import Store
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='Linux.do collection and value review')
-    parser.add_argument('command', choices=['collect', 'review', 'status', 'replay', 'export-legacy'])
+    parser.add_argument('command', choices=['collect', 'review', 'status', 'replay', 'export-legacy',
+                                            'helper-auth', 'helper-check', 'helper-baseline', 'helper-import-following'])
     parser.add_argument('--store', type=Path)
     parser.add_argument('--input', type=Path)
     parser.add_argument('--limit', type=int, default=4)
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args(argv)
+    if args.command == 'helper-auth':
+        from .helper_account import run_authorize
+        return run_authorize()
+    if args.command == 'helper-check':
+        import asyncio
+        from .helper_collect import inspect_account
+        print(json.dumps(asyncio.run(inspect_account()), ensure_ascii=False))
+        return 0
+    if args.command == 'helper-import-following':
+        if not args.apply or not args.input:
+            parser.error('helper-import-following requires --apply and a private --input file')
+        from .following import install
+        try:
+            print(json.dumps(install(args.input), ensure_ascii=False))
+            return 0
+        except Exception as exc:
+            print(json.dumps({'error': type(exc).__name__}))
+            return 1
     if args.command == 'replay':
         import os
         production = Path(os.environ.get('PYLON_OUTBOX', str(home() / 'data/outbox.sqlite3'))).resolve()
         if not args.store or args.store.resolve() == production or not args.input:
             parser.error('replay requires --input and an isolated --store')
     store = Store(Outbox(args.store)) if args.store else Store()
+    if args.command == 'helper-baseline':
+        if not args.apply:
+            parser.error('helper-baseline requires --apply after stopping both Linux.do timers')
+        from .following import available
+        if available()[0] is None:
+            parser.error('helper-baseline requires a complete imported following list')
+        from .helper import SOURCE
+        if (store.checkpoint(SOURCE) or {}).get('baseline'):
+            parser.error('Helper baseline already exists; retain its cursor when resuming')
+        from .helper_collect import collect
+        config = pipeline.source_config() | {'version': 2, 'mode': 'helper', 'page_size': 100, 'recheck_limit': 100}
+        summary = collect(store, config)
+        print(json.dumps(summary, ensure_ascii=False))
+        return int(bool(summary.get('error')))
     if args.command == 'collect':
         summary = pipeline.collect(store)
     elif args.command == 'review':

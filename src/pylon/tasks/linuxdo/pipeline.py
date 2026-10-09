@@ -21,13 +21,21 @@ def source_config(path: Path | None = None) -> dict:
                 'fetch_timeout_seconds': 8, 'source_budget_seconds': 40}
     path = path or SOURCE_CONFIG
     config = json.loads(path.read_text()) if path.exists() else defaults
-    if not isinstance(config, dict) or set(config) != set(defaults) or config['version'] != 1:
+    if isinstance(config, dict) and config.get('version') == 2:
+        defaults = defaults | {'version': 2, 'mode': 'helper', 'page_size': 100, 'recheck_limit': 100}
+    if not isinstance(config, dict) or set(config) != set(defaults) or config['version'] != defaults['version']:
         raise ValueError('invalid Linux.do source configuration')
     if not isinstance(config['channels'], list) or not config['channels'] or any(c not in CHANNELS for c in config['channels']):
         raise ValueError('unknown Linux.do source')
     for key, bounds in [('max_pages', (1, 20)), ('fetch_timeout_seconds', (1, 15)), ('source_budget_seconds', (10, 120))]:
         if type(config[key]) is not int or not bounds[0] <= config[key] <= bounds[1]:
             raise ValueError('invalid source budget')
+    if config['version'] == 2:
+        if config['mode'] not in {'helper', 'channels'}:
+            raise ValueError('unknown Linux.do source mode')
+        for key, bounds in [('page_size', (1, 100)), ('recheck_limit', (0, 100))]:
+            if type(config[key]) is not int or not bounds[0] <= config[key] <= bounds[1]:
+                raise ValueError('invalid Helper page limit')
     return config
 
 
@@ -97,6 +105,9 @@ def collect(store: Store | None = None, *, config: dict | None = None, getter=ht
     store = store or Store()
     store.import_legacy(state_json.load(LEGACY_STATE, default={}))
     config = config or source_config()
+    if config.get('mode') == 'helper':
+        from .helper_collect import collect as collect_helper
+        return collect_helper(store, config)
     result = []
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures = [pool.submit(collect_source, store, channel, config, getter=getter) for channel in config['channels']]
@@ -111,6 +122,10 @@ def process_topic(store: Store, topic_id: str, config: dict, *, model: str,
                   official_fetch=http.official_evidence) -> dict:
     try:
         snapshot = store.snapshot(topic_id)
+        from .helper_store import covered_by_personal
+        if covered_by_personal(snapshot):
+            store.finish(snapshot, {'decision': 'skip', 'expires_at': ''})
+            return {'topic_id': topic_id, 'decision': 'skip', 'event_id': None, 'error': ''}
         if ((snapshot['expires_at'] and snapshot['expires_at'] <= time.time())
                 or time.time() - snapshot['updated_at'] > 7 * 86400):
             store.finish(snapshot, {'decision': 'skip', 'expires_at': ''})
@@ -144,10 +159,13 @@ def process_topic(store: Store, topic_id: str, config: dict, *, model: str,
 
 def review(store: Store | None = None, *, config: dict | None = None, limit: int = 4,
            model: str | None = None, request=judge.request,
-           topic_fetch=http.topic_evidence, official_fetch=http.official_evidence) -> dict:
+           topic_fetch=http.topic_evidence, official_fetch=http.official_evidence,
+           sources: dict | None = None) -> dict:
     store = store or Store()
     config = config or policy.load()
-    topic_ids = store.claim(limit=max(1, min(limit, 20)))
+    sources = sources if sources is not None else source_config()
+    from .helper import SOURCE
+    topic_ids = store.claim(limit=max(1, min(limit, 20)), source=SOURCE if sources.get('mode') == 'helper' else '')
     if not topic_ids:
         store.sync_deliveries()
         return {'processed': 0, 'errors': 0, 'queued': 0}

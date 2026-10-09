@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 
 from pylon.events import text_key
@@ -46,7 +47,18 @@ class Store:
                 CREATE TABLE IF NOT EXISTS linuxdo_legacy_topics (
                     topic_id TEXT PRIMARY KEY, delivered_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS linuxdo_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS linuxdo_helper_messages (
+                    message_id INTEGER PRIMARY KEY, kind TEXT NOT NULL, route TEXT NOT NULL,
+                    topic_id TEXT NOT NULL, post_number INTEGER NOT NULL, payload TEXT NOT NULL,
+                    content_hash TEXT NOT NULL, status TEXT NOT NULL, observed_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS linuxdo_helper_events (
+                    event_key TEXT PRIMARY KEY, message_id INTEGER NOT NULL, kind TEXT NOT NULL,
+                    topic_id TEXT NOT NULL, post_number INTEGER NOT NULL, source_time REAL NOT NULL,
+                    event_id TEXT NOT NULL, created_at REAL NOT NULL, post_fingerprint TEXT NOT NULL DEFAULT '');
             ''')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(linuxdo_helper_events)')}
+            if 'post_fingerprint' not in columns:
+                db.execute("ALTER TABLE linuxdo_helper_events ADD COLUMN post_fingerprint TEXT NOT NULL DEFAULT ''")
 
     def checkpoint(self, channel: str) -> dict | None:
         with self.box.connect() as db:
@@ -105,10 +117,11 @@ class Store:
                     item['body'], json.dumps(item['links']), int(item['complete']), content_hash, now))
         return True
 
-    def save_page(self, channel: str, page: Page, checkpoint: dict, *, baseline: bool = False) -> int:
+    def save_page(self, channel: str, page: Page, checkpoint: dict, *, baseline: bool = False, connection=None) -> int:
         now, changed = time.time(), 0
-        with self.box.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
+        with self.box.connect() if connection is None else nullcontext(connection) as db:
+            if connection is None:
+                db.execute('BEGIN IMMEDIATE')
             for post in page.observations:
                 if post.channel != channel:
                     raise ValueError('observation channel mismatch')
@@ -119,7 +132,7 @@ class Store:
                 if old and old[0] == content_hash:
                     continue
                 db.execute('''INSERT INTO linuxdo_observations VALUES(?,?,?,?,?,?)
-                    ON CONFLICT(channel,message_id) DO UPDATE SET payload=excluded.payload,
+                    ON CONFLICT(channel,message_id) DO UPDATE SET topic_id=excluded.topic_id,payload=excluded.payload,
                     content_hash=excluded.content_hash,observed_at=excluded.observed_at''',
                            (channel, post.message_id, post.topic_id, json.dumps(payload, ensure_ascii=False), content_hash, now))
                 db.execute('''INSERT OR IGNORE INTO linuxdo_topics
@@ -131,7 +144,8 @@ class Store:
                 item = {'ref': f'tg:{channel}:{post.message_id}', 'origin': 'telegram',
                         'post_number': post.post_number, 'url': post.source_url,
                         'title': post.title, 'body': post.body, 'links': post.links, 'complete': False}
-                if self._evidence(db, post.topic_id, item, now):
+                evidence_changed = self._evidence(db, post.topic_id, item, now)
+                if evidence_changed or old:
                     db.execute('''UPDATE linuxdo_topics SET version=version+1,updated_at=?,
                         title=CASE WHEN ?=1 THEN ? ELSE title END,
                         status=CASE WHEN historical=1 THEN 'historical' ELSE 'pending' END,
@@ -166,13 +180,15 @@ class Store:
             db.execute('UPDATE linuxdo_sources SET failures=?,error=?,alert_open=? WHERE channel=?',
                        (failures, error[:100], int(opened), channel))
 
-    def claim(self, *, limit: int = 4, now: float | None = None) -> list[str]:
+    def claim(self, *, limit: int = 4, now: float | None = None, source: str = '') -> list[str]:
         now = time.time() if now is None else now
         with self.box.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             rows = db.execute('''SELECT topic_id FROM linuxdo_topics WHERE historical=0
                 AND status IN ('pending','hold') AND next_attempt<=? AND lease_until<=?
-                ORDER BY first_seen,topic_id LIMIT ?''', (now, now, limit)).fetchall()
+                AND (?='' OR EXISTS(SELECT 1 FROM linuxdo_observations o
+                    WHERE o.topic_id=linuxdo_topics.topic_id AND o.channel=?))
+                ORDER BY first_seen,topic_id LIMIT ?''', (now, now, source, source, limit)).fetchall()
             for row in rows:
                 db.execute('UPDATE linuxdo_topics SET lease_until=? WHERE topic_id=?', (now + 300, row[0]))
         return [row[0] for row in rows]
@@ -190,24 +206,30 @@ class Store:
             legacy = db.execute('SELECT 1 FROM linuxdo_legacy_topics WHERE topic_id=?', (topic_id,)).fetchone()
             observations = db.execute('SELECT channel,message_id,payload FROM linuxdo_observations WHERE topic_id=?',
                                       (topic_id,)).fetchall()
+            personal = [dict(row) for row in db.execute('''SELECT n.post_number,n.source_time,n.post_fingerprint FROM linuxdo_helper_events n
+                JOIN events e ON e.id=n.event_id WHERE n.topic_id=? AND e.status<>'suppressed' ''', (topic_id,))]
         observations = {f"tg:{row['channel']}:{row['message_id']}": json.loads(row['payload']) for row in observations}
         positions = {ref: row['post_number'] for ref, row in observations.items()}
         for row in evidence:
             row['links'] = json.loads(row['links'])
             source_time = observations.get(row['ref'], {}).get('published_at', '')
             row['source_published_at'] = source_time if timestamp(source_time) is not None else ''
+            row['source_edited_at'] = observations.get(row['ref'], {}).get('edited_at', '')
             positions[row['ref']] = row['post_number']
         for row in notifications:
             row['facts'] = json.loads(row['facts'])
         result = dict(topic)
         result.update(evidence=evidence, notifications=notifications, evidence_positions=positions,
-                      previously_notified=bool(legacy or any(n['delivery_status'] != 'suppressed' for n in notifications)))
+                      personal_posts=personal,
+                      previously_notified=bool(legacy or personal or any(n['delivery_status'] != 'suppressed' for n in notifications)))
         # Collection times do not renew an offer. Publication times can change relative deadlines.
         facts = {(r['post_number'], re.sub(r'\s+', ' ', r['title']), re.sub(r'\s+', ' ', r['body'])) for r in evidence}
         reduced = [item for item in facts if not any(item != other and item[0] == other[0]
                    and item[1] == other[1] and item[2] and item[2] in other[2] for other in facts)]
         publication_times = {timestamp(r['source_published_at']) for r in evidence if r['source_published_at']}
         result['fingerprint'] = digest({'text': sorted(reduced), 'published': sorted(publication_times),
+                                        'personal_posts': sorted((r['post_number'], r['source_time'], r['post_fingerprint']) for r in personal),
+                                        'edited': sorted({r['source_edited_at'] for r in evidence if r['source_edited_at']}),
                                         'links': sorted({u for r in evidence for u in r['links']})})
         return result
 
@@ -287,6 +309,12 @@ class Store:
 
     def sync_deliveries(self) -> None:
         with self.box.connect() as db:
+            db.execute('''UPDATE linuxdo_helper_messages SET status=(
+                SELECT CASE WHEN e.status='pending' THEN 'queued' ELSE e.status END
+                FROM linuxdo_helper_events n JOIN events e ON e.id=n.event_id
+                WHERE n.message_id=linuxdo_helper_messages.message_id LIMIT 1)
+                WHERE route='personal' AND EXISTS(SELECT 1 FROM linuxdo_helper_events n
+                    WHERE n.message_id=linuxdo_helper_messages.message_id)''')
             db.execute('''UPDATE linuxdo_topics SET status='delivered' WHERE status='queued'
                 AND EXISTS(SELECT 1 FROM linuxdo_notifications n JOIN events e ON e.id=n.event_id
                     WHERE n.topic_id=linuxdo_topics.topic_id AND e.status='delivered')
@@ -332,5 +360,7 @@ class Store:
             return {'topics': dict(db.execute('SELECT status,count(*) FROM linuxdo_topics GROUP BY status')),
                     'observations': db.execute('SELECT count(*) FROM linuxdo_observations').fetchone()[0],
                     'sources': [dict(row) for row in db.execute('SELECT channel,last_success,failures,error FROM linuxdo_sources')],
+                    'helper_messages': [dict(row) for row in db.execute('''SELECT route,status,count(*) AS count
+                        FROM linuxdo_helper_messages GROUP BY route,status''')],
                     'notifications': dict(db.execute('''SELECT e.status,count(*) FROM linuxdo_notifications n
                         JOIN events e ON e.id=n.event_id GROUP BY e.status'''))}

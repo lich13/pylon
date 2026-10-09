@@ -100,6 +100,50 @@ def test_runner_completes_terminal_suppressed_events_without_waiting(tmp_path, m
     assert retained['finished_at'] is not None
 
 
+def test_runner_can_finish_without_waiting_for_pending_delivery(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('PYLON_HOME', str(tmp_path))
+    monkeypatch.setenv('INVOCATION_ID', 'fixture-helper-invocation')
+    box = Outbox(tmp_path / 'outbox.sqlite3')
+    monkeypatch.setattr(runner, 'Outbox', lambda: box)
+    monkeypatch.setattr(runner, 'jobs', lambda: {'fixture-helper': {
+        'name': '合成 Helper 采集任务', 'profile': 'webops', 'module': 'fixture_module',
+        'timeout': 1, 'deliver': False, 'failure_notify': False, 'wait_for_delivery': False,
+    }})
+    monkeypatch.setattr(runner, 'task_environment', lambda profile: {})
+    monkeypatch.setattr(runner.time, 'time', lambda: 1000.0)
+    wait = Mock(side_effect=AssertionError('collection must finish while delivery is pending'))
+    monkeypatch.setattr(runner.time, 'sleep', wait)
+
+    def start_process(*args, **kwargs):
+        box.enqueue(profile='webops', job_id='fixture-helper', kind='text',
+                    payload={'text': '合成个人通知'}, key='fixture-helper-notice',
+                    run_id=kwargs['env']['PYLON_RUN_ID'])
+        return SimpleNamespace(returncode=0, poll=lambda: 0, communicate=lambda timeout: ('', ''))
+
+    process = Mock(side_effect=start_process)
+    monkeypatch.setattr(runner.subprocess, 'Popen', process)
+
+    result = runner.run('fixture-helper')
+
+    assert result == 0
+    process.assert_called_once()
+    wait.assert_not_called()
+    output = json.loads(capsys.readouterr().out)
+    assert output['status'] == 'ok'
+    assert output['detail'] == ''
+    assert output['notifications'] == {
+        'delivered': 0, 'suppressed': 0, 'pending': 1, 'sending': 0, 'uncertain': 0, 'failed': 0,
+    }
+    with box.connect() as db:
+        retained = db.execute('SELECT status,finished_at FROM runs WHERE id=?',
+                              ('fixture-helper:fixture-helper-invocation',)).fetchone()
+        event = db.execute('SELECT status,receipt FROM events').fetchone()
+    assert retained['status'] == 'ok'
+    assert retained['finished_at'] is not None
+    assert event['status'] == 'pending'
+    assert event['receipt'] is None
+
+
 def test_root_helper_rejects_unknown_units_actions_and_extra_arguments(tmp_path, monkeypatch):
     path = tmp_path / 'jobs.json'
     path.write_text('{"safe":{}}')

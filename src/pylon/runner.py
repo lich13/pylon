@@ -99,7 +99,7 @@ def run(job_id: str, trigger: str = "scheduled") -> int:
         events = box.run_events(run_id)
         if not events and status == "ok" and not result.get('changed'):
             status = "no_change"
-        elif events:
+        elif events and job.get('wait_for_delivery', True):
             deadline = time.time() + 55
             while time.time() < deadline:
                 events = box.run_events(run_id)

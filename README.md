@@ -4,15 +4,23 @@ Python 机器人服务、SQLite 待发队列和 systemd timers。维护 Gmail、
 
 ## Linux.do 聚合
 
-LinuxDoNew、linux_do_channel、linuxdo_tg 每分钟独立采集，按主题合并频道预览、首楼和关联回复。`b7a84d1d9f21` 负责采集，`linuxdo-review` 独立补证和调用现有 Grok；模型或投递积压不阻断采集。来源断档保留分页续接点，首次接入只建立基线，不发送历史帖子。
+`b7a84d1d9f21` 每分钟采集，`linuxdo-review` 独立补证和调用现有 Grok，投递由 outbox 完成。Helper 模式通过专用 Telegram 用户会话读取 `linux_do_helper_bot` 私聊；板块帖子按主题聚合并判断价值，关注者发帖/回复、私信和个人互动提醒直接转发。个人提醒正文独立保存，不进入模型证据；采集不标记已读、不代为回复或点赞。板块、标签和关注用户由使用者在论坛维护。
+
+旧版来源配置继续采集 LinuxDoNew、linux_do_channel、linuxdo_tg，直到显式切换。Helper 分页检查点随消息在同一事务内保存，重启续采，首次接入只建立基线。新消息优先，有限回查处理编辑；未知通知保留并合并告警。个人提醒按通知身份去重，同主题不同回复各自保留。同一帖子同时命中板块订阅和个人提醒时，未发送的板块通知让位于个人提醒，已确认或回执不确定的消息不重复发送。
 
 WebOps profile 的 `config/linuxdo_policy.json` 是独立、版本化的关注目录，缺省采用已确认策略。支持 `groups`、`categories` 和优先级更高的 `excluded_categories`；类别见 `pylon.tasks.linuxdo.policy.CATEGORIES`，未知类别拒绝。默认关注顶级 AI 资源，Codex、Claude Code、Grok Build、MCP/Skills、API 工具，开发自动化、自托管、代理稳定性、登录支付方法，以及全国/北京实用福利。DNS/CDN/证书、安全故障资讯、普通效率软件与硬件类关闭。纯国产模型、影音/PT、游戏素材、论文、邮箱账号、非北京限定和 WPS 福利继续排除；涉及这些产品的可复用技术方法独立判断。
 
 主机促销仅腾讯云、阿里云，地域包含大陆、香港和海外；域名和转售排除。配置、地域、实付价格、周期和参与资格须有匹配的官方原文依据，续费未说明时明确标注。`config/linuxdo_sources.json` 可设置来源列表、分页数、请求超时和单来源预算；默认值见 `pipeline.source_config`。
 
+授权入口是 `python -m pylon.tasks.linuxdo helper-auth`，必须在运行用户的交互终端使用。自己的 Telegram API 凭据、登录码和两步验证密码均隐藏输入；凭据与会话位于 WebOps profile 的 `private/linuxdo-helper`，目录权限 0700、文件权限 0600，不提交或输出内容。首次部署需预置该目录并归运行用户所有。`helper-check` 只读最近消息，输出识别计数和读取前后的已读标记是否相同。会话为 Telegram 账号级授权，程序仅访问首次授权固定的 Helper 身份；认证失效提示重新授权，限流按服务端时间延后重试。
+
+Helper 的“某人 发布了”同时用于板块新帖和关注者发帖。使用本机已登录浏览器导出完整关注名单，以运行用户执行 `helper-import-following --input <private-following.json> --apply`，原子写入上述私有目录的 `following.json`。输入须为 0600 文件，包含 `version: 1`、`complete: true`、带时区的 `imported_at` 和从用户资料链接提取的 `usernames` 数组。名单内作者的发帖与回复直通，其余这类通知只有明确指向首帖时才进入价值判断；名单缺失、无效或消息无法确认时保留待解析。私信和明确个人互动提醒不依赖名单。浏览器导入是快照，后续增删关注需重新导入；不另行授权论坛账号或自动修改订阅。
+
+切换前停止两个 Linux.do timer，等待在途任务结束，执行 `helper-baseline --apply`。在来源配置原有字段基础上设置 `version: 2`、`mode: "helper"`、`page_size: 100`、`recheck_limit: 100`，然后恢复 timer。只有新 Helper 板块消息进入判断，旧源独有候选停止消费；旧证据、投递记录和待发消息保留。再次启动保持已有基线，不重置游标。需要回到三源时停两个 timer 并等待结束，将 `mode` 改为 `"channels"` 后恢复；Helper 暂时失败不会自动启用三源。
+
 Grok 只处理合并后的证据并返回结构化判断，不执行操作。关注范围、证据引用、链接、关键条件和重复事实由本地校验。缺证据或暂时失败的候选退避重试，普通提问可在补充明确答案后重新判断。相同证据按策略、模型和提示词版本缓存；候选最长保留七天待处理，明确过期则关闭。通知只发 Telegram，无日报和新增机器人菜单。通知与判断在同一事务中保存；入队不等于送达，失败/不确定回执沿用 outbox。
 
-上线前停止原 Linux.do timer 并等待在途任务结束；首次新采集会原子导入旧游标、已投主题和旧待发队列。新旧入口不得同时运行。运维入口为 `python -m pylon.tasks.linuxdo status`；隔离回放使用 `replay --store <analysis.sqlite3> --input <observations.json> --limit 4`，输入是 `sources.Observation` 字段数组，回放数据库不可设为正式 outbox，且不连接发送器。回退须先停两个新 timer、等待任务结束，再执行 `python -m pylon.tasks.linuxdo export-legacy --apply`，最后恢复旧模块入口与原 timer；正式 outbox 保持原样继续投递。
+从早期脚本首次升级到持久聚合时，采集入口会原子导入旧游标、已投主题和旧待发队列。新旧入口不得同时运行。运维入口为 `python -m pylon.tasks.linuxdo status`；隔离回放使用 `replay --store <analysis.sqlite3> --input <observations.json> --limit 4`，输入是 `sources.Observation` 字段数组，回放数据库不可设为正式 outbox，且不连接发送器。仅当需要退回早期脚本时，先停两个新 timer、等待任务结束，再执行 `python -m pylon.tasks.linuxdo export-legacy --apply`，最后恢复旧模块入口与原 timer；正式 outbox 保持原样继续投递。
 
 ## 三平台二手交易
 
