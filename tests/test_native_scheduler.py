@@ -7,7 +7,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from pylon import commands, scheduler
+from pylon import commands, runner, scheduler
+from pylon.outbox import Outbox
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -51,6 +52,52 @@ def test_all_jobs_keep_schedule_and_native_catchup():
     assert catalog['software-update-review']['profile'] == 'default'
     assert '--apply' in catalog['xianbao-retention-cleanup']['args']
     assert catalog['f3ec3ec24210']['lock'] == catalog['e961da51fe69']['lock']
+
+
+@pytest.mark.parametrize('event_statuses', [('suppressed',), ('delivered', 'suppressed')],
+                         ids=['only-suppressed', 'mixed-terminal'])
+def test_runner_completes_terminal_suppressed_events_without_waiting(tmp_path, monkeypatch, capsys, event_statuses):
+    monkeypatch.setenv('PYLON_HOME', str(tmp_path))
+    monkeypatch.setenv('INVOCATION_ID', 'fixture-invocation')
+    box = Outbox(tmp_path / 'outbox.sqlite3')
+    monkeypatch.setattr(runner, 'Outbox', lambda: box)
+    monkeypatch.setattr(runner, 'jobs', lambda: {'fixture-job': {
+        'name': '合成到期通知任务', 'profile': 'webops', 'module': 'fixture_module',
+        'timeout': 1, 'deliver': False, 'failure_notify': False,
+    }})
+    monkeypatch.setattr(runner, 'task_environment', lambda profile: {})
+    monkeypatch.setattr(runner.time, 'time', lambda: 1000.0)
+    wait = Mock(side_effect=AssertionError('terminal notifications must not wait'))
+    monkeypatch.setattr(runner.time, 'sleep', wait)
+
+    def start_process(*args, **kwargs):
+        run_id = kwargs['env']['PYLON_RUN_ID']
+        for index, status in enumerate(event_statuses):
+            eid = box.enqueue(profile='webops', job_id='fixture-job', kind='text',
+                              payload={'text': '合成通知'}, key=f'fixture:{index}', run_id=run_id)
+            box.finish(eid, status)
+        return SimpleNamespace(returncode=0, poll=lambda: 0, communicate=lambda timeout: ('', ''))
+
+    process = Mock(side_effect=start_process)
+    monkeypatch.setattr(runner.subprocess, 'Popen', process)
+
+    result = runner.run('fixture-job')
+
+    assert result == 0
+    process.assert_called_once()
+    wait.assert_not_called()
+    output = json.loads(capsys.readouterr().out)
+    assert output['status'] == 'ok'
+    assert output['detail'] == ''
+    assert output['notifications'] == {
+        'delivered': event_statuses.count('delivered'), 'suppressed': event_statuses.count('suppressed'),
+        'pending': 0, 'sending': 0, 'uncertain': 0, 'failed': 0,
+    }
+    with box.connect() as db:
+        retained = db.execute('SELECT status,finished_at FROM runs WHERE id=?',
+                              ('fixture-job:fixture-invocation',)).fetchone()
+    assert retained['status'] == 'ok'
+    assert retained['finished_at'] is not None
 
 
 def test_root_helper_rejects_unknown_units_actions_and_extra_arguments(tmp_path, monkeypatch):

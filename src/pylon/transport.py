@@ -124,7 +124,12 @@ def telegram_request(http: httpx.Client, token: str, method: str, *, data=None, 
 def deliver_event(box: Outbox, event: dict, http: httpx.Client):
     payload = json.loads(event["payload"])
     receipt = json.loads(event["receipt"] or "null")
+    def check_expiration():
+        expiry = payload.get('expires_at')
+        if type(expiry) in (int, float) and expiry <= time.time():
+            raise DeliveryError('suppressed', 'notification expired')
     try:
+        check_expiration()
         if event["kind"] == "bark":
             try:
                 response = http.post(payload["api_base"].rstrip("/") + "/push", json=payload["body"])
@@ -156,6 +161,7 @@ def deliver_event(box: Outbox, event: dict, http: httpx.Client):
                 receipt = receipt or []
                 chunks = telegram_chunks(payload["text"])
                 for chunk in chunks[len(receipt):]:
+                    check_expiration()
                     data = {"chat_id": chat, "text": chunk, "parse_mode": "HTML", "link_preview_options": '{"is_disabled":true}'}
                     if payload.get("reply_markup") and len(receipt) + 1 == len(chunks):
                         data["reply_markup"] = json.dumps(payload["reply_markup"], ensure_ascii=False, separators=(",", ":"))

@@ -89,3 +89,20 @@ def timestamp(value: str) -> float | None:
 
 def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def availability_position(facts: list[dict], positions: dict[str, int]) -> int:
+    """Canonical reply number, shared by channel copies of a replenishment event."""
+    numbers = []
+    for fact in facts:
+        if fact.get('kind') != 'availability':
+            continue
+        for citation in fact.get('evidence', []):
+            ref = citation.get('ref', '')
+            number = positions.get(ref)
+            original = re.fullmatch(r'topic:(\d+)', ref)
+            if number is None and original:
+                number = int(original[1])
+            if type(number) is int and number > 0:
+                numbers.append(number)
+    return max(numbers, default=0)

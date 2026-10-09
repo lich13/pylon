@@ -3,11 +3,13 @@ from __future__ import annotations
 import copy
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
+from pylon import transport
 from pylon.events import text_key
 from pylon.outbox import Outbox
 from pylon.tasks.linuxdo import http, judge, pipeline, policy, sources
@@ -303,7 +305,8 @@ def store(tmp_path, monkeypatch):
     return Store(Outbox(tmp_path / "outbox.sqlite3"))
 
 
-def observation(*, channel="LinuxDoNew", message_id=61, topic_id="9201", post_number=1, body="合成工具开放申请。"):
+def observation(*, channel="LinuxDoNew", message_id=61, topic_id="9201", post_number=1,
+                body="合成工具开放申请。", published_at=PUBLISHED_AT):
     return sources.Observation(
         channel=channel,
         message_id=message_id,
@@ -312,7 +315,7 @@ def observation(*, channel="LinuxDoNew", message_id=61, topic_id="9201", post_nu
         title="合成工具开放申请",
         body=body,
         tags=["开发调优"],
-        published_at=PUBLISHED_AT,
+        published_at=published_at,
         source_url=f"https://t.me/{channel}/{message_id}",
         links=["https://example.invalid/resource"],
     )
@@ -350,6 +353,65 @@ def complete_evidence(*, body="合成工具开放申请，说明包含完整操�
         "links": ["https://example.invalid/resource"],
         "complete": True,
     }
+
+
+def prompt_data(snapshot):
+    return json.loads(judge.build_prompt(snapshot, policy.default_policy()).splitlines()[-1])
+
+
+def test_three_channel_publication_times_reach_snapshot_and_prompt_by_source_ref(store, monkeypatch):
+    observed_iso = "2026-10-09T04:00:00+00:00"
+    observed_at = datetime.fromisoformat(observed_iso).timestamp()
+    monkeypatch.setattr(judge.time, "time", lambda: observed_at)
+    publication_times = dict(zip(CHANNELS, [
+        "2026-01-02T03:04:05+00:00",
+        "2026-02-03T12:13:14+08:00",
+        "2026-03-04T05:06:07Z",
+    ]))
+    for channel, published_at in publication_times.items():
+        page = sources.parse_page(
+            message_html(channel, 71, structured_message(channel, "9201"), published_at=published_at),
+            channel,
+        )
+        assert len(page.observations) == 1
+        assert save_observation(store, page.observations[0]) == 1
+    store.add_evidence("9201", [complete_evidence()])
+    snapshot = Store(Outbox(store.box.path)).snapshot("9201")
+    expected_times = {f"tg:{channel}:71": value for channel, value in publication_times.items()}
+    expected_times["topic:9201:1"] = ""
+
+    assert {row["ref"]: row["source_published_at"] for row in snapshot["evidence"]} == expected_times
+    assert {row["observed_at"] for row in snapshot["evidence"]} == {observed_at}
+    data = prompt_data(snapshot)
+    assert {row["ref"]: row["source_published_at"] for row in data["evidence"]} == expected_times
+    assert {row["observed_at"] for row in data["evidence"]} == {observed_iso}
+
+
+@pytest.mark.parametrize("channel", CHANNELS)
+@pytest.mark.parametrize("published_at", [
+    pytest.param(None, id="missing-time-element"),
+    pytest.param("", id="empty"),
+    pytest.param("not-a-date", id="malformed"),
+    pytest.param("2026-02-30T03:04:05+00:00", id="invalid-calendar-date"),
+    pytest.param("2026-01-02T03:04:05", id="missing-timezone"),
+])
+def test_unknown_publication_time_never_falls_back_to_collection_time(store, monkeypatch, channel, published_at):
+    observed_iso = "2026-10-09T04:00:00+00:00"
+    observed_at = datetime.fromisoformat(observed_iso).timestamp()
+    monkeypatch.setattr(judge.time, "time", lambda: observed_at)
+    markup = message_html(channel, 71, structured_message(channel, "9201"), published_at=published_at)
+    if published_at is None:
+        markup = markup.replace('<time datetime="None"></time>', "")
+    page = sources.parse_page(markup, channel)
+    assert len(page.observations) == 1
+    save_observation(store, page.observations[0])
+
+    snapshot = Store(Outbox(store.box.path)).snapshot("9201")
+    assert snapshot["evidence"][0]["source_published_at"] == ""
+    assert snapshot["evidence"][0]["observed_at"] == observed_at
+    row = prompt_data(snapshot)["evidence"][0]
+    assert row["source_published_at"] == ""
+    assert row["observed_at"] == observed_iso
 
 
 def test_page_save_rolls_back_observations_if_checkpoint_write_fails(store):
@@ -785,6 +847,161 @@ def test_restock_or_correction_with_a_grounded_change_can_notify_again(change_ki
     assert validate_judgment(value, snapshot)["decision"] == "push"
 
 
+def availability_restock(*, subject="合成工具申请", url="https://example.invalid/resource",
+                         ref="topic:2", quote="合成工具补货后重新开放申请，资源 https://example.invalid/resource。"):
+    value = judge_result()
+    value.update(change_kind="restocked", facts=[
+        {
+            "category": "C2", "kind": "resource", "subject": "合成工具", "value": url,
+            "evidence": [{"ref": ref, "quote": quote}],
+        },
+        {
+            "category": "C2", "kind": "availability", "subject": subject, "value": "开放",
+            "evidence": [{"ref": ref, "quote": quote}],
+        },
+    ])
+    return value
+
+
+def restock_evidence(post_number, *, subject="合成工具申请", url="https://example.invalid/resource"):
+    quote = f"合成工具补货后重新开放{subject}，资源 {url}。"
+    return {
+        "ref": f"topic:{post_number}", "origin": "topic", "post_number": post_number,
+        "url": f"https://linux.do/t/topic/9201/{post_number}", "title": "合成工具补货",
+        "body": quote, "links": [url], "complete": True,
+    }
+
+
+def test_same_quota_restock_at_reply_two_and_five_creates_separate_events(store):
+    save_observation(store)
+    store.add_evidence("9201", [restock_evidence(1)])
+    initial = availability_restock(ref="topic:1", quote=restock_evidence(1)["body"])
+    initial["change_kind"] = "initial"
+    first_id = store.finish(store.snapshot("9201"), initial, message="首次开放申请。")
+
+    event_ids = [first_id]
+    for post_number in (2, 5):
+        evidence = restock_evidence(post_number)
+        store.add_evidence("9201", [evidence])
+        snapshot = store.snapshot("9201")
+        decision = availability_restock(ref=evidence["ref"], quote=evidence["body"])
+
+        validated = validate_judgment(decision, snapshot)
+        event_ids.append(store.finish(snapshot, validated, message=f"第 {post_number} 帖再次开放申请。"))
+
+    assert all(event_ids)
+    assert len(set(event_ids)) == 3
+    assert len(Store(Outbox(store.box.path)).snapshot("9201")["notifications"]) == 3
+
+
+def test_same_reply_restock_copy_after_restart_reuses_one_event(store):
+    save_observation(store)
+    quote = "合成工具补货后重新开放申请，资源 https://example.invalid/resource。"
+    store.add_evidence("9201", [restock_evidence(1)])
+    initial_evidence = restock_evidence(1)
+    initial = availability_restock(ref="topic:1", quote=initial_evidence["body"])
+    initial["change_kind"] = "initial"
+    store.finish(store.snapshot("9201"), initial, message="首次开放申请。")
+
+    for channel, message_id in (("LinuxDoNew", 62), ("linuxdo_tg", 63)):
+        save_observation(store, observation(
+            channel=channel, message_id=message_id, post_number=5, body=quote,
+        ))
+
+    first_snapshot = store.snapshot("9201")
+    first_ref = "tg:LinuxDoNew:62"
+    first = validate_judgment(availability_restock(ref=first_ref, quote=quote), first_snapshot)
+    first_id = Store(Outbox(store.box.path)).finish(
+        first_snapshot, first, message="第 5 帖再次开放申请。",
+    )
+    assert first["decision"] == "push"
+    assert first_id
+
+    reopened = Store(Outbox(store.box.path))
+    second_snapshot = reopened.snapshot("9201")
+    second_ref = "tg:linuxdo_tg:63"
+    second = validate_judgment(availability_restock(ref=second_ref, quote=quote), second_snapshot)
+    assert second["decision"] == "skip"
+
+    repeated_push = availability_restock(ref=second_ref, quote=quote)
+    repeated_id = reopened.finish(second_snapshot, repeated_push, message="转载再次开放申请。")
+
+    assert repeated_id == first_id
+    assert len(reopened.snapshot("9201")["notifications"]) == 2
+
+
+def test_late_reply_three_cannot_repeat_restock_already_notified_at_reply_five():
+    snapshot = judge_snapshot()
+    snapshot["previously_notified"] = True
+    first_fact = availability_restock(ref="tg:LinuxDoNew:70")["facts"]
+    later_fact = availability_restock(ref="topic:5")["facts"]
+    snapshot["notifications"] = [
+        {"delivery_status": "delivered", "facts": first_fact},
+        {"delivery_status": "delivered", "facts": later_fact},
+    ]
+    quote = "合成工具补货后重新开放申请，资源 https://example.invalid/resource。"
+    snapshot["evidence"] = [{
+        "ref": "topic:3", "origin": "topic", "post_number": 3,
+        "url": "https://linux.do/t/topic/9301/3", "title": "合成工具补货",
+        "body": quote, "links": ["https://example.invalid/resource"], "complete": True,
+    }]
+    snapshot["evidence_positions"] = {"tg:LinuxDoNew:70": 2, "topic:5": 5, "topic:3": 3}
+
+    result = validate_judgment(availability_restock(ref="topic:3", quote=quote), snapshot)
+
+    assert result["decision"] == "skip"
+
+
+def test_later_restock_for_one_resource_is_not_blocked_by_another_resource_reply_number():
+    quote_a = "合成工具甲补货后重新开放申请，资源 https://example.invalid/resource-a。"
+    quote_b = "合成工具乙补货后重新开放申请，资源 https://example.invalid/resource-b。"
+    prior_a = availability_restock(
+        subject="合成工具甲申请", url="https://example.invalid/resource-a", ref="tg:LinuxDoNew:70",
+        quote=quote_a,
+    )["facts"]
+    prior_b = availability_restock(
+        subject="合成工具乙申请", url="https://example.invalid/resource-b", ref="topic:5", quote=quote_b,
+    )["facts"]
+    snapshot = judge_snapshot()
+    snapshot["previously_notified"] = True
+    snapshot["notifications"] = [
+        {"delivery_status": "delivered", "facts": prior_a},
+        {"delivery_status": "delivered", "facts": prior_b},
+    ]
+    snapshot["evidence"] = [{
+        "ref": "topic:3", "origin": "topic", "post_number": 3,
+        "url": "https://linux.do/t/topic/9301/3", "title": "合成工具甲补货",
+        "body": quote_a, "links": ["https://example.invalid/resource-a"], "complete": True,
+    }]
+    snapshot["evidence_positions"] = {"tg:LinuxDoNew:70": 2, "topic:5": 5, "topic:3": 3}
+
+    result = validate_judgment(availability_restock(
+        subject="合成工具甲申请", url="https://example.invalid/resource-a", ref="topic:3", quote=quote_a,
+    ), snapshot)
+
+    assert result["decision"] == "push"
+
+
+def test_missing_old_reply_position_does_not_allow_a_restock_to_bypass_duplicate_gate():
+    snapshot = judge_snapshot()
+    snapshot["previously_notified"] = True
+    snapshot["notifications"] = [{
+        "delivery_status": "delivered",
+        "facts": availability_restock(ref="tg:LinuxDoNew:70")["facts"],
+    }]
+    quote = "合成工具补货后重新开放申请，资源 https://example.invalid/resource。"
+    snapshot["evidence"] = [{
+        "ref": "topic:3", "origin": "topic", "post_number": 3,
+        "url": "https://linux.do/t/topic/9301/3", "title": "合成工具补货",
+        "body": quote, "links": ["https://example.invalid/resource"], "complete": True,
+    }]
+    snapshot["evidence_positions"] = {"topic:3": 3}
+
+    result = validate_judgment(availability_restock(ref="topic:3", quote=quote), snapshot)
+
+    assert result["decision"] == "skip"
+
+
 def cloud_judgment(*, provider="tencent", region="中国香港"):
     official_url = {
         "tencent": "https://cloud.tencent.com/fixture/offer",
@@ -1096,3 +1313,246 @@ def test_cached_hold_is_reused_until_new_evidence_requires_a_fresh_judgment(stor
     assert third["event_id"]
     assert request.call_count == 2
     assert store.box.counts() == {"pending": 1}
+
+
+def test_restart_and_recollection_preserve_original_deadline_context_and_cached_skip(store, monkeypatch):
+    now = datetime.fromisoformat("2026-10-09T04:00:00+00:00").timestamp()
+    monkeypatch.setattr(judge.time, "time", lambda: now)
+    monkeypatch.setattr("pylon.tasks.linuxdo.common.iso_now",
+                        lambda: datetime.fromtimestamp(now, timezone.utc).isoformat())
+    body = judge_snapshot()["evidence"][0]["body"] + "本次活动今天截止。"
+    post = observation(message_id=71, body=body)
+    save_observation(store, post)
+    original = store.snapshot("9201")
+    original_input = prompt_data(original)
+    expired = judge_result()
+    expired.update(decision="skip", reason="原始消息中的相对期限已经结束。")
+    request = Mock(return_value=expired)
+    kwargs = {
+        "model": "fixture-model", "request": request,
+        "topic_fetch": lambda topic_id, numbers: [], "official_fetch": lambda snapshot: [],
+    }
+    config = policy.default_policy()
+    original_key = judge.cache_key(original, config, "fixture-model")
+    first = pipeline.process_topic(store, "9201", config, **kwargs)
+
+    now += 86400
+    reopened = Store(Outbox(store.box.path))
+    assert save_observation(reopened, post) == 0
+    replayed = reopened.snapshot("9201")
+    assert replayed["version"] == original["version"]
+    assert replayed["fingerprint"] == original["fingerprint"]
+    assert prompt_data(replayed)["evidence"] == original_input["evidence"]
+    second = pipeline.process_topic(reopened, "9201", config, **kwargs)
+
+    assert save_observation(reopened, observation(channel="linuxdo_tg", message_id=72, body=body)) == 1
+    recollected = reopened.snapshot("9201")
+    assert recollected["fingerprint"] == original["fingerprint"]
+    assert judge.cache_key(recollected, config, "fixture-model") == original_key
+    assert reopened.cached(original_key)["decision"] == "skip"
+    data = prompt_data(recollected)
+    assert data["now_utc"] == "2026-10-10T04:00:00+00:00"
+    assert {row["source_published_at"] for row in data["evidence"]} == {PUBLISHED_AT}
+    assert {row["observed_at"] for row in data["evidence"]} == {
+        "2026-10-09T04:00:00+00:00", "2026-10-10T04:00:00+00:00",
+    }
+    third = pipeline.process_topic(reopened, "9201", config, **kwargs)
+
+    assert [result["decision"] for result in (first, second, third)] == ["skip", "skip", "skip"]
+    assert [result["error"] for result in (first, second, third)] == ["", "", ""]
+    assert request.call_count == 1
+    assert reopened.snapshot("9201")["notifications"] == []
+    assert reopened.box.counts() == {}
+
+
+@pytest.mark.parametrize("initial_published_at", [PUBLISHED_AT, ""], ids=["corrected-date", "newly-known-date"])
+def test_changed_publication_time_invalidates_cached_time_judgment(store, monkeypatch, initial_published_at):
+    now = datetime.fromisoformat("2026-10-09T04:00:00+00:00").timestamp()
+    monkeypatch.setattr(judge.time, "time", lambda: now)
+    body = judge_snapshot()["evidence"][0]["body"] + "本次活动今天截止。"
+    save_observation(store, observation(message_id=71, body=body, published_at=initial_published_at))
+    before = store.snapshot("9201")
+    held = judge_result()
+    held.update(decision="hold", missing_evidence=["活动起算时间"])
+    request = Mock(return_value=held)
+    kwargs = {
+        "model": "fixture-model", "request": request,
+        "topic_fetch": lambda topic_id, numbers: [], "official_fetch": lambda snapshot: [],
+    }
+    config = policy.default_policy()
+    before_key = judge.cache_key(before, config, "fixture-model")
+    first = pipeline.process_topic(store, "9201", config, **kwargs)
+    assert store.cached(before_key)["decision"] == "hold"
+
+    now += 600
+    corrected_date = "2026-01-03T03:04:05+00:00"
+    reopened = Store(Outbox(store.box.path))
+    save_observation(reopened, observation(message_id=71, body=body, published_at=corrected_date))
+    after = reopened.snapshot("9201")
+    assert after["evidence"][0]["body"] == before["evidence"][0]["body"]
+    assert after["evidence"][0]["title"] == before["evidence"][0]["title"]
+    assert after["evidence"][0]["source_published_at"] == corrected_date
+    assert prompt_data(after)["evidence"][0]["source_published_at"] == corrected_date
+    assert after["fingerprint"] != before["fingerprint"]
+    after_key = judge.cache_key(after, config, "fixture-model")
+    assert after_key != before_key
+    assert reopened.cached(after_key) is None
+
+    second = pipeline.process_topic(reopened, "9201", config, **kwargs)
+
+    assert first["decision"] == second["decision"] == "hold"
+    assert first["error"] == second["error"] == ""
+    assert request.call_count == 2
+    judged_dates = [call.args[0]["evidence"][0]["source_published_at"] for call in request.call_args_list]
+    assert judged_dates == [initial_published_at, corrected_date]
+    assert reopened.cached(after_key)["decision"] == "hold"
+    assert reopened.box.counts() == {}
+
+
+def test_old_publication_date_does_not_automatically_expire_a_reusable_tutorial(store, monkeypatch):
+    now = datetime.fromisoformat("2026-10-09T04:00:00+00:00").timestamp()
+    monkeypatch.setattr(judge.time, "time", lambda: now)
+    published_at = "2020-01-02T03:04:05+00:00"
+    save_observation(store, observation(
+        message_id=71, body=judge_snapshot()["evidence"][0]["body"], published_at=published_at,
+    ))
+    request = Mock(return_value=judge_result())
+
+    result = pipeline.process_topic(
+        store, "9201", policy.default_policy(), model="fixture-model", request=request,
+        topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [],
+    )
+
+    assert result["decision"] == "push"
+    assert result["error"] == ""
+    assert result["event_id"]
+    request.assert_called_once()
+    assert prompt_data(request.call_args.args[0])["evidence"][0]["source_published_at"] == published_at
+    assert store.box.counts() == {"pending": 1}
+
+
+def test_expired_notification_is_terminal_and_a_new_deadline_can_notify_the_same_facts(store, monkeypatch):
+    now = datetime.fromisoformat("2026-10-09T00:00:00+00:00").timestamp()
+    monkeypatch.setattr(judge.time, "time", lambda: now)
+    monkeypatch.setattr(transport, "profile_env", lambda profile: {
+        "TELEGRAM_BOT_TOKEN": "fixture-token", "TELEGRAM_HOME_CHANNEL": "123",
+    })
+    original_body = judge_snapshot()["evidence"][0]["body"]
+    save_observation(store, observation(
+        message_id=71, body=original_body + "领取截止时间：2026-10-09 09:00（北京时间）。",
+    ))
+    first_decision = judge_result()
+    first_decision["expires_at"] = "2026-10-09T01:00:00+00:00"
+    next_decision = judge_result()
+    next_decision["expires_at"] = "2026-10-10T01:00:00+00:00"
+    request = Mock(side_effect=[first_decision, next_decision])
+    kwargs = {
+        "model": "fixture-model", "request": request,
+        "topic_fetch": lambda topic_id, numbers: [], "official_fetch": lambda snapshot: [],
+    }
+    first = pipeline.process_topic(store, "9201", policy.default_policy(), **kwargs)
+    assert first["decision"] == "push"
+    first_id = first["event_id"]
+    assert first_id
+    with store.box.connect() as db:
+        payload = json.loads(db.execute("SELECT payload FROM events WHERE id=?", (first_id,)).fetchone()[0])
+    first_expiry = datetime.fromisoformat(first_decision["expires_at"]).timestamp()
+    assert payload["expires_at"] == first_expiry
+    assert isinstance(payload["expires_at"], float)
+
+    now = first_expiry
+    reopened = Store(Outbox(store.box.path))
+    requests = []
+
+    def handler(http_request):
+        requests.append(http_request)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 81, "chat": {"id": 123}}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        transport.deliver_event(reopened.box, reopened.box.claim(), http_client)
+        reopened.sync_deliveries()
+        expired = reopened.snapshot("9201")
+        assert requests == []
+        assert expired["status"] == "skip"
+        assert expired["previously_notified"] is False
+        assert expired["notifications"][0]["delivery_status"] == "suppressed"
+        assert prompt_data(expired)["previous_facts"] == []
+        assert reopened.box.claim() is None
+
+        save_observation(reopened, observation(
+            message_id=71, body=original_body + "领取截止时间：2026-10-10 09:00（北京时间）。",
+        ))
+        second = pipeline.process_topic(reopened, "9201", policy.default_policy(), **kwargs)
+        assert second["decision"] == "push"
+        assert first["error"] == second["error"] == ""
+        second_id = second["event_id"]
+        assert second_id and second_id != first_id
+        assert request.call_count == 2
+        assert request.call_args.args[0]["previously_notified"] is False
+        reopened.sync_deliveries()
+        assert reopened.snapshot("9201")["status"] == "queued"
+        transport.deliver_event(reopened.box, reopened.box.claim(), http_client)
+
+    reopened.sync_deliveries()
+    current = reopened.snapshot("9201")
+    assert len(requests) == 1
+    assert current["status"] == "delivered"
+    assert {row["event_id"]: row["delivery_status"] for row in current["notifications"]} == {
+        first_id: "suppressed", second_id: "delivered",
+    }
+    assert current["previously_notified"] is True
+    assert prompt_data(current)["previous_facts"] == [next_decision["facts"]]
+    with reopened.box.connect() as db:
+        payload = json.loads(db.execute("SELECT payload FROM events WHERE id=?", (second_id,)).fetchone()[0])
+    assert payload["expires_at"] == datetime.fromisoformat(next_decision["expires_at"]).timestamp()
+    assert reopened.box.claim() is None
+
+
+def test_suppressed_facts_do_not_block_new_information_when_other_facts_were_delivered():
+    value = judge_result()
+    value["change_kind"] = "new_method"
+    previous_facts = copy.deepcopy(value["facts"])
+    previous_facts[0]["value"] = "已有的其他操作步骤"
+    snapshot = judge_snapshot()
+    snapshot["previously_notified"] = True
+    snapshot["notifications"] = [
+        {"delivery_status": "delivered", "facts": previous_facts},
+        {"delivery_status": "suppressed", "facts": copy.deepcopy(value["facts"])},
+    ]
+
+    result = validate_judgment(value, snapshot)
+
+    assert result["decision"] == "push"
+    assert prompt_data(snapshot)["previous_facts"] == [previous_facts]
+
+
+def test_equivalent_deadline_timezones_reuse_the_same_notification(store, monkeypatch):
+    now = datetime.fromisoformat("2026-10-09T00:00:00+00:00").timestamp()
+    monkeypatch.setattr(judge.time, "time", lambda: now)
+    save_observation(store)
+    first_decision = push_decision()
+    first_decision["expires_at"] = "2026-10-10T01:00:00+00:00"
+    first_id = store.finish(store.snapshot("9201"), first_decision, message="同一期合成优惠。")
+    second_decision = push_decision()
+    second_decision["expires_at"] = "2026-10-10T09:00:00+08:00"
+
+    second_id = store.finish(store.snapshot("9201"), second_decision, message="同一期优惠使用北京时间。")
+
+    assert first_id and second_id == first_id
+    assert len(store.snapshot("9201")["notifications"]) == 1
+    assert store.box.counts() == {"pending": 1}
+
+
+@pytest.mark.parametrize(("expires_at", "expected_deadline"), [
+    ("", None),
+    ("2026-10-09T18:30:00+00:00", "截止：2026-10-10 02:30（北京时间）"),
+    ("2026-10-10T02:30:00+08:00", "截止：2026-10-10 02:30（北京时间）"),
+])
+def test_notification_displays_only_the_explicit_deadline_in_beijing_time(expires_at, expected_deadline):
+    decision = judge_result()
+    decision["expires_at"] = expires_at
+
+    message = judge.format_message(judge_snapshot(), decision)
+
+    deadline_lines = [line for line in message.splitlines() if line.startswith("截止：")]
+    assert deadline_lines == ([expected_deadline] if expected_deadline else [])

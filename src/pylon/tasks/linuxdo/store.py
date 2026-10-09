@@ -7,7 +7,7 @@ from dataclasses import asdict
 
 from pylon.events import text_key
 from pylon.outbox import Outbox
-from .common import JOB_ID, TOPIC_RE, clean, digest, timestamp
+from .common import JOB_ID, TOPIC_RE, availability_position, clean, digest, timestamp
 from .sources import Page
 
 
@@ -188,17 +188,27 @@ class Store:
                 FROM linuxdo_notifications n JOIN events e ON e.id=n.event_id WHERE n.topic_id=?
                 ORDER BY n.created_at''', (topic_id,))]
             legacy = db.execute('SELECT 1 FROM linuxdo_legacy_topics WHERE topic_id=?', (topic_id,)).fetchone()
+            observations = db.execute('SELECT channel,message_id,payload FROM linuxdo_observations WHERE topic_id=?',
+                                      (topic_id,)).fetchall()
+        observations = {f"tg:{row['channel']}:{row['message_id']}": json.loads(row['payload']) for row in observations}
+        positions = {ref: row['post_number'] for ref, row in observations.items()}
         for row in evidence:
             row['links'] = json.loads(row['links'])
+            source_time = observations.get(row['ref'], {}).get('published_at', '')
+            row['source_published_at'] = source_time if timestamp(source_time) is not None else ''
+            positions[row['ref']] = row['post_number']
         for row in notifications:
             row['facts'] = json.loads(row['facts'])
         result = dict(topic)
-        result.update(evidence=evidence, notifications=notifications, previously_notified=bool(legacy or notifications))
-        # Channel labels, observation times, counters and display wording are not evidence changes.
+        result.update(evidence=evidence, notifications=notifications, evidence_positions=positions,
+                      previously_notified=bool(legacy or any(n['delivery_status'] != 'suppressed' for n in notifications)))
+        # Collection times do not renew an offer. Publication times can change relative deadlines.
         facts = {(r['post_number'], re.sub(r'\s+', ' ', r['title']), re.sub(r'\s+', ' ', r['body'])) for r in evidence}
         reduced = [item for item in facts if not any(item != other and item[0] == other[0]
                    and item[1] == other[1] and item[2] and item[2] in other[2] for other in facts)]
-        result['fingerprint'] = digest({'text': sorted(reduced), 'links': sorted({u for r in evidence for u in r['links']})})
+        publication_times = {timestamp(r['source_published_at']) for r in evidence if r['source_published_at']}
+        result['fingerprint'] = digest({'text': sorted(reduced), 'published': sorted(publication_times),
+                                        'links': sorted({u for r in evidence for u in r['links']})})
         return result
 
     def add_evidence(self, topic_id: str, items: list[dict], *, attempted: bool = True) -> None:
@@ -244,15 +254,25 @@ class Store:
                 status = 'skip'
             if status == 'push' and not row['historical'] and message:
                 facts = decision['facts']
-                fact_key = digest(sorted(tuple(re.sub(r'\s+', '', f[key]).casefold()
-                                               for key in ('kind', 'subject', 'value')) for f in facts))
+                identity = sorted(tuple(re.sub(r'\s+', '', f[key]).casefold()
+                                        for key in ('kind', 'subject', 'value')) for f in facts)
+                fact_key = digest([identity, expiry]) if expiry is not None else digest(identity)
+                if decision.get('change_kind') == 'restocked':
+                    restocks = []
+                    for fact in facts:
+                        position = availability_position([fact], snapshot.get('evidence_positions', {}))
+                        if position:
+                            restocks.append([*(re.sub(r'\s+', '', fact[key]).casefold() for key in ('kind', 'subject', 'value')), position])
+                    if restocks:
+                        fact_key = digest([fact_key, 'restocked', sorted(restocks)])
                 existing = db.execute('SELECT event_id FROM linuxdo_notifications WHERE topic_id=? AND fact_key=?',
                                       (topic_id, fact_key)).fetchone()
                 if existing:
                     event_id = existing[0]
                 else:
                     event_id = self.box.enqueue(profile='webops', job_id=JOB_ID, kind='text',
-                                                payload={'text': message}, key=f'linuxdo:{topic_id}:{fact_key}',
+                                                payload={'text': message, **({'expires_at': expiry} if expiry is not None else {})},
+                                                key=f'linuxdo:{topic_id}:{fact_key}',
                                                 run_id=run_id, connection=db)
                     db.execute('INSERT INTO linuxdo_notifications VALUES(?,?,?,?,?)',
                                (topic_id, fact_key, json.dumps(facts, ensure_ascii=False), event_id, now))
@@ -268,9 +288,15 @@ class Store:
     def sync_deliveries(self) -> None:
         with self.box.connect() as db:
             db.execute('''UPDATE linuxdo_topics SET status='delivered' WHERE status='queued'
-                AND EXISTS(SELECT 1 FROM linuxdo_notifications n WHERE n.topic_id=linuxdo_topics.topic_id)
+                AND EXISTS(SELECT 1 FROM linuxdo_notifications n JOIN events e ON e.id=n.event_id
+                    WHERE n.topic_id=linuxdo_topics.topic_id AND e.status='delivered')
                 AND NOT EXISTS(SELECT 1 FROM linuxdo_notifications n JOIN events e ON e.id=n.event_id
-                    WHERE n.topic_id=linuxdo_topics.topic_id AND e.status<>'delivered')''')
+                    WHERE n.topic_id=linuxdo_topics.topic_id AND e.status NOT IN ('delivered','suppressed'))''')
+            db.execute('''UPDATE linuxdo_topics SET status='skip' WHERE status='queued'
+                AND EXISTS(SELECT 1 FROM linuxdo_notifications n JOIN events e ON e.id=n.event_id
+                    WHERE n.topic_id=linuxdo_topics.topic_id AND e.status='suppressed')
+                AND NOT EXISTS(SELECT 1 FROM linuxdo_notifications n JOIN events e ON e.id=n.event_id
+                    WHERE n.topic_id=linuxdo_topics.topic_id AND e.status<>'suppressed')''')
 
     def health(self, component: str, failed: bool) -> None:
         with self.box.connect() as db:

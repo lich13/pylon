@@ -103,12 +103,12 @@ def run(job_id: str, trigger: str = "scheduled") -> int:
             deadline = time.time() + 55
             while time.time() < deadline:
                 events = box.run_events(run_id)
-                if all(row["status"] == "delivered" for row in events):
+                if all(row["status"] in {"delivered", "suppressed"} for row in events):
                     break
                 if any(row["status"] in {"uncertain", "failed"} for row in events):
                     break
                 time.sleep(1)
-            if status == "ok" and any(row["status"] != "delivered" for row in events):
+            if status == "ok" and any(row["status"] not in {"delivered", "suppressed"} for row in events):
                 status, detail = "delivery_pending", "通知已保存，等待补发或核对回执"
     except Exception as exc:
         status, detail = "failed", redact(f"{type(exc).__name__}: {exc}")
@@ -136,7 +136,7 @@ def run(job_id: str, trigger: str = "scheduled") -> int:
         with box.connect() as db:
             db.execute("UPDATE runs SET finished_at=?,status=?,detail=? WHERE id=?", (time.time(), status, detail, run_id))
         lock.close()
-    print(json.dumps({"task": job_id, "status": status, "duration_seconds": round(time.time() - started, 1), "detail": detail, "notifications": {s: sum(r['status'] == s for r in box.run_events(run_id)) for s in ['delivered', 'pending', 'sending', 'uncertain', 'failed']}}, ensure_ascii=False))
+    print(json.dumps({"task": job_id, "status": status, "duration_seconds": round(time.time() - started, 1), "detail": detail, "notifications": {s: sum(r['status'] == s for r in box.run_events(run_id)) for s in ['delivered', 'pending', 'sending', 'uncertain', 'failed', 'suppressed']}}, ensure_ascii=False))
     if stderr.strip():
         print(redact(stderr[-3000:]))
     if stdout.strip() and not silent(stdout):

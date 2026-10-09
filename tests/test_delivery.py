@@ -23,8 +23,11 @@ def box(tmp_path, monkeypatch):
     return Outbox(tmp_path / 'data/outbox.sqlite3')
 
 
-def enqueue(box, text='消息 [链接](https://example.com/a?q=1&b=2)', key='same'):
-    return box.enqueue(profile='webops', job_id='test', kind='text', payload={'text': text}, key=key, run_id='run1')
+def enqueue(box, text='消息 [链接](https://example.com/a?q=1&b=2)', key='same', *, expires_at=None):
+    payload = {'text': text}
+    if expires_at is not None:
+        payload['expires_at'] = expires_at
+    return box.enqueue(profile='webops', job_id='test', kind='text', payload=payload, key=key, run_id='run1')
 
 
 def row(box, eid):
@@ -75,6 +78,77 @@ def test_rate_limit_retries_only_unacknowledged_chunks(box):
     assert len(json.loads(final['receipt'])) == 3
     assert requests[0] not in requests[2:]
     assert requests[1] == requests[2]
+
+
+@pytest.mark.parametrize('expires_at', [999.0, 1000.0], ids=['past-deadline', 'at-deadline'])
+def test_expired_retry_makes_no_http_request_and_preserves_confirmed_receipt(box, monkeypatch, expires_at):
+    monkeypatch.setattr(transport.time, 'time', lambda: 1000.0)
+    eid = enqueue(box, '开头\n' + '中😀' * 2500 + '\n末尾', expires_at=expires_at)
+    receipt = [{'message_id': 41, 'chat_id': 123}]
+    box.finish(eid, 'pending', receipt=receipt)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={'ok': True, 'result': {'message_id': 42, 'chat': {'id': 123}}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        transport.deliver_event(box, box.claim(), http)
+        restarted = Outbox(box.path)
+        restarted.recover_sending()
+        assert transport.drain(restarted, http) == 0
+
+    final = row(restarted, eid)
+    assert final['status'] == 'suppressed'
+    assert json.loads(final['receipt']) == receipt
+    assert requests == []
+    assert restarted.claim() is None
+
+
+@pytest.mark.parametrize('expires_at', [None, 1001.0], ids=['no-deadline', 'future-deadline'])
+def test_live_notification_still_delivers_and_records_receipt(box, monkeypatch, expires_at):
+    monkeypatch.setattr(transport.time, 'time', lambda: 1000.0)
+    eid = enqueue(box, '合成有效通知', expires_at=expires_at)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={'ok': True, 'result': {'message_id': 51, 'chat': {'id': 123}}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        transport.deliver_event(box, box.claim(), http)
+
+    assert len(requests) == 1
+    assert row(box, eid)['status'] == 'delivered'
+    assert json.loads(row(box, eid)['receipt']) == [{'message_id': 51, 'chat_id': 123}]
+
+
+def test_expiration_between_chunks_stops_remaining_delivery_without_repeating_confirmed_chunk(box, monkeypatch):
+    now = 1000.0
+    monkeypatch.setattr(transport.time, 'time', lambda: now)
+
+    def advance(seconds):
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(transport.time, 'sleep', advance)
+    eid = enqueue(box, '开头\n' + '中😀' * 2500 + '\n末尾', expires_at=1001.0)
+    requests = []
+
+    def handler(request):
+        requests.append(request.content)
+        return httpx.Response(200, json={'ok': True, 'result': {'message_id': 61, 'chat': {'id': 123}}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        transport.deliver_event(box, box.claim(), http)
+        restarted = Outbox(box.path)
+        assert transport.drain(restarted, http) == 0
+
+    assert len(requests) == 1
+    final = row(restarted, eid)
+    assert final['status'] == 'suppressed'
+    assert json.loads(final['receipt']) == [{'message_id': 61, 'chat_id': 123}]
+    assert restarted.claim() is None
 
 
 @pytest.mark.parametrize('error,status', [(httpx.ConnectTimeout, 'pending'), (httpx.ReadTimeout, 'uncertain'), (httpx.WriteError, 'uncertain')])
