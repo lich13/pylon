@@ -4,12 +4,13 @@ from __future__ import annotations
 import re
 from .taxonomy import RULES, canonical
 
-VERSION = 12
+VERSION = 13
 from . import subjects
 
 PATTERNS = [(key, re.compile(pattern, re.I)) for key, _, pattern in RULES]
 SOLD = re.compile(r'已售|已出售(?!中)|已出(?!售)|已预[订定]|售罄|已被预[订定]|预[订定]给|封帖|封贴|结贴|勿拍')
 ALL_SOLD = re.compile(r'(?:全部|所有|全都|均)(?:已经|已)(?:售出|出售|出完|售罄|出清|出掉|出了|出(?=\W|$))|(?:全部|所有|全都|均)(?:售罄|出完|出清|出了)')
+CLOSING_UPDATE = re.compile(r'(?:^|\n)楼主补充[:：]\s*(?:没了(?:[，,、\s]*没了)*|(?:都|全|全部)没了|[售卖]完了?|出完了|已出完)[。.!！~～\s]*$')
 BUY = re.compile(r'求购|求收|想收|询价|价格咨询|什么价|值多少|行情多少|求推荐|求助|求问|询问|估价|不出售|不是出货|[\[【](?:收|求购|预收)[\]】]|(?:^|[\]】])\s*(?:收|预收)\s*(?:一|个|台|张|两|[A-Za-z0-9])')
 ACQUIRE = r'收(?!到|齐|件|款|货|藏|据|入|益|费|音|纳|尾|拾)'
 WANTED_BUDGET = re.compile(r'(?<![\d.A-Za-z])([¥￥]?\d+(?:\.\d+)?\s*(?:元|块)?)\s*(?='+ACQUIRE+r')')
@@ -42,8 +43,16 @@ def _sale_body(body: str, source: str) -> str:
         return body
     lines = []
     download_count = 0
-    for original in body.splitlines():
+    source_lines = body.splitlines()
+    for index, original in enumerate(source_lines):
         line = original.strip()
+        # Image filenames/links may already have been removed by the HTML
+        # reader, leaving the download counter beside its control. Require
+        # that adjacent control so a numbered product is never discarded.
+        if re.fullmatch(r'\d+\s*[)）]', line):
+            following = next((v.strip() for v in source_lines[index+1:] if v.strip()), '')
+            if following == '下载附件':
+                continue
         if ATTACHMENT_HEADER.fullmatch(line):
             download_count = 1 if line.endswith((':','：')) else 0
             continue
@@ -366,7 +375,7 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
     # A named group (for example all memory sticks) closing does not close
     # another item's sale. Only unscoped body remarks can close the whole post.
     title_closed = ALL_SOLD.search(title) and not re.search(r'另出|另外|还有|剩余|继续出|其他',title)
-    all_sold = bool(title_closed or any(ALL_SOLD.search(line) and category_for(line)[0]=='unknown'
+    all_sold = bool(title_closed or CLOSING_UPDATE.search(body) or any(ALL_SOLD.search(line) and category_for(line)[0]=='unknown'
                                        for line in re.split(r'[\n。；;，,]',body)))
     from pylon.tasks.quotes.arbitrage import is_excluded_device_deal
     from pylon.tasks.quotes.matching import newness_evidence
@@ -408,7 +417,7 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
                   else 'available' if SALE.search(title + '\n' + text) or source in {'chiphell', 'nga'} else 'uncertain')
         gifted_subject=bool(re.match(r'^\s*(?:赠送|赠品|送的|附赠|送(?!货|达|修|到|测|检))',subject)
                             and not SALE.search(subject))
-        if gifted_subject and category != 'unknown':
+        if gifted_subject and category != 'unknown' and status != 'sold':
             status = 'uncertain'
         context = text + '\n' + common_terms
         # An item owns its location. Only an unscoped title restriction may

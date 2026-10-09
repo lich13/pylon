@@ -415,3 +415,77 @@ def test_mixed_sale_keeps_verified_phone_when_unrelated_unknown_row_fails(tmp_pa
     assert [item["category"] for item in safe] == ["phone.smartphone", "unknown"]
     assert policy.evaluate(safe, SALE_POLICY) == [safe[0]]
     assert safe[0]["price"] == 4500
+
+
+def test_seller_closing_update_marks_all_bags_sold_without_grok():
+    title = "出女包"
+    body = "LV女包 1600元出售\nYSL女包 1000元出售\n楼主补充：没了没了"
+    post = _post(title, body, source_id="closed-bags")
+
+    items = classifier.classify_listing(title, body, "v2ex", True)
+
+    assert [(item["category"], item["price"], item["status"]) for item in items] == [
+        ("life.bag", 1600, "sold"),
+        ("life.bag", 1000, "sold"),
+    ]
+    assert not enrich.needs_analysis(post, items)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "LV女包 1600元出售\nYSL女包 1000元出售\n楼主补充：盒子没了",
+        "LV女包 1600元已售\nYSL女包 1000元出售",
+        "LV女包 1600元出售\nYSL女包 1000元出售\n楼主补充：没了没了\n后续重新开卖：LV女包 1800元出售",
+    ],
+)
+def test_partial_or_reopened_bag_sales_are_not_closed_as_a_whole(body):
+    items = classifier.classify_listing("出女包", body, "v2ex", True)
+
+    assert items
+    assert any(item["status"] == "available" for item in items)
+
+
+def test_closed_post_with_sold_gift_does_not_reenter_analysis():
+    title = "出 iPhone 15"
+    body = "iPhone 15 3000元出售\n附赠原装充电器已售\n楼主补充：没了没了"
+    post = _post(title, body, source_id="closed-gift")
+    items = classifier.classify_listing(title, body, "v2ex", True)
+
+    assert len(items) == 1
+    assert items[0]["status"] == "sold"
+    assert not enrich.needs_analysis(post, items)
+
+
+def test_chiphell_attachment_controls_are_excluded_from_source_and_price_evidence():
+    body = (
+        "1.jpg (321.00 KB, 下载次数:\n"
+        "0)\n下载附件\n2026-10-8 12:30 上传\n"
+        "1) LV女包 1600元出售\n"
+        "2) YSL女包 1000元出售"
+    )
+    post = {
+        "source": "chiphell",
+        "title": "出女包",
+        "body": body,
+        "body_complete": True,
+    }
+
+    assert enrich.source_lines(post) == [
+        "出女包",
+        "1) LV女包 1600元出售",
+        "2) YSL女包 1000元出售",
+    ]
+    items = classifier.classify_listing(post["title"], body, post["source"], True)
+    assert [(item["price"], item["status"]) for item in items] == [(1600, "available"), (1000, "available")]
+    assert all(
+        not any(marker in item["attributes"]["price_evidence"] for marker in ("下载附件", "上传", "0)"))
+        for item in items
+    )
+
+
+@pytest.mark.parametrize("source", ["v2ex", "nga", "linuxdo"])
+def test_discuz_attachment_looking_text_is_preserved_for_non_chiphell(source):
+    body = "1.jpg (321.00 KB, 下载次数:\n0)\n下载附件\n2026-10-8 12:30 上传"
+
+    assert classifier._sale_body(body, source) == body

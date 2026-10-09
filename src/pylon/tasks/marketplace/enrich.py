@@ -11,7 +11,7 @@ from . import classifier
 from .taxonomy import CATEGORIES, type_for
 from .subjects import FIELDS
 
-VERSION = 'marketplace-items-v8'
+VERSION = 'marketplace-items-v9'
 CONSTRAINT = re.compile(r'已售|已出|预[订定]|求购|求收|不出售|赠送|赠品|不含|不带|打包|不拆|不单卖|'
                         r'本地|同城|自提|面交|地区|邮寄|快递|包邮|顺丰|外地|全国|'
                         r'电池|循环|维修|拆修|使用|划痕|磕碰|成新|全新|未拆|未激活')
@@ -128,7 +128,8 @@ def subject_conflict(post,items):
 
 
 def source_lines(post: dict) -> list[str]:
-    return [post['title'],*[line.strip() for line in post['body'].splitlines() if line.strip()]]
+    body = classifier._sale_body(post['body'], post['source'])
+    return [post['title'],*[line.strip() for line in body.splitlines() if line.strip()]]
 
 
 def build_prompt(post: dict) -> str:
