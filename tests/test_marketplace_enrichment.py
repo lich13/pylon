@@ -359,14 +359,63 @@ def test_marketplace_watch_subject_owns_its_model_and_price(label):
 
 def test_marketplace_contact_redaction_preserves_product_nouns_and_model_names():
     post=example();post['title']='电话手表 Z8、电话卡、WX-1000 耳机、QQ音乐会员'
-    post['body']='电话: 12345678901\n微信fixture_contact\nVX: sample_handle\nQQ 123456\n电话手表可邮寄'
+    post['body']='电话: 12345678901\n微信fixture_contact\nVX: sample_handle\nQQ123456\nWXfixture_direct\n电话手表可邮寄'
     prompt=enrich.build_prompt(post)
     for term in ['电话手表 Z8','电话卡','WX-1000','QQ音乐会员','电话手表可邮寄']:
         assert term in prompt
-    for term in ['12345678901','fixture_contact','sample_handle','123456']:
+    for term in ['12345678901','fixture_contact','sample_handle','123456','fixture_direct']:
         assert term not in prompt
 
 
 def test_marketplace_watch_accessory_cannot_borrow_watch_classification():
     assert classifier.category_for('电话手表 Z8 保护壳，售价29元')[0]=='accessory.phone_case'
     assert classifier.category_for('尼康 Z8 相机，售价9000元')[0]=='camera.body'
+
+
+@pytest.mark.parametrize('heading,name,category',[
+    ('出售会员','88VIP会员','virtual.retail_membership'),
+    ('出耳机','AirPods 4','audio.tws'),
+    ('出内存','笔记本内存','component.memory_laptop'),
+    ('出固态硬盘','NVMe SSD','storage.ssd_nvme'),
+])
+def test_marketplace_generic_heading_can_refine_from_owned_subject(heading,name,category):
+    post=dict(source='nga',source_id='47',title=heading,body=name+'，成色见图。\n售价345元。',
+              body_complete=True,url='https://example.invalid/t/47',history=0)
+    value={'items':[dict(name=name,category=category,start_line=0,end_line=2,
+                        price=345,price_line=2,status='available',link_ids=[])],
+           'common_lines':[],'shared_link_ids':[]}
+    item=enrich.validate(value,post)[0]
+    assert item['category']==category and item['price']==345
+    if category=='virtual.retail_membership':
+        assert policy.evaluate([item],{'enabled':True,'categories':['virtual.membership']})==[]
+
+
+@pytest.mark.parametrize('context',[
+    '赠送AirPods 4','不是AirPods 4','兼容AirPods 4','不含AirPods 4','对比AirPods 4',
+    'https://example.invalid/AirPods4',
+])
+def test_marketplace_generic_heading_cannot_refine_from_background_or_gift(context):
+    assert not enrich.supported_category('audio.tws','AirPods 4','出耳机\n'+context)
+
+
+def test_marketplace_specific_subject_cannot_be_replaced_by_other_family():
+    assert not enrich.supported_category('phone.smartphone','iPhone 14','出手机壳\n适配iPhone 14')
+    assert not enrich.supported_category('camera.body','尼康 Z8','电话手表 Z8\n拍照类似尼康 Z8')
+
+
+def test_marketplace_single_item_can_own_the_whole_post_link():
+    post=dict(source='nga',source_id='48',title='出售会员',body='88VIP会员\n详情 https://example.invalid/item',
+              body_complete=True,url='https://example.invalid/t/48',history=0)
+    value={'items':[dict(name='88VIP会员',category='virtual.retail_membership',start_line=0,end_line=2,
+                        price=None,price_line=None,status='available',link_ids=[])],
+           'common_lines':[],'shared_link_ids':['L0']}
+    items=enrich.validate(value,post)
+    assert items[0]['attributes']['shared_links']==['https://example.invalid/item']
+    assert pipeline.format_message(post,items,[]).count('https://example.invalid/item')==1
+
+
+def test_marketplace_multiple_items_cannot_share_one_items_private_link():
+    post=example();post['body']=post['body'].replace('4,123 |','4,123 | https://example.invalid/phone')
+    value=answer();value['shared_link_ids']=['L0','L1']
+    with pytest.raises(enrich.AnalysisError,match='item_link_marked_shared'):
+        enrich.validate(value,post)

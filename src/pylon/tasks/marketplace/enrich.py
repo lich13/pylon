@@ -8,14 +8,14 @@ import time
 from urllib.parse import urlsplit
 
 from . import classifier
-from .taxonomy import CATEGORIES
+from .taxonomy import CATEGORIES, type_for
 
-VERSION = 'marketplace-items-v4'
+VERSION = 'marketplace-items-v5'
 CONSTRAINT = re.compile(r'已售|已出|预[订定]|求购|求收|不出售|赠送|赠品|不含|不带|打包|不拆|不单卖|'
                         r'本地|同城|自提|面交|地区|邮寄|快递|包邮|顺丰|外地|全国|'
                         r'电池|循环|维修|拆修|使用|划痕|磕碰|成新|全新|未拆|未激活')
 URL = re.compile(r'https?://[^\s<>\[\]"]+', re.I)
-CONTACT_LABEL = r'(?:微信(?:号)?|(?<![A-Za-z0-9_])(?:WX|VX|WeChat|QQ)(?![A-Za-z0-9_-])|电话(?:号码)?|手机号码?)'
+CONTACT_LABEL = r'(?:微信(?:号)?|(?<![A-Za-z0-9_])(?:WX|VX|WeChat|QQ)(?!-)|电话(?:号码)?|手机号码?)'
 CONTACT = re.compile(CONTACT_LABEL + r'(?:\s*[:：=]\s*[^\s，,；;]+|\s*[A-Za-z0-9_.+@-]{3,})', re.I)
 SCHEMA = {'type':'object','additionalProperties':False,'properties':{
     'items':{'type':'array','items':{'type':'object','additionalProperties':False,'properties':{
@@ -115,6 +115,29 @@ def _normal(text: str) -> str:
     return re.sub(r'\s+','',text).casefold()
 
 
+def supported_category(category: str, name: str, evidence: str) -> bool:
+    local=classifier.canonical(classifier.category_for(evidence)[0])
+    if local==category:
+        return True
+    # Generic headings can be refined by a concrete name in the owned body.
+    # Keep this within an unspecified leaf's family, never across products.
+    if (local not in {'virtual.membership','audio.headphone','component.memory','storage.ssd'}
+            or type_for(local)!=type_for(category)
+            or classifier.canonical(classifier.category_for(name)[0])!=category):
+        return False
+    needle=_normal(name)
+    for clause in re.split(r'[\n，,。；;|]',URL.sub('',evidence)):
+        text=_normal(clause);position=text.find(needle)
+        if position<0:
+            continue
+        before=text[:position]
+        if (classifier.GIFT.search(before) or
+                re.search(r'不是|并非|不(?:含|带|包括|包含|出售|单卖|支持)|适配|兼容|对比|类似',before)):
+            continue
+        return True
+    return False
+
+
 def price_evidence(lines: list[str], index: int, category: str):
     from pylon.shared.sale_price import analyse_price
     line=lines[index]
@@ -168,7 +191,7 @@ def validate(value: dict, post: dict) -> list[dict]:
         if category not in CATEGORIES and category!='unknown':raise AnalysisError('invalid_category')
         # The source's actual sale subject must agree, not just an AI-picked
         # device name borrowed from a case, a gift or a system configuration.
-        if classifier.canonical(classifier.category_for(evidence)[0])!=category:
+        if not supported_category(category,name,evidence):
             raise AnalysisError('unsupported_category')
         context=name+'\n'+evidence+'\n'+'\n'.join(lines[i] for i in common)
         parsed=classifier.classify_listing(name,context,post['source'],bool(post['body_complete']),single_item=True)
@@ -211,8 +234,10 @@ def validate(value: dict, post: dict) -> list[dict]:
             links=[urls[k] for k in owned_links],shared_links=[urls[k] for k in shared])
         output.append(item)
     # A shared link must not secretly be another product's individual link.
+    # For a single item, a whole-post link and an item link have the same owner.
     for link in shared:
-        if any(urls[link] in lines[i] for i in claimed):raise AnalysisError('item_link_marked_shared')
+        if len(output)>1 and any(urls[link] in lines[i] for i in claimed):
+            raise AnalysisError('item_link_marked_shared')
     for i,line in enumerate(lines):
         if i in claimed or i in common:
             continue
