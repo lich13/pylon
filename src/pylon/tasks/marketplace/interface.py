@@ -7,7 +7,9 @@ import re
 import secrets
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from pylon.config import home
 from pylon.inline import owns_callback
@@ -175,7 +177,8 @@ def preview(db,d):
             else:state=policy.decision(item,{**d['content']['sale'],'extension_categories':list(draft_catalog)})[0]
             counts[state]+=1
             if len(examples[state])<3:examples[state].append(row['url'])
-    return {'counts':counts,'examples':examples,'posts':len(seen),'complete':complete,'missing':len(seen)-complete,'hash':control.digest([d['content'],fingerprints]),'at':time.time()}
+    return {'counts':counts,'examples':examples,'posts':len(seen),'complete':complete,'missing':len(seen)-complete,
+            'hash':control.digest([d['content'],fingerprints]),'draft_hash':control.digest(d['content']),'at':time.time()}
 
 
 def preview_card(db,d):
@@ -183,6 +186,8 @@ def preview_card(db,d):
     db.execute('UPDATE market_drafts SET preview=? WHERE id=?',(control.dumps(p),d['id']))
     sale=d['content']['sale'];catalog=taxonomy.catalog(d['content'].get('taxonomy',{}));follow=[catalog[k].split('/')[-1] for k in catalog if policy.selected(k,sale)]
     text=f'草稿预览 · {p["posts"]} 帖（完整 {p["complete"]}，缺正文 {p["missing"]}）\n'
+    stamp=datetime.fromtimestamp(p['at'],ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')
+    text+=f'样本统计截至 {stamp}（北京时间）；可点“刷新预览”查看最新情况。\n'
     text+='关注：'+('、'.join(follow) or '无')+'\n屏蔽大类：'+('、'.join(taxonomy.GROUPS[k] for k in sale.get('blocked_groups',[])) or '无')
     for cat,rules in sale.get('filters',{}).items():
         if rules:text+='\n'+catalog[cat]+'\n'+describe_filters(rules)
@@ -197,7 +202,8 @@ def preview_card(db,d):
     text+='\n求购目标：'+('、'.join(t['model']+' '+t.get('region','')+' '+str(t.get('specs') or '') for t in d['content']['wanted'].get('targets',[])) or '无')
     text+='\n仅影响后续处理；历史样本不会补发。'
     return card(text,[[_b(db,d['base'],'确认应用','apply',draft=d['id'],revision=d['revision'],hash=p['hash']),
-                       _b(db,d['base'],'继续调整','groups',draft=d['id'])],_back(db,d['base'])])
+                       _b(db,d['base'],'继续调整','groups',draft=d['id'])],
+                      [_b(db,d['base'],'刷新预览','preview',draft=d['id'])],_back(db,d['base'])])
 
 
 def wanted_card(db,d):
@@ -378,9 +384,14 @@ def route(db,action,p,version):
     if action=='preview':return preview_card(db,d)
     if action=='apply':
         if d['status']!='draft':return card('该草稿已处理。',[_back(db,version)])
-        saved=json.loads(d['preview'] or '{}');now=preview(db,d)
-        if d['revision']!=p['revision'] or saved.get('hash')!=p['hash'] or now['hash']!=p['hash']:
-            return card('草稿或样本已变化，请重新预览。',[[_b(db,version,'重新预览','preview',draft=d['id'])]])
+        saved=json.loads(d['preview'] or '{}')
+        # Applying a filter changes future policy, not the sampled posts. Keep
+        # the displayed snapshot stable while collection and analysis continue;
+        # draft edits, replacement previews and policy versions still invalidate
+        # their old confirmation buttons.
+        if (d['revision']!=p['revision'] or saved.get('hash')!=p['hash']
+                or saved.get('draft_hash')!=control.digest(d['content'])):
+            return card('草稿或预览已变化，请重新预览。',[[_b(db,version,'重新预览','preview',draft=d['id'])]])
         policy.validate_filters(d['content']['sale'].get('filters',{}));policy.validate_filters(d['content']['wanted'].get('filters',{}));wanted.validate(d['content']['wanted'])
         new=control.activate(db,d['content'],d['base'],'telegram')
         db.execute("UPDATE market_drafts SET status='applied' WHERE id=?",(d['id'],))

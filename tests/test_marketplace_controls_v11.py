@@ -267,15 +267,27 @@ def test_apply_is_explicit_atomic_and_idempotent(market):
         assert db.execute("SELECT COUNT(*) FROM events WHERE job_id!='test-control'").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("change", ["draft", "items", "updated_at", "new_post"])
-def test_preview_drift_requires_a_new_preview_before_apply(market, change):
+def test_preview_drift_requires_a_new_preview_before_apply_when_draft_changes(market):
     draft = replace_draft(market, sale={"categories": [CATEGORY]})
     add_post(market)
     preview = action(market, "preview", draft=draft["id"])
     payload = deliver(market, preview, "确认应用")
-    if change == "draft":
-        replace_draft(market, sale={"categories": []})
-    elif change == "new_post":
+    replace_draft(market, sale={"categories": []})
+    result = interface.callback("webops", payload, store=market)
+    assert "已变化" in result["text"]
+    assert active(market)[0] == 1
+    assert current_draft(market)["status"] == "draft"
+    updated = click(market, result, "重新预览")
+    assert "已应用版本 2" in click(market, updated, "确认应用")["text"]
+
+
+@pytest.mark.parametrize("change", ["items", "updated_at", "new_post"])
+def test_preview_confirmation_uses_the_displayed_snapshot_when_samples_change(market, change):
+    draft = replace_draft(market, sale={"categories": [CATEGORY]})
+    add_post(market)
+    preview = action(market, "preview", draft=draft["id"])
+    payload = deliver(market, preview, "确认应用")
+    if change == "new_post":
         add_post(market, "2")
     else:
         with market.box.connect() as db:
@@ -284,11 +296,77 @@ def test_preview_drift_requires_a_new_preview_before_apply(market, change):
             else:
                 db.execute("UPDATE marketplace_posts SET updated_at=updated_at+1")
     result = interface.callback("webops", payload, store=market)
+    assert "已应用版本 2" in result["text"]
+    assert active(market)[0] == 2
+    with market.box.connect() as db:
+        assert db.execute("SELECT status FROM market_drafts WHERE id=?", (draft["id"],)).fetchone()[0] == "applied"
+
+
+def test_preview_displays_statistics_time_and_refreshes_snapshot(market):
+    draft = replace_draft(market, sale={"categories": [CATEGORY]})
+    add_post(market)
+    preview = action(market, "preview", draft=draft["id"])
+    assert "· 1 帖" in preview["text"]
+    assert "样本统计截至 " in preview["text"]
+    assert "（北京时间）" in preview["text"]
+    assert any(button["text"] == "刷新预览"
+               for row in preview["reply_markup"]["inline_keyboard"] for button in row)
+
+    old_payload = deliver(market, preview, "确认应用")
+    add_post(market, "2")
+    refreshed = click(market, preview, "刷新预览")
+    assert "· 2 帖" in refreshed["text"]
+    stale = interface.callback("webops", old_payload, store=market)
+    assert "已变化" in stale["text"]
+    assert active(market)[0] == 1
+    assert "已应用版本 2" in click(market, refreshed, "确认应用")["text"]
+
+
+def test_preview_confirmation_survives_restart_and_new_post(market):
+    draft = replace_draft(market, sale={"categories": [CATEGORY]})
+    add_post(market)
+    preview = action(market, "preview", draft=draft["id"])
+    payload = deliver(market, preview, "确认应用")
+    restarted = Store(Outbox(market.box.path))
+    add_post(restarted, "2")
+    result = interface.callback("webops", payload, store=restarted)
+    assert "已应用版本 2" in result["text"]
+    assert active(restarted)[0] == 2
+    with restarted.box.connect() as db:
+        assert db.execute("SELECT status FROM market_drafts WHERE id=?", (draft["id"],)).fetchone()[0] == "applied"
+
+
+def test_old_preview_without_draft_hash_requires_a_new_preview(market):
+    draft = replace_draft(market, sale={"categories": [CATEGORY]})
+    add_post(market)
+    preview = action(market, "preview", draft=draft["id"])
+    payload = deliver(market, preview, "确认应用")
+    with market.box.connect() as db:
+        saved = json.loads(db.execute("SELECT preview FROM market_drafts WHERE id=?", (draft["id"],)).fetchone()[0])
+        saved.pop("draft_hash")
+        db.execute("UPDATE market_drafts SET preview=? WHERE id=?", (json.dumps(saved), draft["id"]))
+    result = interface.callback("webops", payload, store=market)
+    assert "已变化" in result["text"]
+    assert active(market)[0] == 1
+    updated = click(market, result, "重新预览")
+    assert "已应用版本 2" in click(market, updated, "确认应用")["text"]
+
+
+def test_preview_rejects_content_change_even_when_revision_is_unchanged(market):
+    draft = replace_draft(market, sale={"categories": [CATEGORY]})
+    add_post(market)
+    preview = action(market, "preview", draft=draft["id"])
+    payload = deliver(market, preview, "确认应用")
+    with market.box.connect() as db:
+        row = db.execute("SELECT content,revision FROM market_drafts WHERE id=?", (draft["id"],)).fetchone()
+        content = json.loads(row["content"])
+        content["sale"]["categories"] = []
+        db.execute("UPDATE market_drafts SET content=? WHERE id=?", (control.dumps(content), draft["id"]))
+        assert db.execute("SELECT revision FROM market_drafts WHERE id=?", (draft["id"],)).fetchone()[0] == row["revision"]
+    result = interface.callback("webops", payload, store=market)
     assert "已变化" in result["text"]
     assert active(market)[0] == 1
     assert current_draft(market)["status"] == "draft"
-    updated = click(market, result, "重新预览")
-    assert "已应用版本 2" in click(market, updated, "确认应用")["text"]
 
 
 def test_old_version_card_cannot_overwrite_new_policy(market):
@@ -310,6 +388,7 @@ def test_rollback_previews_and_commits_a_new_version(market):
     before = active(market)
     preview = action(market, "rollback_preview")
     assert active(market) == before
+    add_post(market, "2")
     assert "已应用版本 3" in click(market, preview, "确认应用")["text"]
     version, restored = active(market)
     assert version == 3
