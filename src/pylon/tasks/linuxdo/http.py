@@ -77,10 +77,16 @@ def topic_evidence(topic_id: str, post_numbers: list[int], *, getter=fetch) -> l
         body, links = plain_html(str(post.get('cooked') or ''))
         if not body:
             continue
+        from pylon.shared.html_text import body_text
+        owned_body=body_text(str(post.get('cooked') or ''))
         result.append({'ref': f'topic:{number}', 'origin': 'topic', 'post_number': number,
                        'url': f'https://linux.do/t/topic/{topic_id}/{number}',
                        'title': clean(str(data.get('title') or ''), 300),
-                       'body': body, 'links': links, 'complete': True})
+                       'body': body, 'links': links, 'complete': True,
+                       'owned_body':owned_body,
+                       'actor_hash':__import__('pylon.tasks.linuxdo.common',fromlist=['digest']).digest(str(post.get('username','')).casefold()) if post.get('username') else '',
+                       'source_published_at':str(post.get('created_at') or ''),
+                       'source_edited_at':str(post.get('updated_at') or '')})
     if not result:
         raise FetchError('topic body unavailable')
     return result

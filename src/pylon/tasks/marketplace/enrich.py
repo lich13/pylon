@@ -11,7 +11,7 @@ from . import classifier
 from .taxonomy import CATEGORIES, type_for
 from .subjects import FIELDS
 
-VERSION = 'marketplace-items-v7'
+VERSION = 'marketplace-items-v8'
 CONSTRAINT = re.compile(r'已售|已出|预[订定]|求购|求收|不出售|赠送|赠品|不含|不带|打包|不拆|不单卖|'
                         r'本地|同城|自提|面交|地区|邮寄|快递|包邮|顺丰|外地|全国|'
                         r'电池|循环|维修|拆修|使用|划痕|磕碰|成新|全新|未拆|未激活')
@@ -83,6 +83,10 @@ def fingerprint(post: dict, model: str) -> str:
 def needs_analysis(post: dict, items: list[dict]) -> bool:
     if not post.get('body_complete') or not post.get('body'):
         return False
+    items=[item for item in items if not item['attributes'].get('ai_price_result')]
+    if not items:return False
+    if items and all(i['status']=='sold' or i['attributes'].get('intent') in {'inquiry','discussion'} for i in items):
+        return False
     body=post['body']
     rows=[line for line in body.splitlines() if line.count('|')>=2]
     flat_table=bool(re.search(r'(?:名称|商品)[\s|]*(?:价格|售价)',body) and len(items)>1)
@@ -93,8 +97,10 @@ def needs_analysis(post: dict, items: list[dict]) -> bool:
                 and any(c.role=='unresolved' for c in classifier.price_analysis(i['text']).candidates)
                 for i in items)
     return (bool(subject_conflict(post,items))
+            or any(i['attributes'].get('trade_intent_pending') for i in items)
+            or any(i['attributes'].get('conditional_terms') for i in items)
             or any(i['category']=='unknown' or i['attributes'].get('required_missing') for i in items)
-            or len(rows)>=2 or flat_table or (len(items)>1 and ambiguous)
+            or len(rows)>=2 or flat_table or ambiguous
             or (len(items)>=3 and fragmented>0) or unbound)
 
 
@@ -181,6 +187,7 @@ def _normal(text: str) -> str:
 
 
 def supported_category(category: str, name: str, evidence: str) -> bool:
+    if category=='wearable.watch' and re.search(r'电话手表|儿童(?:智能)?手表',name):return False
     from .subjects import subject_text, heading
     owned=classifier._clean_subject(URL.sub('',evidence))
     owned='\n'.join(clause for clause in re.split(r'[\n，,。；;|]',owned) if not re.search(r'不是|并非|不(?:出售|单卖)',clause))
@@ -190,14 +197,16 @@ def supported_category(category: str, name: str, evidence: str) -> bool:
     named_key,named_evidence=classifier.category_for(name)
     named=classifier.canonical(named_key)
     if local==category:return True
-    if category=='unknown':return local=='unknown'
+    if category=='unknown':return True
     # Explicit accessory/system heads are contradictory evidence. Unknown
     # models remain correctable: the verifier checks ownership, not its lexicon.
-    if local.startswith(('accessory.','computer.')) and type_for(local)!=type_for(category):return False
-    if named!='unknown' and type_for(named)!=type_for(category):
-        # A bare GPU number in a laptop model is a weak lexical guess. It is
-        # not the explicit accessory/system counter-evidence above.
-        if not (named=='component.gpu' and named_evidence.isdigit()):return False
+    noun=re.compile(r'手机壳|保护壳|保护膜|镜头膜|充电器|耳机|音箱|相机|镜头(?!膜)|笔记本|台式|小主机|整机|'
+                    r'iPhone|iPad|MacBook|AirPods|Apple\s*Watch|(?:电话|儿童(?:智能)?)手表|内存|显卡|硬盘|鼠标|键盘',re.I)
+    # Only explicit product nouns are hard counter-evidence. A locally guessed
+    # short model or a forum heading is not a second independent verifier.
+    if (local.startswith('accessory.') and noun.search(heading(owned)) and type_for(local)!=type_for(category)):
+        return False
+    if named!='unknown' and noun.search(name) and type_for(named)!=type_for(category):return False
     return category in CATEGORIES
 
 
@@ -217,10 +226,11 @@ def price_evidence(lines: list[str], index: int, category: str):
                     return analyse_price('售价 '+cell)
                 break
     return analyse_price(line,allow_bare=True,subject=lambda _:True,
+                         recurring=category.startswith('virtual.'),
                          capacity_context=category.startswith(('phone.','tablet.','computer.','storage.')))
 
 
-def validate(value: dict, post: dict) -> list[dict]:
+def validate(value: dict, post: dict, *, partial: bool = False) -> list[dict]:
     if not isinstance(value,dict) or not isinstance(value.get('items'),list) or not 1<=len(value['items'])<=30:
         raise AnalysisError('invalid_items')
     lines=source_lines(post);urls={'L'+str(i):u for i,u in enumerate(links(post['title']+'\n'+post['body']))}
@@ -247,98 +257,118 @@ def validate(value: dict, post: dict) -> list[dict]:
         owned=set(range(start,end+1))
         if claimed & owned or owned & set(common):raise AnalysisError('overlapping_items')
         claimed |= owned
-        evidence='\n'.join(lines[start:end+1]);name=raw.get('name','')
-        product_rows=[line for line in lines[start:end+1]
-                      if line.count('|')>=2 and classifier.category_for(line)[0]!='unknown']
-        if len(product_rows)>1:raise AnalysisError('multiple_products_in_range')
-        if (not isinstance(name,str) or not name.strip() or len(name)>160 or '\n' in name
-                or _normal(name) not in _normal(evidence)):
-            raise AnalysisError('invented_subject')
-        category=raw.get('category')
-        if category not in CATEGORIES and category!='unknown':raise AnalysisError('invalid_category')
-        # The source's actual sale subject must agree, not just an AI-picked
-        # device name borrowed from a case, a gift or a system configuration.
-        if not supported_category(category,name,evidence):
-            raise AnalysisError('unsupported_category:item='+str(len(output))+':'+str(category))
-        context=name+'\n'+evidence+'\n'+'\n'.join(lines[i] for i in common)
-        parsed=classifier.classify_listing(name,context,post['source'],bool(post['body_complete']),single_item=True)
-        possible=parsed
-        if not possible:raise AnalysisError('missing_item')
-        # Rebuild exactly one item from the verified source span. Local rules
-        # retain the authority over region, sold state, condition and priority.
-        item=possible[0]
-        item['category']=category
-        for fragment in raw.get('category_evidence',[]):
-            if not isinstance(fragment,str) or not fragment or fragment not in evidence:raise AnalysisError('invented_category_evidence')
-        item['attributes']['category_reason']=str(raw.get('category_reason') or '')[:500]
-        item['attributes']['category_evidence']=raw.get('category_evidence',[])
-        from .subjects import applicable_fields
-        for fact in raw.get('attributes',[]):
-            field,answer,quote=fact.get('field'),fact.get('value'),fact.get('evidence')
-            if field not in FIELDS or field=='price':raise AnalysisError('invalid_attribute_field:use_attribute_fields_keys_only')
-            if not isinstance(answer,str) or len(answer)>80:raise AnalysisError('invalid_attribute_value:'+field)
-            if not isinstance(quote,str) or not quote or quote not in evidence:raise AnalysisError('attribute_quote_outside_item:'+field)
-            if _normal(answer) not in _normal(quote):raise AnalysisError('invented_attribute_value')
-            # A quoted paragraph may contain both the item and a replacement
-            # story. Check ownership of the actual value, not of the paragraph.
-            if _normal(answer) not in _normal(classifier._clean_subject(quote)):
-                raise AnalysisError('attribute_from_background:'+field)
-            if field not in applicable_fields(category):continue
-            if field in item['attributes'].get('attribute_conflicts',[]):raise AnalysisError('attribute_conflict:'+field)
-            previous=item['attributes']['facts'].get(field)
-            numeric=field in {'ram_gb','storage_gb'}
-            quantity=re.fullmatch(r'(\d{1,4})\s*(GB|G|TB|T)?',answer,re.I) if numeric else None
-            if numeric and not quantity:raise AnalysisError('invalid_numeric_attribute:'+field)
-            converted=(int(quantity[1])*(1024 if (quantity[2] or '').upper().startswith('T') else 1)) if numeric else answer
-            if previous not in (None,'',[]):
-                if numeric and converted!=previous:raise AnalysisError('attribute_conflict')
-                continue
-            item['attributes']['facts'][field]=converted if numeric else [converted]
-            item['attributes']['attribute_evidence'][field]=[quote]
-        novelty=raw.get('novelty')
-        if novelty is not None:
-            from .novelty import validate_suggestion
-            item['attributes']['novelty']=validate_suggestion(novelty,category,evidence)
-        item['text']=context
-        item['name']=name.strip()
-        amount=raw.get('price');price_line=raw.get('price_line')
-        if amount is not None:
-            if type(amount) not in (int,float) or not 0<amount<=1000000 or type(price_line) is not int:
-                raise AnalysisError('invalid_price')
-            if price_line not in owned or price_line in price_lines:raise AnalysisError('price_outside_item')
-            proof=price_evidence(lines,price_line,category)
-            unresolved={c.amount for c in proof.candidates if c.role=='unresolved'}
-            interpreted=(proof.amount is None and proof.status=='missing' and unresolved=={amount}
-                         and category!='unknown')
-            if proof.amount!=amount and not interpreted:raise AnalysisError('price_without_evidence')
-            # Explicit conflicting prices or bundles cannot be overridden by AI.
-            if item['attributes'].get('bundle') or classifier.price_analysis(evidence).status=='ambiguous':
-                raise AnalysisError('ambiguous_price')
-            price_lines.add(price_line)
-        elif price_line is not None:raise AnalysisError('price_line_without_amount')
-        state=raw.get('status')
-        if state not in {'available','buy','sold','uncertain'}:raise AnalysisError('invalid_status')
-        if item['status'] in {'sold','buy'} and state!=item['status']:raise AnalysisError('status_conflict')
-        if state=='available' and classifier.SOLD.search(context):
-            raise AnalysisError('unavailable_item')
-        # AI cannot turn a gift, inquiry or closed request into an offer.
-        item['status']=state if item['status']=='available' or amount is not None else item['status']
-        item['price']=amount
-        item['attributes']['facts'].pop('price',None)
-        if amount is not None:item['attributes']['facts']['price']=amount
-        item['index']=len(output)
-        owned_links=raw.get('link_ids',[])
-        evidence_links=set(links(evidence))
-        if not isinstance(owned_links,list) or any(link not in urls or urls[link] not in evidence_links for link in owned_links):
-            raise AnalysisError('unbound_item_link')
-        # The verified, exclusive source span already establishes ownership.
-        # Preserve its original links even when the model omits a reference;
-        # links outside that span still require explicit shared ownership.
-        item_links=[url for key,url in urls.items() if url in evidence_links and key not in shared]
-        item['attributes'].update(analysis_version=VERSION,price_status='identified' if amount is not None else 'missing',
-            price_reason='verified_grok_evidence',price_evidence=lines[price_line] if price_line is not None else '',
-            links=item_links,shared_links=[urls[k] for k in shared])
-        output.append(item)
+        try:
+            evidence='\n'.join(lines[start:end+1]);name=raw.get('name','')
+            product_rows=[line for line in lines[start:end+1]
+                          if line.count('|')>=2 and classifier.category_for(line)[0]!='unknown']
+            if len(product_rows)>1:raise AnalysisError('multiple_products_in_range')
+            if (not isinstance(name,str) or not name.strip() or len(name)>160 or '\n' in name
+                    or _normal(name) not in _normal(evidence)):
+                raise AnalysisError('invented_subject')
+            category=raw.get('category')
+            if category not in CATEGORIES and category!='unknown':raise AnalysisError('invalid_category')
+            # The source's actual sale subject must agree, not just an AI-picked
+            # device name borrowed from a case, a gift or a system configuration.
+            if not supported_category(category,name,evidence):
+                raise AnalysisError('unsupported_category:item='+str(len(output))+':'+str(category))
+            context=name+'\n'+evidence+'\n'+'\n'.join(lines[i] for i in common)
+            parsed=classifier.classify_listing(name,context,post['source'],bool(post['body_complete']),single_item=True)
+            possible=parsed
+            if not possible:raise AnalysisError('missing_item')
+            # Rebuild exactly one item from the verified source span. Local rules
+            # retain the authority over region, sold state, condition and priority.
+            item=possible[0]
+            item['category']=category
+            if category.startswith('virtual.') and classifier.entitlement_origin(post['title'],post['body'],evidence):
+                item['attributes']['facts']['origin']=['88VIP']
+                item['attributes']['attribute_evidence']['origin']=[post['title']]
+            if ('category_evidence' in raw and category!='unknown' and
+                    (not isinstance(raw['category_evidence'],list) or not raw['category_evidence'] or not str(raw.get('category_reason','')).strip())):
+                raise AnalysisError('missing_category_evidence')
+            for fragment in raw.get('category_evidence',[]):
+                if not isinstance(fragment,str) or not fragment or fragment not in evidence:raise AnalysisError('invented_category_evidence')
+            item['attributes']['category_reason']=str(raw.get('category_reason') or '')[:500]
+            item['attributes']['category_evidence']=raw.get('category_evidence',[])
+            from .subjects import applicable_fields
+            for fact in raw.get('attributes',[]):
+                field,answer,quote=fact.get('field'),fact.get('value'),fact.get('evidence')
+                if field not in FIELDS or field=='price':raise AnalysisError('invalid_attribute_field:use_attribute_fields_keys_only')
+                if not isinstance(answer,str) or len(answer)>80:raise AnalysisError('invalid_attribute_value:'+field)
+                if not isinstance(quote,str) or not quote or quote not in evidence:raise AnalysisError('attribute_quote_outside_item:'+field)
+                if _normal(answer) not in _normal(quote):raise AnalysisError('invented_attribute_value')
+                # A quoted paragraph may contain both the item and a replacement
+                # story. Check ownership of the actual value, not of the paragraph.
+                if _normal(answer) not in _normal(classifier._clean_subject(quote)):
+                    raise AnalysisError('attribute_from_background:'+field)
+                if field not in applicable_fields(category):continue
+                if field in item['attributes'].get('attribute_conflicts',[]):raise AnalysisError('attribute_conflict:'+field)
+                previous=item['attributes']['facts'].get(field)
+                numeric=field in {'ram_gb','storage_gb'}
+                quantity=re.fullmatch(r'(\d{1,4})\s*(GB|G|TB|T)?',answer,re.I) if numeric else None
+                if numeric and not quantity:raise AnalysisError('invalid_numeric_attribute:'+field)
+                converted=(int(quantity[1])*(1024 if (quantity[2] or '').upper().startswith('T') else 1)) if numeric else answer
+                if previous not in (None,'',[]):
+                    if numeric and converted!=previous:raise AnalysisError('attribute_conflict')
+                    continue
+                item['attributes']['facts'][field]=converted if numeric else [converted]
+                item['attributes']['attribute_evidence'][field]=[quote]
+            novelty=raw.get('novelty')
+            if novelty is not None:
+                from .novelty import validate_suggestion
+                item['attributes']['novelty']=validate_suggestion(novelty,category,evidence)
+            item['text']=context
+            item['name']=name.strip()
+            amount=raw.get('price');price_line=raw.get('price_line')
+            if amount is not None:
+                if type(amount) not in (int,float) or not 0<amount<=1000000 or type(price_line) is not int:
+                    raise AnalysisError('invalid_price')
+                if price_line not in owned or price_line in price_lines:raise AnalysisError('price_outside_item')
+                proof=price_evidence(lines,price_line,category)
+                unresolved={c.amount for c in proof.candidates if c.role=='unresolved'}
+                interpreted=(proof.amount is None and proof.status=='missing' and unresolved=={amount}
+                             and category!='unknown')
+                if proof.amount!=amount and not interpreted:raise AnalysisError('price_without_evidence')
+                # Explicit conflicting prices or bundles cannot be overridden by AI.
+                if classifier.price_analysis(evidence).status=='ambiguous':
+                    raise AnalysisError('ambiguous_price')
+                price_lines.add(price_line)
+            elif price_line is not None:raise AnalysisError('price_line_without_amount')
+            state=raw.get('status')
+            if state not in {'available','buy','sold','uncertain'}:raise AnalysisError('invalid_status')
+            if item['status'] in {'sold','buy'} and state!=item['status']:raise AnalysisError('status_conflict')
+            if state=='available' and classifier.SOLD.search(context):
+                raise AnalysisError('unavailable_item')
+            # AI cannot turn a gift, inquiry or closed request into an offer.
+            item['status']=state if item['status']=='available' or amount is not None else item['status']
+            item['price']=amount
+            item['attributes']['facts'].pop('price',None)
+            if amount is not None:item['attributes']['facts']['price']=amount
+            item['index']=len(output)
+            owned_links=raw.get('link_ids',[])
+            evidence_links=set(links(evidence))
+            if not isinstance(owned_links,list) or any(link not in urls or urls[link] not in evidence_links for link in owned_links):
+                raise AnalysisError('unbound_item_link')
+            # The verified, exclusive source span already establishes ownership.
+            # Preserve its original links even when the model omits a reference;
+            # links outside that span still require explicit shared ownership.
+            item_links=[url for key,url in urls.items() if url in evidence_links and key not in shared]
+            item['attributes'].update(analysis_version=VERSION,price_status='identified' if amount is not None else 'missing',
+                price_reason='verified_grok_evidence',price_evidence=lines[price_line] if price_line is not None else '',
+                links=item_links,shared_links=[urls[k] for k in shared])
+            output.append(item)
+        except AnalysisError as error:
+            if not partial or len(value['items'])==1:raise
+            # The span boundaries have already passed disjointness checks.
+            # Keep its uncertainty separate; never reuse its price elsewhere.
+            evidence='\n'.join(lines[start:end+1])
+            fallback=classifier.classify_listing(lines[start],evidence,post['source'],bool(post['body_complete']),single_item=True)
+            if not fallback:raise
+            item=fallback[0]
+            item.update(index=len(output),category='unknown',price=None,name=lines[start][:160])
+            item['attributes'].update(analysis_version=VERSION,analysis_error=str(error),
+                price_status='missing',links=links(evidence),shared_links=[])
+            item['attributes']['facts'].pop('price',None)
+            output.append(item)
     # A shared link must not secretly be another product's individual link.
     # For a single item, a whole-post link and an item link have the same owner.
     for link in shared:
@@ -367,16 +397,23 @@ def request(post: dict) -> tuple[list[dict],str]:
     schema['properties']['items']['items']['properties']['category']['enum']=[*CATEGORIES,'unknown']
     response,request_id=_request_grok_structured(build_prompt(post),schema=schema,name='marketplace_items',
                                                timeout=20,total_timeout=120)
-    return validate(extract_grok_json(response,label='marketplace items'),post),request_id
+    return validate(extract_grok_json(response,label='marketplace items'),post,partial=bool(post.get('_correction'))),request_id
 
 
 def prepare(db, post: dict, items: list[dict]) -> list[dict] | None:
     if post.get('history'):return items
     required=sorted({field for i in items for field in i['attributes'].get('required_missing',[])})
-    if all(i['attributes'].get('analysis_version')==VERSION and set(required)<=set(i['attributes'].get('analysis_fields',[])) for i in items) and items:return items
+    if all((i['attributes'].get('analysis_version')==VERSION and set(required)<=set(i['attributes'].get('analysis_fields',[])))
+           or i['attributes'].get('ai_price_result') for i in items) and items:return items
     if not needs_analysis(post,items):return items
     post['_required_fields']=required
     conflict=subject_conflict(post,items)
+    safe=[] if conflict else [i for i in items if i['category']!='unknown' and i['status'] in {'available','buy'}
+              and not i['attributes'].get('trade_intent_pending')
+              and not i['attributes'].get('conditional_terms')
+              and i['attributes'].get('price_status')!='ambiguous' and not i['attributes'].get('required_missing')
+              and (not any(line.count('|')>=2 for line in post['body'].splitlines())
+                   or i['attributes'].get('analysis_version')==VERSION or i['attributes'].get('ai_price_result'))]
     model=model_name();key=fingerprint(post,model)
     row=db.execute('SELECT * FROM marketplace_analyses WHERE fingerprint=?',(key,)).fetchone()
     if row and row['status']=='complete':return json.loads(row['result'])
@@ -384,17 +421,14 @@ def prepare(db, post: dict, items: list[dict]) -> list[dict] | None:
         from .control import review
         review(db,post,-1,'分析未能确认：'+row['error'])
         db.execute("UPDATE marketplace_posts SET status='needs_review' WHERE source=? AND source_id=? AND status='ready'",(post['source'],post['source_id']))
-        return None
+        return safe if safe and len(items)>len(safe) else None
     if row is None:
         db.execute('INSERT INTO marketplace_analyses(fingerprint,source,source_id,status,updated_at,model,requirements) VALUES(?,?,?,?,?,?,?)',
                    (key,post['source'],post['source_id'],'pending',time.time(),model,json.dumps(required)))
     db.execute("UPDATE marketplace_posts SET status='pending_analysis' WHERE source=? AND source_id=? AND history=0 AND status='ready'",
                (post['source'],post['source_id']))
     # A separate unknown item must not hold an unambiguous known sale.
-    if not conflict and not any(line.count('|')>=2 for line in post['body'].splitlines()):
-        safe=[i for i in items if i['category']!='unknown' and i['status'] in {'available','buy'}
-              and i['attributes'].get('price_status')!='ambiguous' and not i['attributes'].get('required_missing')]
-        if safe and len(items)>len(safe):return safe
+    if safe and len(items)>len(safe):return safe
     return None
 
 
@@ -438,7 +472,7 @@ def run_pending(store, *, limit: int = 1) -> int:
                     item['attributes']['analysis_fields']=json.loads(job['requirements'])
                     if item['category']=='unknown':
                         if item['attributes'].get('novelty'):record(db,post,item)
-                        else:review(db,post,item['index'],'主体或类别仍不明确')
+                        else:review(db,post,item['index'],item['attributes'].get('analysis_error') or '主体或类别仍不明确')
                 db.execute("UPDATE market_reviews SET status='resolved',updated_at=? WHERE source=? AND source_id=? AND item_index=-1",(time.time(),post['source'],post['source_id']))
                 result=json.dumps(items,ensure_ascii=False)
                 db.execute("UPDATE marketplace_analyses SET status='complete',result=?,request_id=?,updated_at=?,error='' WHERE fingerprint=?",
@@ -469,7 +503,9 @@ def main():
     from .store import Store
     from .pipeline import process
     store=Store()
-    run_pending(store,limit=2)
+    from .ai_prices import run_pending as run_prices
+    run_prices(store,limit=1)
+    run_pending(store,limit=1)
     process(store)
     print('{"wakeAgent":false}')
     return 0
@@ -480,7 +516,9 @@ def summary(store) -> str:
         rows=dict(db.execute("""SELECT a.status,COUNT(*) FROM marketplace_analyses a
             JOIN marketplace_posts p USING(source,source_id)
             WHERE p.history=0 AND p.status='pending_analysis' GROUP BY a.status""").fetchall())
-    return f"复杂帖待分析 {rows.get('pending',0)+rows.get('running',0)}，待核对 {rows.get('error',0)}"
+        prices=dict(db.execute('SELECT status,COUNT(*) FROM market_ai_prices GROUP BY status').fetchall())
+        reviews=db.execute("SELECT COUNT(*) FROM market_reviews WHERE status='pending'").fetchone()[0]
+    return f"复杂帖待分析 {rows.get('pending',0)+rows.get('running',0)}，AI 报价待分析 {prices.get('pending',0)+prices.get('running',0)}，待核对 {reviews}"
 
 
 if __name__=='__main__':raise SystemExit(main())

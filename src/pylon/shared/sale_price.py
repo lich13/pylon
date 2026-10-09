@@ -11,11 +11,11 @@ import re
 import unicodedata
 from typing import Callable
 
-NUMBER = re.compile(r"(?P<prefix>[¥￥]|人民币|RMB)?[ \t]*(?P<n>\d+(?:\.\d+)?)(?P<scale>[ \t]*[kKwW万千])?(?P<suffix>[ \t]*(?:元|块|RMB|人民币))?", re.I)
+NUMBER = re.compile(r"(?P<prefix>[¥￥$]|人民币|RMB|USDT|USD)?[ \t]*(?P<n>\d+(?:\.\d+)?)(?P<scale>[ \t]*[kKwW万千])?(?P<suffix>[ \t]*(?:元|块|RMB|人民币|USDT|USD|美元|r(?![A-Za-z0-9])))?", re.I)
 SELLER = re.compile(r"明盘|一口价|售价|卖价|价格|挂价|定价|现价|现出|现卖|出价|自刀(?:到)?|再刀(?:到)?|刀至|降至|降到|现降|改价(?:为|到)?|现改|现在", re.I)
 REVISION = re.compile(r"自刀|再刀|刀至|降至|降到|现降|改价|现改")
 REFERENCE = re.compile(
-    r"(?:官网|官方|京东|淘宝|天猫|拼多多|商城|专柜|旗舰店)[^\d\n。；;，,]{0,12}?"
+    r"(?:官网|官方|京东|(?<![A-Za-z])JD(?![A-Za-z])|淘宝|天猫|拼多多|商城|专柜|旗舰店)[^\d\n。；;，,]{0,12}?"
     r"(?:现价|售价|价格|报价|定价|到手价|到手|价)|(?:原|参考|建议|零售|厂商)定价|原价|官网|官方价|参考价|市场价|全新价|面值|"
     r"购入|买入|入手|买时|到手价|购价|购买价|收购价|回收价|报价|预算", re.I)
 EXPENSE = re.compile(r"定金|订金|押金|补贴|优惠券|省了|便宜了|立减|直降|降了|运费|邮费|维修|换屏|电池更换|首付|每月|分期", re.I)
@@ -70,6 +70,7 @@ def analyse_price(text: str, *, minimum: int = 1, maximum: int = 1000000,
                   allow_bare: bool = False,
                   subject: Callable[[str], bool] | None = None,
                   strict_title: Callable[[str], bool] | None = None,
+                  recurring: bool = False,
                   capacity_context: bool | None = None) -> PriceAnalysis:
     text = _normalise(text)
     protected = [m.span() for pattern in (DATE, re.compile(r'https?://\S+'),
@@ -93,6 +94,8 @@ def analyse_price(text: str, *, minimum: int = 1, maximum: int = 1000000,
             value = int(amount) if amount == int(amount) else float(amount)
             marked = bool(match['prefix'] or match['suffix'])
             role, marker = _role(before)
+            if recurring and role=='expense' and marker is not None and marker[0]=='每月':
+                role='seller'
             # A battery/cycle/count label owns its next number, not every later
             # number in a compact specification-and-price heading.
             if role in {'metadata','seller'} and marker is not None and re.search(r'\d', before[marker.end():]):
@@ -103,6 +106,10 @@ def analyse_price(text: str, *, minimum: int = 1, maximum: int = 1000000,
             reason = ''
             if any(left <= position < right for left, right in protected):
                 reason = 'protected_metadata'
+            elif re.search(r'(?:之前|原先|上次|曾经)\s*$',before) and re.match(r'\s*(?:元|块)?\s*(?:出了|卖出|卖掉|出掉)',after):
+                reason = 'reference'
+            elif re.search(r'(?:会|将会|可能)(?:涨|变|改|调整|增加)(?:价)?(?:到|为|至|成)?\s*$',before):
+                reason = 'conditional_price'
             elif re.search(r'(?:\+|另加|加收|加价|补差)\s*$',before):
                 reason = 'optional_surcharge'
             elif (not match['prefix'] and start and re.match(r'[A-Za-z0-9_.]', line[start-1])) or (MODEL_PREFIX.search(before) and not marked):
@@ -122,8 +129,9 @@ def analyse_price(text: str, *, minimum: int = 1, maximum: int = 1000000,
             elif (not marked and not scale and role != 'seller' and 2000 <= value <= 2035
                   and re.search(r'(?:MacBook|iMac|Mac\s*mini|Mac\s*Pro|ThinkPad|Surface|iPad)\s*(?:Air|Pro|mini)?\s*$', before, re.I)):
                 reason = 'model_year'
-            elif (not marked and not scale and role != 'seller' and 800 <= value <= 10000
-                  and re.search(r'DDR\s*[345]', before, re.I)):
+            elif (not marked and not scale and role != 'seller'
+                  and (memory := re.search(r'DDR\s*([345])(?:\s*(?:[-/：:]|\d+\s*(?:GB|G|TB|T)(?:\s*[x×*]\s*\d+)?|CL?\s*\d+))*\s*$', before, re.I))
+                  and {3:800,4:1600,5:4000}[int(memory[1])] <= value <= 12800):
                 reason = 'memory_frequency'
             elif (not marked and role != 'seller' and len(match['n']) > 1
                   and match['n'].startswith('0') and not match['n'].startswith('0.')):
@@ -133,7 +141,8 @@ def analyse_price(text: str, *, minimum: int = 1, maximum: int = 1000000,
             if reason:
                 candidates.append(Candidate(value, 'excluded', line.strip()[:160], position, reason))
                 continue
-            explicit = marked or bool(scale) or role == 'seller' or bool(DELIVERY.match(after))
+            periodic = recurring and bool(re.match(r'\s*/\s*(?:年|季度|季|个月|月|周|天|日|小时|人|席)',after))
+            explicit = marked or bool(scale) or role == 'seller' or bool(DELIVERY.match(after)) or periodic
             bare = False
             if not explicit:
                 # A transaction's recognised subject gives meaning to a trailing

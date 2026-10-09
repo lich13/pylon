@@ -15,6 +15,52 @@ from pylon.tasks.marketplace.store import Store
 
 CATEGORY = "phone.smartphone"
 OWNER = 123
+RETIRED_COMMAND = interface.command
+RETIRED_CALLBACK = interface.callback
+RETIRED_REPLY = interface.reply
+
+
+def _legacy_command(profile, argument="", *, store=None):
+    if profile != "webops":
+        return interface.card("交易管理请在库库干使用 /market。")
+    store = store or Store()
+    with store.box.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        return interface.check_post(db, argument) if argument else interface.home_card(db)
+
+
+def _legacy_callback(profile, payload, *, store=None):
+    store = store or Store()
+    if profile != "webops" or not inline.owns_callback(profile, payload, box=store.box):
+        raise ValueError("按钮不属于本人会话或原消息")
+    parts = str(payload.get("data", "")).split("|")
+    if (len(parts) != 3 or parts[0] != "mk1"
+            or not interface.hmac.compare_digest(parts[2], interface._signature(profile, "market", parts[1]))):
+        raise ValueError("按钮签名无效")
+    with store.box.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute(
+            "SELECT * FROM market_buttons WHERE id=? AND profile=?", (parts[1], profile)
+        ).fetchone()
+        if not row:
+            raise ValueError("按钮已失效")
+        if row["result"]:
+            return json.loads(row["result"])
+        version, _ = control.baseline(db)
+        if row["version"] != version:
+            return interface.card("策略已更新，请重新打开交易管理。", interface._back(db, version))
+        params = json.loads(row["payload"])
+        if params.get("draft"):
+            saved = db.execute(
+                "SELECT base,status FROM market_drafts WHERE id=?", (params["draft"],)
+            ).fetchone()
+            if not saved or saved["status"] != "draft" or saved["base"] != version:
+                return interface.card("草稿已处理或过期，请重新打开 /market。", interface._back(db, version))
+        result = interface.route(db, row["action"], params, version)
+        if row["action"] in {"apply", "toggle", "group_set", "value", "clear_field",
+                              "novel_action", "novel_bulk", "wanted_add", "wanted_remove"}:
+            db.execute("UPDATE market_buttons SET result=? WHERE id=?", (control.dumps(result), parts[1]))
+        return result
 
 
 @pytest.fixture
@@ -35,11 +81,18 @@ def market(tmp_path, monkeypatch):
     (settings / "marketplace-wanted.json").write_text(json.dumps({
         "version": 2, "enabled": False, "targets": [], "blocked_groups": [],
     }))
+    (settings / "market-web.json").write_text(json.dumps({
+        "public_url": "https://example.invalid/pylon/market",
+    }))
     prior_extensions = copy.deepcopy(taxonomy.EXTENSIONS)
     taxonomy.refresh_extensions({})
     store = Store()
     with store.box.connect() as db:
         control.baseline(db)
+    # Backend route coverage below calls the internal algorithm directly. The
+    # real Telegram entry points are exercised through RETIRED_* tests.
+    monkeypatch.setattr(interface, "command", _legacy_command)
+    monkeypatch.setattr(interface, "callback", _legacy_callback)
     yield store
     taxonomy.refresh_extensions(prior_extensions)
 
@@ -78,7 +131,22 @@ def deliver(store, card, label, *, profile="webops", receipt=None):
 
 
 def click(store, card, label):
-    return interface.callback("webops", deliver(store, card, label), store=store)
+    matches = [
+        button
+        for row in card["reply_markup"]["inline_keyboard"]
+        for button in row
+        if button["text"] == label
+    ]
+    assert len(matches) == 1
+    token = matches[0]["callback_data"].split("|")[1]
+    with store.box.connect() as db:
+        version, _ = control.baseline(db)
+        row = db.execute("SELECT action,payload FROM market_buttons WHERE id=?", (token,)).fetchone()
+        assert row is not None
+        result = interface.route(db, row["action"], json.loads(row["payload"]), version)
+    if row["action"] == "apply":
+        taxonomy.refresh_extensions()
+    return result
 
 
 def action_payload(store, action, **values):
@@ -89,12 +157,18 @@ def action_payload(store, action, **values):
 
 
 def action(store, name, **values):
-    return interface.callback("webops", action_payload(store, name, **values), store=store)
+    with store.box.connect() as db:
+        version, _ = control.baseline(db)
+        return interface.route(db, name, values, version)
 
 
 def apply_preview(store, draft=None):
     preview = action(store, "preview", draft=(draft or current_draft(store))["id"])
-    return click(store, preview, "确认应用")
+    result = click(store, preview, "确认应用")
+    # The legacy helpers call the route directly, so refresh the in-memory
+    # extension catalog after the route's transaction has committed.
+    taxonomy.refresh_extensions()
+    return result
 
 
 def sample_item(*, category=CATEGORY, facts=None):
@@ -128,6 +202,97 @@ def record_kind(store, value=None, *, source_id="11", status="available", **post
                                  "attributes": {"novelty": value}})
         rows = db.execute("SELECT * FROM market_novelty ORDER BY first_seen").fetchall()
         return [dict(row) for row in rows]
+
+
+def test_retired_command_opens_the_web_surface_without_creating_a_draft(market):
+    before = active(market)
+    result = RETIRED_COMMAND("webops", store=market)
+
+    assert "登录链接" in result["text"]
+    button = result["reply_markup"]["inline_keyboard"][0][0]
+    assert button["text"] == "打开交易筛选"
+    assert button["url"].startswith("https://example.invalid/pylon/market/#login=")
+    assert active(market) == before
+    with market.box.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM market_drafts").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM market_buttons").fetchone()[0] == 0
+
+
+def test_retired_callback_valid_button_only_prompts_web_and_does_not_mutate(market):
+    before = active(market)
+    draft = current_draft(market)
+    payload = action_payload(market, "toggle", draft=draft["id"], category=CATEGORY)
+
+    result = RETIRED_CALLBACK("webops", payload, store=market)
+
+    assert "旧交易按钮已停用" in result["text"]
+    assert active(market) == before
+    assert current_draft(market) == draft
+    with market.box.connect() as db:
+        assert db.execute("SELECT result FROM market_buttons").fetchone()[0] is None
+
+
+@pytest.mark.parametrize("change", [
+    "sender", "bot", "chat", "group", "message", "message_type", "profile",
+    "missing_receipt", "receipt_owner", "other_card", "forged_signature",
+])
+def test_retired_callback_rejects_invalid_owner_or_signed_message(market, change):
+    before = active(market)
+    draft = current_draft(market)
+    payload = action_payload(market, "toggle", draft=draft["id"], category=CATEGORY)
+    profile = "webops"
+    if change == "sender":
+        payload["from"]["id"] = 456
+    elif change == "bot":
+        payload["from"]["is_bot"] = True
+    elif change == "chat":
+        payload["message"]["chat"]["id"] = 456
+    elif change == "group":
+        payload["message"]["chat"]["type"] = "group"
+    elif change == "message":
+        payload["message"]["message_id"] += 1
+    elif change == "message_type":
+        payload["message"]["message_id"] = str(payload["message"]["message_id"])
+    elif change == "profile":
+        profile = "default"
+    elif change == "forged_signature":
+        original = payload["data"]
+        payload["data"] = original[:-1] + ("a" if original[-1] != "a" else "b")
+        with market.box.connect() as db:
+            db.execute("UPDATE events SET payload=replace(payload,?,?)", (original, payload["data"]))
+    else:
+        with market.box.connect() as db:
+            if change == "missing_receipt":
+                db.execute("UPDATE events SET receipt=NULL")
+            elif change == "receipt_owner":
+                db.execute("UPDATE events SET receipt=?", (json.dumps([{
+                    "message_id": payload["message"]["message_id"], "chat_id": 456,
+                }]),))
+            else:
+                db.execute("UPDATE events SET payload=?", (json.dumps(interface.card("无此按钮")),))
+
+    if change != "forged_signature":
+        assert not inline.owns_callback(profile, payload, box=market.box)
+    with pytest.raises(ValueError, match="本人会话|原消息|签名无效"):
+        RETIRED_CALLBACK(profile, payload, store=market)
+    assert active(market) == before
+    assert current_draft(market) == draft
+
+
+def test_retired_reply_never_changes_pending_input_or_policy(market):
+    before = active(market)
+    draft = current_draft(market)
+    action(market, "input", draft=draft["id"], category=CATEGORY, field="price")
+    before_draft = current_draft(market)
+    with market.box.connect() as db:
+        before_inputs = db.execute("SELECT COUNT(*) FROM market_inputs").fetchone()[0]
+
+    assert RETIRED_REPLY("webops", 101, "最低 10；最高 300", store=market) is None
+    assert RETIRED_REPLY("webops", 101, "https://example.invalid/t/1201", store=market) is None
+    assert active(market) == before
+    assert current_draft(market) == before_draft
+    with market.box.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM market_inputs").fetchone()[0] == before_inputs
 
 
 def test_default_profile_cannot_open_or_change_market(market):
@@ -234,15 +399,12 @@ def test_draft_and_pending_input_survive_restart_without_changing_active_policy(
     before = current_draft(market)
     restarted = Store(Outbox(market.box.path))
     assert current_draft(restarted) == before
-    assert interface.reply("webops", 99999, "最低 10；最高 300", store=restarted) is None
-    result = interface.reply("webops", payload["message"]["message_id"], "最低 10；最高 300", store=restarted)
-    assert "最低 10" in result["text"] and "最高 300" in result["text"]
-    draft = current_draft(restarted)
-    assert draft["content"]["sale"]["filters"][CATEGORY]["price"] == {"min": 10, "max": 300}
-    assert draft["revision"] == before["revision"] + 1
+    assert RETIRED_REPLY("webops", 99999, "最低 10；最高 300", store=restarted) is None
+    assert RETIRED_REPLY("webops", payload["message"]["message_id"], "最低 10；最高 300", store=restarted) is None
+    assert current_draft(restarted) == before
     assert active(restarted) == baseline
     with restarted.box.connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM market_inputs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM market_inputs").fetchone()[0] == 1
 
 
 def test_apply_is_explicit_atomic_and_idempotent(market):

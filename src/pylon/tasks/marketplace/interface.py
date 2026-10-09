@@ -95,17 +95,24 @@ def group_card(db,d,group,page=0):
 
 
 def item_rows(db):
-    for row in db.execute('SELECT source,source_id,url,title,items,updated_at,body_complete FROM marketplace_posts ORDER BY first_seen DESC'):
-        yield dict(row)
+    # The live index also contains old title-only dedup records. Prefer the
+    # complete archive when both contain the same post.
+    rows={}
+    def add(connection,where=''):
+        for value in connection.execute('SELECT source,source_id,url,title,items,updated_at,body_complete FROM marketplace_posts '+where):
+            row=dict(value);identity=(row['source'],row['source_id']);previous=rows.get(identity)
+            if previous is None or (bool(row['body_complete']),row['updated_at'])>(bool(previous['body_complete']),previous['updated_at']):
+                rows[identity]=row
+    add(db)
     path=home()/'data/marketplace-review.sqlite3'
     if path.exists():
         with sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True) as history:
             history.row_factory=sqlite3.Row
-            for row in history.execute('SELECT source,source_id,url,title,items,updated_at,body_complete FROM marketplace_posts WHERE history=1'):
-                yield dict(row)
+            add(history,'WHERE history=1')
+    yield from sorted(rows.values(),key=lambda row:row['updated_at'],reverse=True)
 
 
-def options(db,category,field):
+def options(db,category,field,*,detail=False):
     values={};total=known=0;seen=set();samples=[]
     for row in item_rows(db):
         key=(row['source'],row['source_id'])
@@ -121,7 +128,8 @@ def options(db,category,field):
                 option=str(option)
                 if len(option)<=80:values[option]=values.get(option,0)+1
             if len(samples)<3:samples.append(row['url'])
-    return sorted(values,key=lambda k:(-values[k],k))[:24],total,known,samples
+    result=(sorted(values,key=lambda k:(-values[k],k)),total,known,samples)
+    return (*result,values) if detail else (result[0][:24],*result[1:])
 
 
 def fields_card(db,d,category,scope='sale'):
@@ -160,11 +168,12 @@ def field_card(db,d,category,field,scope='sale'):
 
 
 def preview(db,d):
-    counts={'match':0,'exclude':0,'review':0};examples={k:[] for k in counts};seen=set();fingerprints=[];complete=0
+    counts={'match':0,'exclude':0,'review':0};examples={k:[] for k in counts};details={k:[] for k in counts};seen=set();fingerprints=[];complete=0;coverage={}
     for row in item_rows(db):
         identity=(row['source'],row['source_id'])
         if identity in seen:continue
         seen.add(identity);complete+=int(bool(row['body_complete']));fingerprints.append([*identity,row['updated_at'],control.digest(row['items'])])
+        source=coverage.setdefault(row['source'],{'posts':0,'complete':0});source['posts']+=1;source['complete']+=int(bool(row['body_complete']))
         for item in json.loads(row['items']):
             draft_catalog=taxonomy.catalog(d['content'].get('taxonomy',{}))
             if item['category']=='unknown':
@@ -173,11 +182,18 @@ def preview(db,d):
                 if len(matches)==1:item['category']=matches.pop()
             if item['status']=='buy':
                 eligible=wanted.evaluate([item],{**d['content']['wanted'],'filters':{}})
-                state=policy.attribute_decision(item,d['content']['wanted'])[0] if eligible else 'exclude'
-            else:state=policy.decision(item,{**d['content']['sale'],'extension_categories':list(draft_catalog)})[0]
+                state,reasons=policy.attribute_decision(item,d['content']['wanted']) if eligible else ('exclude',['不符合独立求购目标'])
+            else:state,reasons=policy.decision(item,{**d['content']['sale'],'extension_categories':list(draft_catalog)})
+            from .ai_prices import is_ai
+            if state=='match' and item['status']!='buy' and is_ai(item) and not item['attributes'].get('ai_price_result'):
+                state,reasons='review',['AI 报价须按已确认价格上限核验；历史预览不调用模型']
             counts[state]+=1
-            if len(examples[state])<3:examples[state].append(row['url'])
+            if len(examples[state])<3:
+                examples[state].append(row['url'])
+                details[state].append({'url':row['url'],'title':item.get('name') or item['text'].split('\n')[0],
+                                      'price':item.get('price'),'reasons':reasons or ['符合关注条件']})
     return {'counts':counts,'examples':examples,'posts':len(seen),'complete':complete,'missing':len(seen)-complete,
+            'details':details,'coverage':coverage,
             'hash':control.digest([d['content'],fingerprints]),'draft_hash':control.digest(d['content']),'at':time.time()}
 
 
@@ -236,13 +252,15 @@ def novel_card(db,d,page=0):
 
 
 def check_post(db,url):
-    match=re.search(r'(?:thread-|/t/|tid=)(\d+)',url)
-    source='chiphell' if 'chiphell.com/' in url else 'v2ex' if 'v2ex.com/' in url else 'nga' if 'nga.cn/' in url else ''
-    if not match or not source:return card('请发送 CHH、V2EX 或 NGA 原帖链接。')
+    from urllib.parse import urlsplit
+    host=(urlsplit(url).hostname or '').lower()
+    source={'chiphell.com':'chiphell','www.chiphell.com':'chiphell','v2ex.com':'v2ex','www.v2ex.com':'v2ex','bbs.nga.cn':'nga','linux.do':'linuxdo'}.get(host,'')
+    match=re.search(r'(?:thread-|/t/(?:[^/]+/)?|tid=)(\d+)',url)
+    if not match or not source:return card('请提供 CHH、V2EX、NGA 或 Linux.do 原帖链接。')
     row=db.execute('SELECT * FROM marketplace_posts WHERE source=? AND source_id=?',(source,match[1])).fetchone()
     if not row:return card('尚未采集到此帖。检查不会补发历史内容。')
     labels={'queued':'已入通知队列','skipped':'已筛选排除','needs_review':'待核对','pending_analysis':'等待 Grok 分析',
-            'pending_body':'等待补抓正文','ready':'等待筛选','historical':'历史记录（不推送）','refresh_required':'补发前重新读取原帖'}
+            'pending_body':'等待补抓正文','pending_price':'等待 AI 报价条件分析','ready':'等待筛选','historical':'历史记录（不推送）','refresh_required':'补发前重新读取原帖'}
     lines=[row['title'],row['url'],'处理状态：'+labels.get(row['status'],row['status']),
            '正文：'+('完整' if row['body_complete'] else '缺失或不完整')]
     if row['platform_category']:lines.append('原站分类：'+row['platform_category'])
@@ -400,36 +418,18 @@ def route(db,action,p,version):
 
 
 def command(profile,argument='',*,store=None):
-    if profile!='webops':return card('交易管理请在库库干使用 /market。')
-    store=store or Store()
-    with store.box.connect() as db:
-        db.execute('BEGIN IMMEDIATE')
-        return check_post(db,argument) if argument else home_card(db)
+    from .web_auth import login_card
+    return login_card(profile,store=store)
 
 
 def callback(profile,payload,*,store=None):
     store=store or Store()
-    if profile!='webops' or not owns_callback(profile,payload,box=store.box):raise ValueError('按钮不属于本人会话或原消息')
+    if profile!='webops' or not owns_callback(profile,payload,box=store.box):
+        raise ValueError('按钮不属于本人会话或原消息')
     parts=str(payload.get('data','')).split('|')
-    if len(parts)!=3 or parts[0]!='mk1' or not hmac.compare_digest(parts[2],_signature(profile,'market',parts[1])):raise ValueError('按钮签名无效')
-    with store.box.connect() as db:
-        db.execute('BEGIN IMMEDIATE')
-        row=db.execute('SELECT * FROM market_buttons WHERE id=? AND profile=?',(parts[1],profile)).fetchone()
-        if not row:raise ValueError('按钮已失效')
-        if row['result']:return json.loads(row['result'])
-        version,content=control.baseline(db)
-        taxonomy.refresh_extensions(content.get('taxonomy',{}))
-        if row['version']!=version:return card('策略已更新，请重新打开交易管理。',[_back(db,version)])
-        params=json.loads(row['payload'])
-        if params.get('draft'):
-            saved=db.execute('SELECT base,status FROM market_drafts WHERE id=?',(params['draft'],)).fetchone()
-            if not saved or saved['status']!='draft' or saved['base']!=version:return card('草稿已处理或过期，请重新打开 /market。',[_back(db,version)])
-        result=route(db,row['action'],params,version)
-        # Repeated clicks on the same card never toggle back or apply twice.
-        if row['action'] in {'apply','toggle','group_set','value','clear_field','novel_action','novel_bulk','wanted_add','wanted_remove'}:
-            db.execute('UPDATE market_buttons SET result=? WHERE id=?',(control.dumps(result),parts[1]))
-    taxonomy.refresh_extensions()
-    return result
+    if len(parts)!=3 or parts[0]!='mk1' or not hmac.compare_digest(parts[2],_signature(profile,'market',parts[1])):
+        raise ValueError('按钮签名无效')
+    return card('旧交易按钮已停用。请发送 /market 打开新版筛选页；原有关注规则继续生效。')
 
 
 def clear_input(profile,*,store=None):
@@ -439,47 +439,5 @@ def clear_input(profile,*,store=None):
 
 
 def reply(profile,message_id,text,*,store=None):
-    if profile!='webops':return None
-    store=store or Store()
-    if re.fullmatch(r'https://(?:www\.)?(?:chiphell\.com/thread-\d+-1-1\.html|v2ex\.com/t/\d+|bbs\.nga\.cn/read\.php\?tid=\d+)',text.strip()):
-        return command(profile,text.strip(),store=store)
-    with store.box.connect() as db:
-        db.execute('BEGIN IMMEDIATE')
-        row=db.execute('SELECT * FROM market_inputs WHERE profile=?',(profile,)).fetchone()
-        if not row:return None
-        token=row['button'].split('|')[1]
-        button_row=db.execute('SELECT created_at FROM market_buttons WHERE id=?',(token,)).fetchone()
-        if not button_row or time.time()-button_row[0]>3600:
-            db.execute('DELETE FROM market_inputs WHERE profile=?',(profile,))
-            return None
-        if message_id:
-            events=db.execute('SELECT payload,receipt FROM events WHERE profile=? AND receipt IS NOT NULL',(profile,)).fetchall()
-            if not any(row['button'] in event['payload'] and any(r.get('message_id')==message_id for r in (json.loads(event['receipt']) if isinstance(json.loads(event['receipt']),list) else [json.loads(event['receipt'])])) for event in events):return None
-        row=dict(row)
-        scope='sale'
-        if ':' in row['field']:scope,row['field']=row['field'].split(':',1)
-        d=draft(db,row['draft'])
-        if control.baseline(db)[0]!=d['base']:raise ValueError('策略已变化，请重新打开 /market。')
-        if row['field']=='wanted':
-            from .classifier import category_for
-            category=taxonomy.canonical(category_for(text)[0]);target=wanted.descriptor(text,category)
-            if not target:raise ValueError('请提供具体型号或权益名称，避免只写品牌。')
-            target={k:v for k,v in target.items() if k in {'category','model','region','specs'}}
-            wanted.validate({'enabled':True,'version':1,'targets':[target]})
-            targets=d['content']['wanted'].setdefault('targets',[])
-            if target not in targets:targets.append(target)
-            d['content']['wanted']['enabled']=True
-        else:
-            rule={}
-            for clause in re.split(r'[;；\n]',text):
-                m=re.fullmatch(r'\s*(包含|排除|最低|最高)\s*[:：]?\s*(.+?)\s*',clause)
-                if not m:raise ValueError('用“包含 A、B；排除 C”或“最低 100；最高 3000”填写。')
-                field={'包含':'include','排除':'exclude','最低':'min','最高':'max'}[m[1]]
-                if field in {'min','max'}:
-                    if row['field'] not in {'price','ram_gb','storage_gb'}:raise ValueError('此字段不支持数值区间。')
-                    rule[field]=float(m[2])
-                else:rule[field]=[s.strip() for s in re.split('[、，,]',m[2]) if s.strip()]
-            policy.validate_filters({row['category']:{row['field']:rule}})
-            d['content'][scope].setdefault('filters',{}).setdefault(row['category'],{})[row['field']]=rule
-        save(db,d);db.execute('DELETE FROM market_inputs WHERE profile=?',(profile,))
-        return wanted_card(db,d) if row['field']=='wanted' else field_card(db,d,row['category'],row['field'],scope)
+    # Old free-text replies cannot change a web draft or live policy.
+    return None

@@ -291,7 +291,7 @@ def test_marketplace_analysis_wait_does_not_hold_simple_posts(tmp_path,monkeypat
     with store.box.connect() as db:
         states=dict(db.execute('SELECT source,status FROM marketplace_posts').fetchall())
     assert states=={'v2ex':'pending_analysis','chiphell':'queued'}
-    assert enrich.summary(store)=='复杂帖待分析 1，待核对 0'
+    assert enrich.summary(store)=='复杂帖待分析 1，AI 报价待分析 0，待核对 0'
 
 
 def test_marketplace_requests_bounded_read_only_structured_analysis(monkeypatch):
@@ -378,9 +378,9 @@ def test_marketplace_watch_subject_owns_its_model_and_price(label):
               body='平时使用不多，配件齐全。\n定价1567，走平台验货。',
               body_complete=True,url='https://example.invalid/t/46',history=0)
     items=classifier.classify_listing(post['title'],post['body'],post['source'])
-    assert len(items)==1 and items[0]['category']=='wearable.watch'
+    assert len(items)==1 and items[0]['category']=='wearable.child_watch'
     assert items[0]['price']==1567 and not enrich.needs_analysis(post,items)
-    value={'items':[dict(name=label+' Z8',category='wearable.watch',start_line=0,end_line=2,
+    value={'items':[dict(name=label+' Z8',category='wearable.child_watch',start_line=0,end_line=2,
                         price=1567,price_line=2,status='available',link_ids=[])],
            'common_lines':[],'shared_link_ids':[]}
     assert enrich.validate(value,post)[0]['price']==1567

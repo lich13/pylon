@@ -65,8 +65,14 @@ def review(store, *, limit: int = 2, request=trade.request, config: dict, model:
                     state = 'direct'
                     db.execute("UPDATE linuxdo_helper_messages SET status='queued' WHERE message_id=?", (notice.message_id,))
                 elif extracted['intent'] == 'wanted':
-                    state = 'skip'
-                    db.execute("UPDATE linuxdo_helper_messages SET status='skip' WHERE message_id=?", (notice.message_id,))
+                    from pylon.tasks.marketplace.pipeline import enabled
+                    if enabled():
+                        observation=replace(notice,route='board').observation()
+                        store.save_page(SOURCE,Page([observation],[notice.message_id]),store_checkpoint(db),connection=db)
+                        state='trade'
+                    else:
+                        state='skip'
+                        db.execute("UPDATE linuxdo_helper_messages SET status='skip' WHERE message_id=?",(notice.message_id,))
                 elif extracted['intent'] in {'offer', 'cloud_offer'}:
                     # Only now may the public preview join topic evidence.
                     observation = replace(notice, route='board').observation()

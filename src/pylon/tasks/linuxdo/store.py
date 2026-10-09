@@ -47,6 +47,9 @@ class Store:
                 CREATE TABLE IF NOT EXISTS linuxdo_legacy_topics (
                     topic_id TEXT PRIMARY KEY, delivered_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS linuxdo_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS linuxdo_evidence_meta (
+                    topic_id TEXT NOT NULL,ref TEXT NOT NULL,actor_hash TEXT NOT NULL,
+                    published_at TEXT NOT NULL,edited_at TEXT NOT NULL,owned_body TEXT,PRIMARY KEY(topic_id,ref));
                 CREATE TABLE IF NOT EXISTS linuxdo_helper_messages (
                     message_id INTEGER PRIMARY KEY, kind TEXT NOT NULL, route TEXT NOT NULL,
                     topic_id TEXT NOT NULL, post_number INTEGER NOT NULL, payload TEXT NOT NULL,
@@ -59,6 +62,8 @@ class Store:
             columns = {row[1] for row in db.execute('PRAGMA table_info(linuxdo_helper_events)')}
             if 'post_fingerprint' not in columns:
                 db.execute("ALTER TABLE linuxdo_helper_events ADD COLUMN post_fingerprint TEXT NOT NULL DEFAULT ''")
+            if 'owned_body' not in {row[1] for row in db.execute('PRAGMA table_info(linuxdo_evidence_meta)')}:
+                db.execute('ALTER TABLE linuxdo_evidence_meta ADD COLUMN owned_body TEXT')
             from .trade_store import initialize
             initialize(db)
 
@@ -212,6 +217,7 @@ class Store:
             personal = [dict(row) for row in db.execute('''SELECT n.post_number,n.source_time,n.post_fingerprint FROM linuxdo_helper_events n
                 JOIN events e ON e.id=n.event_id WHERE n.topic_id=? AND e.status<>'suppressed' ''', (topic_id,))]
             public = db.execute("SELECT message_id,post_number,payload FROM linuxdo_helper_messages WHERE topic_id=? AND route IN ('board','following')", (topic_id,)).fetchall()
+            metadata={r['ref']:dict(r) for r in db.execute('SELECT * FROM linuxdo_evidence_meta WHERE topic_id=?',(topic_id,))}
         actors, post_actors = {}, {}
         for item in public:
             actor = json.loads(item['payload']).get('actor', '')
@@ -223,9 +229,12 @@ class Store:
         positions = {ref: row['post_number'] for ref, row in observations.items()}
         for row in evidence:
             row['links'] = json.loads(row['links'])
-            source_time = observations.get(row['ref'], {}).get('published_at', '')
+            meta=metadata.get(row['ref'],{})
+            if meta.get('owned_body') is not None:row['owned_body']=meta['owned_body']
+            source_time = meta.get('published_at') or observations.get(row['ref'], {}).get('published_at', '')
             row['source_published_at'] = source_time if timestamp(source_time) is not None else ''
-            row['source_edited_at'] = observations.get(row['ref'], {}).get('edited_at', '')
+            row['source_edited_at'] = meta.get('edited_at') or observations.get(row['ref'], {}).get('edited_at', '')
+            if meta.get('actor_hash'):actors[row['ref']]=meta['actor_hash']
             positions[row['ref']] = row['post_number']
             if row['origin'] == 'topic' and len(post_actors.get(row['post_number'], set())) == 1:
                 actors[row['ref']] = next(iter(post_actors[row['post_number']]))
@@ -251,6 +260,10 @@ class Store:
         with self.box.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             changes = sum(self._evidence(db, topic_id, item, now) for item in items)
+            for item in items:
+                if item.get('actor_hash') or item.get('source_published_at'):
+                    db.execute('INSERT OR REPLACE INTO linuxdo_evidence_meta(topic_id,ref,actor_hash,published_at,edited_at,owned_body) VALUES(?,?,?,?,?,?)',
+                        (topic_id,item['ref'],item.get('actor_hash',''),item.get('source_published_at',''),item.get('source_edited_at',''),item.get('owned_body')))
             db.execute('''UPDATE linuxdo_topics SET version=version+?,updated_at=CASE WHEN ?>0 THEN ? ELSE updated_at END,
                 body_attempted_at=CASE WHEN ? THEN ? ELSE body_attempted_at END WHERE topic_id=?''',
                        (changes, changes, now, attempted, now, topic_id))

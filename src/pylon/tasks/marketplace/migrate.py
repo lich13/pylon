@@ -12,7 +12,12 @@ def retire_cards(store,*,http=None):
         with client() as connection:return retire_cards(store,http=connection)
     results=[]
     with store.box.connect() as db:
-        rows=db.execute("SELECT * FROM events WHERE job_id='chiphell-category-review'").fetchall()
+        candidates=db.execute("SELECT * FROM events WHERE profile='webops' AND kind='text'").fetchall()
+        rows=[]
+        for row in candidates:
+            markup=json.loads(row['payload']).get('reply_markup',{}).get('inline_keyboard',[])
+            if row['job_id']=='chiphell-category-review' or any(str(b.get('callback_data','')).startswith(('mk1|','ch1|','ch2|')) for line in markup for b in line):
+                rows.append(row)
     for row in rows:
         previous=store.box.get('market:retired-card:'+row['id'])
         if previous and previous.get('status')=='removed':continue

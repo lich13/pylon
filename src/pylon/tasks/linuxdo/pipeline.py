@@ -123,34 +123,47 @@ def process_topic(store: Store, topic_id: str, config: dict, *, model: str,
                   trade_config: dict | None = None) -> dict:
     try:
         snapshot = store.snapshot(topic_id)
+        with store.box.connect() as db:
+            fresh_required=bool(db.execute('SELECT 1 FROM linuxdo_meta WHERE key=?',('market_recheck:'+topic_id,)).fetchone())
         from .helper_store import covered_by_personal
         if covered_by_personal(snapshot):
             store.finish(snapshot, {'decision': 'skip', 'expires_at': ''})
             return {'topic_id': topic_id, 'decision': 'skip', 'event_id': None, 'error': ''}
-        trade_config = trade.load() if trade_config is None else trade.validate_config(trade_config)
+        from pylon.tasks.marketplace.ai_prices import config as shared_prices
+        trade_config = shared_prices() if trade_config is None else trade.validate_config(trade_config)
         if ((snapshot['expires_at'] and snapshot['expires_at'] <= time.time())
                 or time.time() - snapshot['updated_at'] > 7 * 86400):
             store.finish(snapshot, {'decision': 'skip', 'expires_at': ''})
             return {'topic_id': topic_id, 'decision': 'expired'}
         # Expensive reads are retried separately from collection and never hold a write transaction.
-        if time.time() - snapshot['body_attempted_at'] >= min(21600, 300 * 2 ** min(snapshot['attempts'], 6)):
+        if fresh_required or time.time() - snapshot['body_attempted_at'] >= min(21600, 300 * 2 ** min(snapshot['attempts'], 6)):
             try:
                 numbers = [e['post_number'] for e in snapshot['evidence'] if e['origin'] == 'telegram']
                 evidence = topic_fetch(topic_id, numbers)
             except Exception:
                 evidence = []
+            if fresh_required:
+                if not any(r.get('complete') and r.get('post_number')==1 for r in evidence):
+                    store.defer(topic_id,'fresh_body_unavailable')
+                    return {'topic_id':topic_id,'decision':'hold','error':'fresh_body_unavailable'}
+                with store.box.connect() as db:db.execute('DELETE FROM linuxdo_meta WHERE key=?',('market_recheck:'+topic_id,))
             store.add_evidence(topic_id, evidence)
             snapshot = store.snapshot(topic_id)
             store.add_evidence(topic_id, official_fetch(snapshot), attempted=False)
             snapshot = store.snapshot(topic_id)
-        trade_key = trade.cache_key(snapshot, trade_config, model, focus=config)
+        from pylon.tasks.marketplace import pipeline as market
+        from pylon.tasks.marketplace.linuxdo_bridge import owned_snapshot,transfer
+        trade_snapshot=owned_snapshot(snapshot) if market.enabled() else snapshot
+        trade_key = trade.cache_key(trade_snapshot, trade_config, model, focus=config)
         extracted = store.cached(trade_key)
         if extracted is None:
-            extracted = trade.validate(trade_request(snapshot), snapshot)
+            extracted = trade.validate(trade_request(trade_snapshot), trade_snapshot)
             store.save_decision(trade_key, topic_id, extracted)
         else:
-            extracted = trade.validate(extracted, snapshot)
+            extracted = trade.validate(extracted, trade_snapshot)
         if extracted['intent'] not in {'non_trade', 'cloud_offer'}:
+            if market.enabled():
+                return {'topic_id':topic_id} | transfer(store,snapshot,extracted)
             allowed = policy.allowed_categories(config)
             filtered = [offer for offer in extracted['offers']
                 if ('B1' if offer['access'] == 'codex' else 'B2' if offer['access'] == 'claude_code' else 'A2') in allowed]
@@ -196,7 +209,8 @@ def review(store: Store | None = None, *, config: dict | None = None, limit: int
         store.sync_deliveries()
         return {'processed': 0, 'errors': 0, 'queued': 0}
     config = config or policy.load()
-    trade_config = trade.load() if trade_config is None else trade.validate_config(trade_config)
+    from pylon.tasks.marketplace.ai_prices import config as shared_prices
+    trade_config = shared_prices() if trade_config is None else trade.validate_config(trade_config)
     model = model or judge.model_name()
     trade_store.refresh_policy(store, trade_config, config, model)
     # Public-author intent and board value reviews share two model slots. Neither

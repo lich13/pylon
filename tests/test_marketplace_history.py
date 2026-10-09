@@ -53,15 +53,18 @@ def _nga_ad_url(target: str) -> str:
 
 
 class FakeNGALocator:
-    def __init__(self, page, *, records=None, html="", text=None, missing=False):
+    def __init__(self, page, *, records=None, html="", text=None, missing=False, count=None):
         self.page = page
         self.records = records or []
         self.html = html
         self.text = text
         self.missing = missing
+        self.count_value = count
         self.first = self
 
     def count(self):
+        if self.count_value is not None:
+            return self.count_value
         return int(self.page.interstitial)
 
     def wait_for(self, **_kwargs):
@@ -87,7 +90,7 @@ class FakeNGALocator:
 class FakeNGAPage:
     def __init__(self, requested_url, *, records=None, body_html="", initial_redirect=True,
                  persistent_interstitial=False, body_text="", body_on_missing=None,
-                 missing_selectors=(), response_status=None):
+                 missing_selectors=(), response_status=None, heading_text="NGA fixture topic"):
         self.requested_url = requested_url
         self.records = records or []
         self.body_html = body_html
@@ -95,6 +98,7 @@ class FakeNGAPage:
         self.body_on_missing = body_on_missing
         self.missing_selectors = set(missing_selectors)
         self.response_status = response_status
+        self.heading_text = heading_text
         self.initial_redirect = initial_redirect
         self.persistent_interstitial = persistent_interstitial
         self.url = requested_url if initial_redirect else _nga_ad_url(requested_url)
@@ -134,6 +138,8 @@ class FakeNGAPage:
             return FakeNGALocator(
                 self, html=self.body_html, missing=selector in self.missing_selectors
             )
+        if selector == "#postsubject0":
+            return FakeNGALocator(self, text=self.heading_text, count=int(bool(self.heading_text)))
         return FakeNGALocator(self, missing=selector in self.missing_selectors)
 
     def close(self):
@@ -493,6 +499,13 @@ def test_nga_detail_follows_ad_before_reading_post_body():
     assert page.goto_calls == [requested, requested]
     assert "RTX 3070" in result["body_full"]
     assert result["body_complete"] is True
+    assert result["title"] == "NGA fixture topic"
+    assert result["body_provenance"] == {
+        "version": 1,
+        "topic_id": "906",
+        "container": "#postcontent0",
+        "identity_verified": True,
+    }
     assert page.closed is True
 
 

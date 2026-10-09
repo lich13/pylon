@@ -192,6 +192,23 @@ def extract_first_post_body(page) -> str:
                 content = body_text(raw_html)
                 if content:
                     parts.append(content)
+                # Only replies with the same explicit author identifier are
+                # supplements. Other buyers' quotes and prices stay out.
+                try:
+                    supplements=page.evaluate('''() => {
+                        const posts=[...document.querySelectorAll('#postlist > div[id^="post_"]')];
+                        const author=p=>p.querySelector('.authi a.xw1')?.getAttribute('href');
+                        const owner=posts[0]&&author(posts[0]);
+                        return owner?posts.slice(1).filter(p=>author(p)===owner)
+                            .map(p=>p.querySelector('td.t_f')?.innerHTML||''):[];
+                    }''')
+                    if isinstance(supplements,list):
+                        for fragment in supplements[:30]:
+                            if isinstance(fragment,str) and fragment:
+                                supplement=body_text(fragment)
+                                if supplement:parts.append('楼主补充：\n'+supplement)
+                except Exception:
+                    pass
                 full_text = "\n\n".join(p for p in parts if p).strip()
                 if full_text:
                     return full_text
@@ -200,8 +217,19 @@ def extract_first_post_body(page) -> str:
     return "\n\n".join(parts).strip()
 
 
-def post_body_fields(page, limit: int = 180) -> dict[str, Any]:
+def post_body_fields(page, limit: int = 180, *, expected_url: str | None = None) -> dict[str, Any]:
     from pylon.shared.html_text import MAX_BODY_CHARS
+    provenance={}
+    title=''
+    if expected_url:
+        from pylon.tasks.marketplace.sources import topic_identity,ContentUnavailable
+        expected=topic_identity(expected_url,'chiphell')
+        if not expected or topic_identity(page.url,'chiphell')!=expected:
+            raise ContentUnavailable('unexpected_topic_redirect')
+        heading=page.locator('#thread_subject')
+        if heading.count():title=heading.first.inner_text().strip()
+        if not title:raise ContentUnavailable('topic_identity_missing')
+        provenance={'version':1,'topic_id':expected,'container':'first_post','identity_verified':True}
     full = extract_first_post_body(page)
     excerpt = compact_excerpt(full, limit)
     contact = format_contact_note(full)
@@ -211,8 +239,10 @@ def post_body_fields(page, limit: int = 180) -> dict[str, Any]:
         original_category = page.locator('#thread_subject').evaluate("el => [...el.parentElement.querySelectorAll('a[href*=typeid]')].map(n => n.innerText).join(' / ')") or ''
     except Exception:
         original_category = ''
-    return {'platform_category':original_category, 'body_full': full[:MAX_BODY_CHARS], 'body_complete': bool(full) and len(full) <= MAX_BODY_CHARS,
-            'body_excerpt': excerpt}
+    from pylon.tasks.marketplace.sources import author_context
+    return {'platform_category':original_category, 'source_context':author_context(page,'chiphell'),
+            'body_full': full[:MAX_BODY_CHARS], 'body_complete': bool(full) and len(full) <= MAX_BODY_CHARS,
+            'body_excerpt': excerpt,'body_provenance':provenance,**({'title':title,'title_refreshed':True} if title else {})}
 
 
 def extract_first_post_excerpt(page, limit: int = 180) -> str:
@@ -317,7 +347,7 @@ def collect_once(args: argparse.Namespace) -> tuple[str, list[dict[str, Any]]]:
                 try:
                     tpage.goto(post["url"], wait_until="domcontentloaded", timeout=args.timeout_ms)
                     tpage.wait_for_timeout(args.settle_ms)
-                    post.update(post_body_fields(tpage, args.body_limit))
+                    post.update(post_body_fields(tpage, args.body_limit,expected_url=post['url']))
                 except Exception as e:
                     post["body_excerpt"] = f"正文抓取失败：{type(e).__name__}"
                 finally:

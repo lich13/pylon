@@ -16,7 +16,9 @@ class BodyText(HTMLParser):
     def handle_starttag(self, tag, attrs):
         values = dict(attrs)
         active = self.classes is None or any(v[1] for v in self.stack) or bool(self.classes.intersection(values.get('class', '').split()))
-        hidden = tag in {'script', 'style', 'blockquote'} or any(v[2] for v in self.stack)
+        hidden = (tag in {'script', 'style', 'blockquote'}
+                  or bool({'quote','blockquote','attach_nopermission'} & set(values.get('class','').split()))
+                  or any(v[2] for v in self.stack))
         if active and not hidden and tag in {'br', 'p', 'div', 'li', 'tr'}:
             self.parts.append(' ' if tag!='tr' and any(v[0] in {'td','th'} for v in self.stack) else '\n')
         if tag not in {'br', 'hr', 'img', 'input', 'meta', 'link', 'wbr'}:

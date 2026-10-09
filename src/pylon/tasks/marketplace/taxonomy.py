@@ -96,7 +96,8 @@ RULES = [
     ('camera.drone', '影像/航拍/无人机', r'无人机|御\s*\d|Mavic|DJI\s*(?:Mini|Air|Avata)'),
     ('camera.gimbal', '影像/配件/稳定器与脚架', r'稳定器|三脚架|云台|曼富图'),
     ('camera.light', '影像/配件/补光与闪光设备', r'补光灯|闪光灯|摄影灯'),
-    ('wearable.watch', '穿戴/电子/智能手表', r'Watch|智能手表|电话手表|儿童(?:智能)?手表'),
+    ('wearable.child_watch', '穿戴/儿童/电话与儿童手表', r'电话手表|儿童(?:智能)?手表|小天才\s*(?:电话手表|[ZQ]\d+)'),
+    ('wearable.watch', '穿戴/电子/智能手表', r'Watch|智能手表'),
     ('wearable.band', '穿戴/电子/手环', r'手环|\bBand\s*\d'),
     ('wearable.mechanical', '穿戴/传统/机械与石英表', r'机械表|石英表|卡西欧|劳力士|欧米茄|精工'),
     ('home.cleaning', '家电/清洁/扫地与洗地设备', r'扫地|洗地机|吸尘器'),
@@ -108,7 +109,7 @@ RULES = [
     ('home.furniture', '家居/家具/桌椅与家具', r'工学椅|人体工学|桌子|升降桌|椅子|沙发|床垫'),
     ('life.clothing', '生活/穿戴/服饰', r'衣服|羽绒服|外套|冲锋衣|裤子|T恤'),
     ('life.shoes', '生活/穿戴/鞋靴', r'鞋|球鞋|靴'),
-    ('life.bag', '生活/穿戴/箱包', r'背包|双肩包|行李箱|旅行箱|皮包'),
+    ('life.bag', '生活/穿戴/箱包', r'背包|双肩包|行李箱|旅行箱|皮包|女包|手提包|斜挎包'),
     ('life.cycling', '生活/运动/骑行设备', r'自行车|公路车|山地车|骑行|头盔'),
     ('life.fitness', '生活/运动/健身与户外用品', r'哑铃|健身|帐篷|露营|鱼竿|钓鱼'),
     ('life.car', '生活/交通/车辆与汽车用品', r'汽车|摩托|电动车|三轮车|行车记录仪|轮胎'),
@@ -170,9 +171,9 @@ def type_for(key: str) -> str:
     return key
 
 
-def hierarchy() -> dict:
+def hierarchy(categories=None) -> dict:
     result={key:{'label':label,'types':{}} for key,label in GROUPS.items()}
-    for key,label in CATEGORIES.items():
+    for key,label in (CATEGORIES if categories is None else categories).items():
         group=group_for(key);kind=type_for(key)
         name=TYPE_FAMILIES[kind][0] if kind in TYPE_FAMILIES else label.split('/')[-1]
         item=result[group]['types'].setdefault(kind,{'label':name,'categories':[]})
@@ -199,11 +200,12 @@ def refresh_extensions(content=None):
         content=active[1].get('taxonomy',{}) if active else {}
     EXTENSIONS.clear()
     CATEGORIES.clear();CATEGORIES.update(BASE_CATEGORIES)
+    valid_targets=catalog(content)
     for key,value in content.items():
         if value.get('parent') not in GROUPS or not key.startswith(value['parent']+'.ext_'):
             continue
         target=value.get('target') or key
-        if target!=key and target not in BASE_CATEGORIES:continue
+        if target!=key and target not in valid_targets:continue
         EXTENSIONS[key]=value
         if target==key:CATEGORIES[key]=GROUPS[value['parent']]+'/'+value['name']+'/'+value['name']
 

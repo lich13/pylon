@@ -1,6 +1,6 @@
 # pylon
 
-Python 机器人服务、SQLite 待发队列和 systemd timers。维护 Gmail、线报、V2EX、Linux.do、Chiphell、日港 iTunes、KDocs 报价、软件更新、数据清理、SSH 和软件维护任务；新增三平台二手交易处理任务在关注策略明确启用后工作。
+Python 机器人服务、SQLite 待发队列和 systemd timers。维护 Gmail、线报、V2EX、Linux.do、Chiphell、日港 iTunes、KDocs 报价、软件更新、数据清理、SSH 和软件维护任务；四平台统一交易处理任务在关注策略明确启用后工作。
 
 ## Linux.do 聚合
 
@@ -32,11 +32,11 @@ Grok 只处理合并后的证据并返回结构化判断，不执行操作。关
 
 从早期脚本首次升级到持久聚合时，采集入口会原子导入旧游标、已投主题和旧待发队列。新旧入口不得同时运行。运维入口为 `python -m pylon.tasks.linuxdo status`；隔离回放使用 `replay --store <analysis.sqlite3> --input <observations.json> --limit 4`，输入是 `sources.Observation` 字段数组，回放数据库不可设为正式 outbox，且不连接发送器。仅当需要退回早期脚本时，先停两个新 timer、等待任务结束，再执行 `python -m pylon.tasks.linuxdo export-legacy --apply`，最后恢复旧模块入口与原 timer；正式 outbox 保持原样继续投递。
 
-## 三平台二手交易
+## 四平台交易
 
-`config/marketplace.json` 是统一关注策略，必须显式设置 `version`、`enabled` 和 `categories`。`groups` 关注整个大类，`types` 关注小类及其细分类，`categories` 只关注指定细分类；`blocked_groups` 优先级最高，屏蔽该大类全部现有和未来子类，子类关注不能绕过。未选类别不推送，品牌、型号和规格仅作属性。类别使用 `pylon.tasks.marketplace.taxonomy` 中的稳定标识；缺失策略时保留旧流程，新 NGA 任务静默。启用后，V2EX 频道的二手交易分流、CHH 抓取结果和 NGA 新帖统一进入持久化处理队列，其他 V2EX 业务不变。
+`market_active` 指向 SQLite 中的生效策略版本；`config/marketplace.json` 仅作首次导入，必须显式设置 `version`、`enabled` 和 `categories`。`groups` 关注整个大类，`types` 关注小类及其细分类，`categories` 只关注指定细分类；`blocked_groups` 优先级最高，屏蔽该大类全部现有和未来子类，子类关注不能绕过。未选类别不推送，品牌、型号和规格仅作属性。类别使用 `pylon.tasks.marketplace.taxonomy` 中的稳定标识；缺失策略时保留旧流程，新 NGA 任务静默。启用后，V2EX 各节点的明确交易与拼车、CHH、NGA 和 Linux.do 公共交易共用筛选与投递。Linux.do 私人互动、非交易技术信息及官方优惠核验保持原职责。
 
-关注策略只匹配仍在出售的独立商品，混合帖至少一件命中才通知。整机配置和赠品不作为独立商品；北京自提和可邮寄规则适用于三个来源。正文读取失败会退避重试，最终仅以明确标题生成带缺失说明的普通通知，禁止重点比价。重点比价与普通通知共用关注清单，KDocs 无效或过期只暂停比价。
+关注策略只匹配仍在出售的独立商品，混合帖至少一件命中才通知。整机配置和赠品不作为独立商品；北京自提和可邮寄规则适用于四个来源。正文读取失败会退避重试，最终仅以明确标题生成带缺失说明的普通通知，禁止重点比价。重点比价与普通通知共用关注清单，KDocs 无效或过期只暂停比价。
 
 求购使用独立的 `config/marketplace-wanted.json`，缺失时关闭。`targets` 必须逐项列出可提供的具体商品型号或地区服务权益及规格，不继承出售关注品类。仅匹配明确、未结束的求购，询价和求推荐不触发；无法确定型号或关键规格时保留内部诊断。求购出价单独标示，绝不参与出售比价。混售/混求帖合并成一条消息，只展示分别命中两套策略的条目。实时抓取按来源并行推进，每个来源复用连接或浏览器，并独立投递和记录健康状态。
 
@@ -90,11 +90,15 @@ Agent 由 `pylon-agent.service` 按需执行，无常驻 Agent。全局串行，
 
 关键服务监控涵盖 FRP、OpenList、sing-box、easy_proxies、Certbot、PostgreSQL 18、Redis 8.6，各源每小时拉取一次。首次登记只建立基线，不回放历史消息。首次部署时在暂停软件监控且等待在途执行结束后，以 webops profile 环境运行 `python -m pylon.tasks.software.infrastructure`；后续部署不重新登记已移除的订阅。
 
-“增加监控 URL”“加监控 owner/repo”“移除监控→回复编号”继续可用。`/monitors` 只查看列表，`/remove_monitor` 开启编号移除。旧 CHH 分类按钮只返回入口已移除，不修改策略。库库干的 `/market` 将出售筛选、求购目标、新品种确认、待核对和帖子原因检查集中在一个入口；闷头干不新增此菜单。
+“增加监控 URL”“加监控 owner/repo”“移除监控→回复编号”继续可用。`/monitors` 只查看列表，`/remove_monitor` 开启编号移除。旧 CHH 分类按钮只返回入口已移除，不修改策略。库库干的 `/market` 只发出网页一次性登录链接；闷头干不提供入口。旧 `mk1`、`ch1/ch2` 配置按钮无法修改策略。
 
 交易筛选先保存草稿，支持大类批量关注或屏蔽，以及细类内的品牌、型号、价格、成色和规格组合。字段内多选满足其一，字段之间同时满足，排除条件优先；缺少受限属性时由 Grok 从原文补判，仍不明确则暂缓。预览并确认后才修改生产版本，可以恢复上一版本。新品种建议每天北京时间 21:00 汇总一次，仅提醒新增内容；新品牌、新型号不会单独创建类别。分类和是否关注分别确认，历史样本不自动补发。
 
-复杂交易分析由 `marketplace-analyze` 独立任务处理，不占用三平台抓取。来源原类目、商品范围、属性证据和每阶段决定均保留；`/market 原帖链接` 可查看未推送原因。历史回放只能在独立数据库中运行，不产生通知。
+复杂交易分析由 `marketplace-analyze` 独立任务处理，不占用四平台采集。来源原类目、商品范围、属性证据和每阶段决定均保留；网页“检查帖子”可查看未推送原因。历史回放只能在独立数据库中运行，不产生通知。
+
+网页使用 `/pylon/market/`，由 `pylon-market-web.service` 在回环地址单 worker 运行。`config/market-web.json` 的 `public_url` 设为实际 HTTPS 页面地址；反向代理转发该路径并设置 `Host`、`X-Forwarded-Proto`，不开放整个 `/pylon/`。服务没有 sudo 提权能力。一次性登录凭据仅保留哈希，10分钟过期；Cookie 为 HttpOnly、Secure、SameSite=Strict，最长7天，退出会撤销会话。写操作校验 CSRF 与来源。客户端只改草稿；预览固定当时的数据范围，新增帖子不使确认失效，并发策略版本变化会拒绝旧草稿。
+
+四平台 AI 交易共用 `market_active.content.ai_prices` 中已确认的价格规则，独立于本地商品分类器：包括实付总额、期限、每30天折合价、API额度及含车主的拼车分摊。卖家报价去重继承 Linux.do 旧通知记录。执行 `python -m pylon.tasks.marketplace.migrate_v12 --apply` 会一次性迁入现用价格规则、停用旧配置交互，并加入已批准的 Apple Music、88VIP及其明确来源权益、电话/儿童手表排除；不会改动求购目标或重发历史。近24小时漏推单独经 `reconsider --stage` 与新鲜读取后处理。只读审计入口为 `python -m pylon.tasks.marketplace.audit 数据库... --before 旧策略.json --after 新策略.json`，不导入发送器。
 
 机器人启动时后台核对默认、所有私聊和本人会话的默认/中文/英文菜单，统一使用中文，自动替换旧命令并设置菜单按钮。网络失败或限流按退避策略重试，不阻塞消息收发。`bot-menu check` 只读核对，不一致时退出码为 1；`bot-menu sync` 仅更新差异并读回确认。命令定义统一维护在 `src/pylon/command_catalog.py`。
 

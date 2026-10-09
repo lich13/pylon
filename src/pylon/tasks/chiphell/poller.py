@@ -155,7 +155,7 @@ def _collect_proxy_once(
                     try:
                         thread_page.goto(post["url"], wait_until="domcontentloaded", timeout=args.timeout_ms)
                         thread_page.wait_for_timeout(args.settle_ms)
-                        fields=base.post_body_fields(thread_page,args.body_limit)
+                        fields=base.post_body_fields(thread_page,args.body_limit,expected_url=post['url'])
                         if not fields.get('platform_category'):fields['platform_category']=post.get('platform_category','')
                         post.update(fields)
                     except Exception as error:

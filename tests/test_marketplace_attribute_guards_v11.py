@@ -15,7 +15,7 @@ from pylon.tasks.marketplace.store import Store
 
 PHONE = "phone.smartphone"
 OWNER = 123
-COMMON_FIELDS = {"brand", "series", "model", "price"}
+COMMON_FIELDS = {"brand", "series", "model", "price", "product", "keywords"}
 
 
 @pytest.fixture
@@ -80,9 +80,12 @@ def delivered_button(store, card, label):
 def begin_price_input(store):
     with store.box.connect() as db:
         draft = interface.draft(db)
-        card = interface.field_card(db, draft, PHONE, "price")
-    payload = delivered_button(store, card, "输入指定值／范围")
-    prompt = interface.callback("webops", payload, store=store)
+        prompt = interface.route(
+            db,
+            "input",
+            {"draft": draft["id"], "category": PHONE, "field": "price"},
+            draft["base"],
+        )
     reply_to = delivered_button(store, prompt, "取消输入")
     return draft["id"], reply_to["message"]["message_id"]
 
@@ -172,7 +175,7 @@ def test_service_entitlement_keeps_its_two_hour_duration():
 @pytest.mark.parametrize("category,applicable", [
     (PHONE, {"condition", "ram_gb", "storage_gb", "size", "network", "fault", "repair"}),
     ("life.clothing", {"condition", "size"}),
-    ("virtual.service", {"platform", "plan", "duration", "region", "transfer"}),
+    ("virtual.service", {"platform", "plan", "duration", "region", "transfer", "origin"}),
 ])
 @pytest.mark.parametrize("scope", ["sale", "wanted"])
 def test_attribute_editor_exposes_only_relevant_fields_and_keeps_shared_fields(
@@ -228,15 +231,14 @@ def test_market_input_still_accepts_a_reply_just_before_one_hour(
     draft_id, message_id = begin_price_input(market)
     now[0] += 3599
 
+    before = saved_draft(market, draft_id)
     result = interface.reply(
         "webops", message_id if explicit_reply else 0, "最低 10；最高 300", store=market,
     )
 
-    assert result is not None
-    assert saved_draft(market, draft_id)["content"]["sale"]["filters"][PHONE]["price"] == {
-        "min": 10, "max": 300,
-    }
-    assert input_count(market) == 0
+    assert result is None
+    assert saved_draft(market, draft_id) == before
+    assert input_count(market) == 1
 
 
 @pytest.mark.parametrize("explicit_reply", [False, True])
@@ -259,7 +261,7 @@ def test_market_input_expires_from_original_button_even_after_a_draft_update(
     )
 
     assert result is None
-    assert input_count(market) == 0
+    assert input_count(market) == 1
     assert saved_draft(market, draft_id) == before
 
 

@@ -128,7 +128,18 @@ def install(path: Path) -> dict:
         raise TradeError('price confirmation is in the future')
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _write_private(CONFIG_FILE, value)
-    return {'revision': value['revision'], 'rules': len(value['rules'])}
+    result={'revision': value['revision'], 'rules': len(value['rules'])}
+    from pylon.tasks.marketplace import control
+    active=control.current()
+    if active and 'ai_prices' in active[1]:
+        from pylon.tasks.marketplace.store import Store
+        with Store().box.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            version,content=control.baseline(db)
+            if content.get('ai_prices')!=value:
+                content['ai_prices']=value
+                result['market_version']=control.activate(db,content,version,'confirmed-ai-prices')
+    return result
 
 
 def cache_key(snapshot: dict, config: dict, model: str, *, focus: dict | None = None) -> str:

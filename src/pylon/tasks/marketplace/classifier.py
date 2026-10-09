@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from .taxonomy import RULES, canonical
 
-VERSION = 11
+VERSION = 12
 from . import subjects
 
 PATTERNS = [(key, re.compile(pattern, re.I)) for key, _, pattern in RULES]
@@ -16,7 +16,7 @@ WANTED_BUDGET = re.compile(r'(?<![\d.A-Za-z])([¥￥]?\d+(?:\.\d+)?\s*(?:元|块
 WANTED = re.compile(r'求购|求收|想收|[\[【](?:收|求购|预收)[\]】]|(?:^|[\s。；;，,\]】])\s*(?:预)?'+ACQUIRE+r'\s*\S|'
                     +WANTED_BUDGET.pattern+r'|(?:长期|持续|一直)\s*收(?:\W|$)|求(?:一|两|二|几)[张台个只件]|有没有人(?:卖|出)')
 WANTED_CLOSED = re.compile(r'已收(?:到|齐|到货)?(?:\W|$)|[\[【]已收[\]】]|不收了|停止收购|需求已(?:解决|满足)|已找到')
-INQUIRY = re.compile(r'询价|价格咨询|行情多少|值多少|求推荐|求助|求问|询问|估价|只了解行情')
+INQUIRY = re.compile(r'询价|价格咨询|行情多少|值多少|求推荐|求助|求问|询问|估价|只了解行情|请教.*(?:购买|怎么买|选择)')
 SALE = re.compile(r'出售|闲置|转让|明盘|卖|(?:^|[\s，,])出|元出|包邮|可刀|走鱼|闲鱼|挂价|议价|私聊')
 GIFT = re.compile(r'赠送|赠品|送的|随.{0,12}赠|附赠|(?:^|[\s|，,。；;])送(?!货|达|修|到|测|检)')
 BUNDLE = re.compile(r'打包|整套|不拆卖|不单卖|一起出|合计')
@@ -66,7 +66,8 @@ def _clean_subject(text: str) -> str:
     # Gifts and descriptions of compatible devices are not sale subjects.
     text = subjects.subject_text(text)
     lines = ['，'.join(FILM_USE.sub('', clause) for clause in re.split(r'[，,。|]', line)
-                      if (not GIFT.search(clause) or WANTED.search(clause))
+                      if (not GIFT.search(clause) or WANTED.search(clause)
+                          or re.search(r'^\s*(?:\d+[、.)]\s*)?(?:出售|出(?!现)|转让|卖)|\d+\s*元出',clause))
                       and not re.match(r'^\s*(?:不含|不包括|不包含|不带)',clause)).strip()
              for line in text.splitlines()]
     return '\n'.join(line for line in lines if line).strip()
@@ -94,6 +95,11 @@ def category_for(text: str) -> tuple[str, str]:
         match = pattern.search(subject)
         if not match:
             continue
+        # Short model tokens have meaning only inside a product family. A
+        # processor R5 and a phone Z9 are not evidence for a camera body.
+        if key == 'camera.body' and not re.search(r'相机|微单|单反', match[0]):
+            if not re.search(r'索尼|Sony|尼康|Nikon|佳能|Canon|相机|微单|单反|快门|镜头卡口', subject, re.I):
+                continue
         # A phone's asking price such as 3090 yuan is not a graphics-card model.
         if key=='component.gpu' and match[0].isdigit() and re.match(r'\s*(?:元|块|人民币|RMB|包邮)',subject[match.end():],re.I):
             continue
@@ -155,7 +161,7 @@ def category_for(text: str) -> tuple[str, str]:
         'display.portable', 'input.keycaps', 'input.mousepad', 'game.media', 'game.controller',
         'game.handheld', 'game.vr', 'audio.portable', 'audio.tws', 'audio.inear', 'audio.overear',
         'audio.dac', 'camera.action', 'camera.pocket', 'camera.drone', 'camera.lens',
-        'tablet.ipad', 'tablet.android', 'tablet.ereader', 'wearable.watch', 'wearable.band',
+        'tablet.ipad', 'tablet.android', 'tablet.ereader', 'wearable.child_watch', 'wearable.watch', 'wearable.band',
     )
     for key in priorities:
         if key in hits:
@@ -168,6 +174,7 @@ def price_analysis(text: str):
     category = canonical(category_for(text)[0])
     return analyse_price(text, allow_bare=category != 'unknown',
                          subject=lambda line: category_for(line)[0] != 'unknown',
+                         recurring=category.startswith('virtual.'),
                          capacity_context=category.startswith(('phone.','tablet.','computer.','storage.','component.memory')))
 
 
@@ -175,8 +182,26 @@ def asking_price(text: str) -> int | float | None:
     return price_analysis(text).amount
 
 
+def entitlement_origin(title: str, body: str, item_text: str) -> str:
+    """An explicitly named benefit group supplies its children's provenance."""
+    if subjects.SEPARATE.search(item_text) or re.search(r'不是|非88|无关|不来自',title):return ''
+    named=re.search(r'88\s*VIP\s*(?:的|开通的|附带的|各种|各类|全部)?\s*(?:会员|权益|赠送|赠品|拆卖|拆出)',title,re.I)
+    shorthand=re.search(r'88\s*(?:各种|各类|全部)?\s*(?:会员|权益)',title)
+    token=re.search(r'88\s*VIP',title,re.I)
+    if not named and not token and not (shorthand and re.search(r'88\s*VIP',body,re.I)):return ''
+    match=named or token or shorthand
+    remainder=title[:match.start()]+title[match.end():]
+    if subjects.SEPARATE.search(remainder):return ''
+    if named and re.search(r'权益|赠送|赠品|拆卖|拆出',named[0]):return '88VIP'
+    if token and re.search(r'开(?:通)?(?:了|的)?\s*$',title[:token.start()]):return '88VIP'
+    # A title listing a second independent subscription is not a common origin.
+    if any(key.startswith('virtual.') and key not in {'virtual.membership','virtual.retail_membership'} and pattern.search(remainder)
+           for key,pattern in PATTERNS):return ''
+    return '88VIP'
+
+
 def _blocks(title: str, body: str) -> list[str]:
-    text = re.sub(r'(?:另出|另外出售|同时出售|再出)', '\n出售 ', body)
+    text = re.sub(r'(?:另出|另外出售|同时出售|再出)', '\n另外出售 ', body)
     lines = [line.strip() for line in re.split(r'\n+|[；;]|(?=\b\d{1,2}[、）])', text) if line.strip()]
     blocks: list[str] = []
     title_category = category_for(title)[0]
@@ -191,6 +216,8 @@ def _blocks(title: str, body: str) -> list[str]:
         if GIFT.search(line) and not SALE.search(line) and not NUMBERED.match(line):
             if blocks:
                 blocks[-1] += '\n' + line
+            else:
+                blocks.append(line)
             continue
         category, _ = category_for(line)
         current_category = category_for(blocks[-1])[0] if blocks else 'unknown'
@@ -244,7 +271,7 @@ def _blocks(title: str, body: str) -> list[str]:
 def _sale_parts(text: str, *, title: str = '') -> list[str]:
     """Split explicit coordinated items, never a system specification list."""
     category, _ = category_for(text)
-    raw_parts = [p.strip() for p in re.split(r'(?<!\d)[、]|\s*(?:以及|另有|另外)\s*|(?<!\d)\s*\+\s*(?!\d)|[，,]',text) if p.strip()]
+    raw_parts = [p.strip() for p in re.split(r'(?<!\d)[、]|\s*(?:以及|另有|另外(?!出售))\s*|(?<!\d)\s*\+\s*(?!\d)|[，,]',text) if p.strip()]
     parts = []
     for part in raw_parts:
         related = re.match(r'^(?:也|还|仅|只|可|且)?(?:适配|兼容|支持|适用|用于|搭配|对比|不含|不包括|不包含|不带)',part)
@@ -320,6 +347,8 @@ def _sale_parts(text: str, *, title: str = '') -> list[str]:
 def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete: bool = True,
                      *, single_item: bool = False, platform_category: str = '') -> list[dict]:
     result = []
+    from .content_quality import contamination
+    if contamination(source,title,body):body_complete=False
     if not body_complete:
         body = ''
     # Normalise grouped amounts before segmentation, not after commas have
@@ -370,12 +399,16 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
         if len(blocks)>1 and category=='unknown' and not NUMBERED.match(text) and not SALE.search(text):
             continue
         own_sale = bool(SALE.search(text) and not WANTED.search(text))
-        intent = ('wanted' if WANTED.search(text) or (WANTED.search(title) and not own_sale) else
+        wanted_text = re.sub(r'(?:不|非|并非|不是|不再)\s*(?:求购|求收|想收)', '', text)
+        wanted_title = re.sub(r'(?:不|非|并非|不是|不再)\s*(?:求购|求收|想收)', '', title)
+        intent = ('wanted' if WANTED.search(wanted_text) or (WANTED.search(wanted_title) and not own_sale) else
                   'inquiry' if INQUIRY.search(title+'\n'+text) else 'sale')
         closed_request = intent=='wanted' and WANTED_CLOSED.search(text+'\n'+title)
-        status = ('sold' if title_sold or all_sold or SOLD.search(text) or closed_request else 'buy' if ((title_buy and not own_sale) or BUY.search(text) or WANTED.search(text))
+        status = ('sold' if title_sold or all_sold or SOLD.search(text) or closed_request else 'uncertain' if intent=='inquiry' else 'buy' if ((title_buy and not own_sale) or BUY.search(text) or WANTED.search(text))
                   else 'available' if SALE.search(title + '\n' + text) or source in {'chiphell', 'nga'} else 'uncertain')
-        if GIFT.search(text) and not SALE.search(text) and category != 'unknown':
+        gifted_subject=bool(re.match(r'^\s*(?:赠送|赠品|送的|附赠|送(?!货|达|修|到|测|检))',subject)
+                            and not SALE.search(subject))
+        if gifted_subject and category != 'unknown':
             status = 'uncertain'
         context = text + '\n' + common_terms
         # An item owns its location. Only an unscoped title restriction may
@@ -407,6 +440,7 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
             'series': re.findall(r'iPhone|iPad|MacBook|ThinkPad|Galaxy|MatePad|Mate|Pura|Redmi|RTX|GTX|Ryzen|Osmo|Mavic',identity_head,re.I),
             'generation': re.findall(r'(?:iPhone|iPad\s*(?:Pro|Air|mini)?|Mate|Pura|小米|Redmi)\s*(\d{1,3})',identity_head,re.I),
             'classifier_version': VERSION,
+            'conditional_terms': bool(subjects.OPTIONAL.search(text)),
         }
         if not body_complete:
             # Only the untruncated title is evidence when the full body is absent.
@@ -420,15 +454,22 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
         attributes['external_price'] = bool(re.search(r'https?://',text)
                                              and re.search(r'闲鱼|咸鱼|价格.{0,12}(?:链接|详见)',text))
         price = price_analysis(price_text)
+        from .price_terms import extract as payment_terms
+        attributes.update(payment_terms(price_text,price))
         attributes.update(price_status='bundled' if bundle_only or shared_bundle else price.status,
                           price_reason='shared_bundle_price' if bundle_only or shared_bundle else price.reason,
                           price_evidence=price.evidence)
         if (status == 'uncertain' and intent == 'sale' and category != 'unknown'
-                and price.amount is not None and not GIFT.search(text)):
+                and price.amount is not None and not gifted_subject):
             status = 'available'
         attributes['subject'] = subject
         attributes['platform_category'] = platform_category
         attributes['facts'], attributes['attribute_evidence'] = subjects.facts(identity,attributes,price=price.amount,category=canonical(category))
+        # A listing of explicitly split benefits carries its named origin to
+        # each entitlement, but never to a separately sold physical device.
+        if category.startswith('virtual.') and entitlement_origin(title,body,text):
+            attributes['facts']['origin']=['88VIP']
+            attributes['attribute_evidence']['origin']=[title]
         attributes['condition'] = attributes['facts'].get('condition','成色未注明') if body_complete else '成色待确认'
         result.append(dict(index=index, category=canonical(category), text=text, status=status,
                            price=None if bundle_only or shared_bundle else price.amount,

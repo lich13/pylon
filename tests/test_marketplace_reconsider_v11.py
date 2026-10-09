@@ -96,7 +96,7 @@ def test_stage_freezes_each_eligible_recent_status(market, status):
 
     result = reconsider.stage(market, now=NOW)
 
-    assert result == {"started_at": NOW, "cutoff": NOW - 86400, "staged": 1}
+    assert result == {"started_at": NOW, "cutoff": NOW - 86400, "staged": 1, "linuxdo": 0}
     assert read_post(market) == {**before, "status": "refresh_required"}
     assert market.checkpoint(reconsider.CHECKPOINT) == result
 
@@ -230,10 +230,13 @@ def install_http_client(monkeypatch, responses):
     return ctx
 
 
-def response(status, *, html=None):
+def response(status, *, html=None, topic_id="1"):
     return httpx.Response(
-        status, request=httpx.Request("GET", "https://www.v2ex.com/t/1"),
-        text=html if html is not None else f"<h1>{TITLE}</h1><div class='topic_content'>{BODY}</div>",
+        status, request=httpx.Request("GET", f"https://www.v2ex.com/t/{topic_id}"),
+        text=html if html is not None else (
+            f"<div id='Main'><h1>{TITLE}</h1>"
+            f"<div class='topic_content'>{BODY}</div></div>"
+        ),
     )
 
 
@@ -245,7 +248,7 @@ def response(status, *, html=None):
 def test_http_failure_moves_only_its_post_to_review_and_continues(market, monkeypatch, status, reason):
     first = seed(market, status="refresh_required", first_seen=NOW - 120)
     seed(market, "2", status="refresh_required")
-    ctx = install_http_client(monkeypatch, [response(status), response(200)])
+    ctx = install_http_client(monkeypatch, [response(status, topic_id="1"), response(200, topic_id="2")])
 
     assert reconsider.drain_source(market, "v2ex") == {
         "source": "v2ex", "total": 2, "fresh": 1, "review": 1, "limited": 0,
@@ -279,12 +282,15 @@ def test_rate_limit_preserves_current_and_remaining_rows_for_resume(market, monk
 
 def test_missing_live_heading_goes_to_review_even_with_complete_body(market, monkeypatch):
     seed(market, status="refresh_required")
-    install_http_client(monkeypatch, [response(200, html=f"<div class='topic_content'>{BODY}</div>")])
+    install_http_client(
+        monkeypatch,
+        [response(200, html=f"<div id='Main'><div class='topic_content'>{BODY}</div></div>")],
+    )
 
     assert reconsider.drain_source(market, "v2ex")["review"] == 1
 
     assert read_post(market)["status"] == "needs_review"
-    assert read_post(market)["error"] == "fresh_recheck:fresh_title_or_body_missing"
+    assert read_post(market)["error"] == "fresh_recheck:topic_identity_missing"
 
 
 def test_main_drains_sources_in_parallel_with_independent_failure_states(market, monkeypatch, capsys):
@@ -323,30 +329,49 @@ def test_main_drains_sources_in_parallel_with_independent_failure_states(market,
     assert read_post(market, source="nga")["status"] == "refresh_required"
 
 
-@pytest.mark.parametrize("heading", ["<h1>[已售] <span>iPhone 15 Pro 256G</span></h1>", "", "<h1> </h1>"])
+@pytest.mark.parametrize(
+    ("heading", "expected_title"),
+    [
+        ("<h1>[已售] <span>iPhone 15 Pro 256G</span></h1>", "[已售] iPhone 15 Pro 256G"),
+        ("", None),
+        ("<h1> </h1>", None),
+    ],
+)
 @pytest.mark.parametrize("with_context", [False, True])
-def test_v2ex_detail_marks_only_a_live_nonempty_heading_as_refreshed(monkeypatch, heading, with_context):
+def test_v2ex_detail_requires_main_heading_and_refreshes_live_title(
+    monkeypatch, heading, expected_title, with_context,
+):
     old = {"title": TITLE, "url": URLS["v2ex"] + "1"}
-    html = heading + f"<div class='topic_content'>{BODY}</div><div class='subtle'>附言：支持邮寄</div>"
+    html = (
+        f"<div id='Main'>{heading}<div class='topic_content'>{BODY}</div>"
+        "<div class='subtle'>附言：支持邮寄</div></div>"
+    )
     ctx = Mock() if with_context else None
     if ctx is not None:
         ctx.get.return_value = response(200, html=html)
     else:
         monkeypatch.setattr("pylon.tasks.forums.v2ex.fetch", Mock(return_value=html))
 
-    result = sources.detail(ctx, "v2ex", old)
-
-    live = "<span>" in heading
-    assert result["title_refreshed"] is live
-    assert result["title"] == ("[已售] iPhone 15 Pro 256G" if live else TITLE)
-    assert result["body_complete"] is True
-    assert BODY in result["body_full"] and "附言：支持邮寄" in result["body_full"]
+    if expected_title is None:
+        with pytest.raises(sources.ContentUnavailable, match="topic_identity_missing"):
+            sources.detail(ctx, "v2ex", old)
+    else:
+        result = sources.detail(ctx, "v2ex", old)
+        assert result["title_refreshed"] is True
+        assert result["title"] == expected_title
+        assert result["body_complete"] is True
+        assert BODY in result["body_full"] and "附言：支持邮寄" in result["body_full"]
 
 
 @pytest.mark.parametrize("source", ["nga", "chiphell"])
-@pytest.mark.parametrize("heading", [" [已售] iPhone 15 Pro 256G ", "", None])
-def test_browser_source_detail_refreshes_only_the_first_post_heading(source, heading):
-    old = {"title": TITLE, "url": URLS[source] + "1", "posted_at": ""}
+@pytest.mark.parametrize(
+    ("heading", "expected_title"),
+    [(" [已售] iPhone 15 Pro 256G ", "[已售] iPhone 15 Pro 256G"), ("", None), (None, None)],
+)
+def test_browser_source_detail_requires_the_first_post_heading(source, heading, expected_title):
+    url = URLS[source] + ("1-1-1.html" if source == "chiphell" else "1")
+    old = {"title": TITLE, "url": url, "posted_at": "", "id": "1"}
+    assert sources.topic_identity(old["url"], source) == "1"
     page = Mock(url=old["url"])
     page.goto.return_value = SimpleNamespace(status=200)
 
@@ -372,10 +397,13 @@ def test_browser_source_detail_refreshes_only_the_first_post_heading(source, hea
     ctx = Mock()
     ctx.new_page.return_value = page
 
-    result = sources.detail(ctx, source, old)
-
-    assert result["title_refreshed"] is bool(heading)
-    assert result["title"] == (heading.strip() if heading else TITLE)
-    assert result["body_complete"] is True and BODY in result["body_full"]
-    assert result["posted_at"] == "2026-10-09T09:00:00+08:00"
+    if expected_title is None:
+        with pytest.raises(sources.ContentUnavailable, match="topic_identity_missing"):
+            sources.detail(ctx, source, old)
+    else:
+        result = sources.detail(ctx, source, old)
+        assert result["title_refreshed"] is True
+        assert result["title"] == expected_title
+        assert result["body_complete"] is True and BODY in result["body_full"]
+        assert result["posted_at"] == "2026-10-09T09:00:00+08:00"
     page.close.assert_called_once_with()

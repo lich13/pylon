@@ -56,7 +56,8 @@ def record(db,post,item):
 
 def main():
     from .store import Store
-    from .interface import button,card
+    from .interface import card
+    from .web_auth import public_url
     store=Store()
     with store.box.connect() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -71,7 +72,7 @@ def main():
                 rows.append(row)
         if rows:
             payload=card('新增商品种类待确认：'+str(len(rows))+' 种\n'+'、'.join(row['kind'] for row in rows[:30]),
-                         [[button(db,'查看并批量确认','novelty',{},version)]])
+                         [[{'text':'打开交易筛选','url':public_url()}]])
             store.box.enqueue(profile='webops',job_id='marketplace-review',kind='text',payload=payload,
                               key='market-novelty:'+control.digest([row['id'] for row in rows]),connection=db)
             db.executemany('UPDATE market_novelty SET announced=1 WHERE id=?',[(row['id'],) for row in rows])

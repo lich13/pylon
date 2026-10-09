@@ -28,6 +28,38 @@ class ContentUnavailable(RuntimeError):
     """A classified, non-transient content gap without raw page content."""
 
 
+def topic_identity(url,source):
+    parsed=urlparse(url)
+    hosts={'chiphell':{'www.chiphell.com','chiphell.com'},'nga':{'bbs.nga.cn','nga.178.com'},'v2ex':{'www.v2ex.com','v2ex.com'}}
+    if parsed.scheme not in {'http','https'} or parsed.hostname not in hosts.get(source,set()):return None
+    if source=='v2ex':
+        m=re.fullmatch(r'/t/(\d+)/?',parsed.path);return m[1] if m else None
+    if source=='chiphell':
+        m=re.fullmatch(r'/thread-(\d+)-\d+-\d+\.html',parsed.path)
+        if m:return m[1]
+        if parsed.path not in {'/forum.php','/read.php'}:return None
+    elif parsed.path!='/read.php':return None
+    return (parse_qs(parsed.query).get('tid') or [None])[0]
+
+
+def author_context(page,source):
+    """A stable pseudonym for same-seller offer deduplication, not a contact."""
+    try:
+        selector='#postlist .authi a.xw1' if source=='chiphell' else '#postauthor0'
+        node=page.locator(selector).first
+        link=node.get_attribute('href') or ''
+        parsed=urlparse(link)
+        actor=(parse_qs(parsed.query).get('uid') or [''])[0]
+        if not actor:
+            found=re.search(r'(?:space-uid-|uid=)(\d+)',link)
+            actor=found[1] if found else ''
+        if not actor and source=='nga':actor=node.get_attribute('data-uid') or node.get_attribute('uid') or ''
+        if actor:return {'actor':__import__('hashlib').sha256((source+':'+actor).encode()).hexdigest()}
+    except Exception:
+        pass
+    return {}
+
+
 def check_nga_rate_limit(page, *, in_slot: bool = False) -> None:
     text = page.locator('body').inner_text(timeout=3000)
     if re.search(r'ERROR\s*:\s*2048|刷新过快|访问过于频繁|操作过于频繁|Too Many Requests', text, re.I):
@@ -184,7 +216,7 @@ def detail(ctx, source: str, post: dict, *, page=None) -> dict:
     if urlparse(post['url']).hostname not in {allowed[source], 'v2ex.com' if source=='v2ex' else allowed[source]}:
         raise ValueError('untrusted forum detail URL')
     if source == 'v2ex':
-        from pylon.tasks.forums.v2ex import fetch, extract_topic_body
+        from pylon.tasks.forums.v2ex import fetch, extract_topic_document
         from urllib.error import HTTPError
         try:
             if ctx is None:
@@ -201,13 +233,12 @@ def detail(ctx, source: str, post: dict, *, page=None) -> dict:
             if error.code in {401,403,404,410}:
                 raise ContentUnavailable('permission_required' if error.code in {401,403} else 'deleted_or_not_found') from None
             raise
-        body = extract_topic_body(raw,include_supplements=True)
-        if not body:
-            raise ContentUnavailable(content_gap(body_text(raw)))
-        heading=re.search(r'<h1\b[^>]*>(.*?)</h1>',raw,re.I|re.S)
-        title=body_text(heading[1]).strip() if heading else ''
-        return {**post,'title':title or post['title'],'title_refreshed':bool(title),
-                'body_full':body[:MAX_BODY_CHARS],'body_complete':bool(body) and len(body)<=MAX_BODY_CHARS}
+        try:
+            fields = extract_topic_document(raw,expected_url=post['url'],
+                final_url=str(response.url) if ctx is not None and hasattr(response,'url') else None)
+        except ValueError as error:
+            raise ContentUnavailable(str(error)) from None
+        return {**post,**fields,'title_refreshed':True}
     owned_page = page is None
     page = ctx.new_page() if owned_page else page
     try:
@@ -216,6 +247,8 @@ def detail(ctx, source: str, post: dict, *, page=None) -> dict:
             skip_nga_ad(page, post['url'], ctx)
         else:
             page.goto(post['url'],wait_until='domcontentloaded',timeout=30000)
+        if not topic_identity(post['url'],source) or topic_identity(page.url,source)!=topic_identity(post['url'],source):
+            raise ContentUnavailable('unexpected_topic_redirect')
         selector = '#postcontent0' if source=='nga' else 'td[id^="postmessage_"]'
         if source=='chiphell' and page.locator('#messagetext').count():
             reason = content_gap(page.locator('#messagetext').inner_text())
@@ -231,7 +264,7 @@ def detail(ctx, source: str, post: dict, *, page=None) -> dict:
                 raise ContentUnavailable(reason) from None
             raise
         if source=='chiphell':
-            fields = post_body_fields(page,260)
+            fields = post_body_fields(page,260,expected_url=post['url'])
         else:
             raw = page.locator(selector).inner_html() if hasattr(page.locator(selector),'inner_html') else page.locator(selector).evaluate('e=>e.innerHTML')
             body = body_text(raw)
@@ -242,7 +275,10 @@ def detail(ctx, source: str, post: dict, *, page=None) -> dict:
         title=''
         heading=page.locator('#postsubject0' if source=='nga' else '#thread_subject')
         if heading.count():title=heading.first.inner_text().strip()
-        fields.update(title=title or post['title'],title_refreshed=bool(title))
+        if not title:raise ContentUnavailable('topic_identity_missing')
+        fields.update(title=title,title_refreshed=True,body_provenance={
+            'version':1,'topic_id':topic_identity(post['url'],source),'container':selector,'identity_verified':True})
+        fields['source_context']=author_context(page,source)
         return {**post,**fields,'posted_at':date_text(' '.join(dates)) or post.get('posted_at','')}
     finally:
         if owned_page:

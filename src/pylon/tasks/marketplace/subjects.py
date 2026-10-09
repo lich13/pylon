@@ -8,10 +8,11 @@ BACKGROUND = re.compile(r'原(?:来|先|本)(?:用|的)|之前(?:用|的)|以前
 PROTECTION = re.compile(r'(?:贴|撕|揭)(?:了|着|有|掉|开)?[^，,。；;\n]{0,16}(?:膜)|(?:全程|一直|到手|买来|开箱)(?:就|都|后)?(?:带壳|戴壳)|镜头膜|镜头保护(?:膜|盖)')
 SEPARATE = re.compile(r'(?<!不)(?:另出|另售|单出|单卖|另外出售|同时出售|单独出售)')
 COMPATIBLE = re.compile(r'^(?:也|还|仅|只|可|且)?(?:适配|兼容|支持|适用|用于|搭配|不含|不包括|不包含|不带)')
+OPTIONAL = re.compile(r'(?:如果|假如|若).{0,32}(?:同意|需要|愿意|想要)|(?:以后|后续|将来).{0,12}(?:可以|可能|考虑)|(?:可以|考虑|打算)(?:再|另外)?(?:订阅|升级|加购)')
 
 
 def incidental(clause: str) -> bool:
-    return bool(not SEPARATE.search(clause) and (BACKGROUND.search(clause) or COMPATIBLE.search(clause.strip())))
+    return bool(not SEPARATE.search(clause) and (BACKGROUND.search(clause) or COMPATIBLE.search(clause.strip()) or OPTIONAL.search(clause)))
 
 
 def subject_text(text: str) -> str:
@@ -51,13 +52,14 @@ FIELDS = {
     'ram_gb':'内存 GB','storage_gb':'容量 GB','size':'尺寸／尺码','network':'网络版本',
     'fault':'故障声明','repair':'维修声明','platform':'权益平台','plan':'套餐',
     'duration':'期限','region':'使用地区','transfer':'转让限制',
+    'product':'产品名称','origin':'权益来源','keywords':'排除词',
 }
 
 
 def applicable_fields(category: str) -> list[str]:
-    common={'brand','series','model','price'}
+    common={'brand','series','model','price','keywords','product'}
     group=category.split('.',1)[0]
-    if group=='virtual':common.update({'platform','plan','duration','region','transfer'})
+    if group=='virtual':common.update({'platform','plan','duration','region','transfer','origin'})
     else:
         common.add('condition')
         if group=='life':common.add('size')
@@ -76,6 +78,15 @@ def facts(text: str, attrs: dict, *, price=None, category='') -> tuple[dict,dict
     for field,old in (('brand','brands'),('series','series'),('model','models')):
         # These lists have already been extracted from source-owned text.
         put(field,attrs.get(old,[]),heading(clean))
+    owned_name=attrs.get('subject') or heading(clean)
+    put('product',owned_name,owned_name)
+    # The text has already been bound to one item. Do not inherit another
+    # item's product name or incidental replacement story into exclusions.
+    put('keywords',clean,clean)
+    if category.startswith('virtual.'):
+        origin_text=re.sub(r'(?:不是|非|不来自|非来自)\s*88\s*VIP|与\s*88\s*VIP\s*无关','',clean,flags=re.I)
+        origin=re.search(r'88\s*VIP',origin_text,re.I)
+        if origin:put('origin',['88VIP'],origin[0])
     pair=re.search(r'(?<!\d)(\d{1,3})\s*(?:GB|G)?\s*\+\s*(\d{1,4})\s*(TB|T|GB|G)?(?![\dA-Za-z])',clean,re.I)
     if pair:
         capacity=int(pair[2])*(1024 if (pair[3] or '').upper().startswith('T') else 1)

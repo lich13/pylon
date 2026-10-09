@@ -99,6 +99,8 @@ class Post:
     body_excerpt: str
     body_full: str = ''
     body_complete: bool = False
+    body_provenance: dict = field(default_factory=dict)
+    source_context: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -200,6 +202,14 @@ def _is_retryable_fetch_error(exc: Exception) -> bool:
     return isinstance(exc, urllib.error.URLError)
 
 
+class FetchedHTML(str):
+    """Keep the final response identity without changing legacy text callers."""
+    def __new__(cls, value, final_url):
+        result = super().__new__(cls, value)
+        result.final_url = final_url
+        return result
+
+
 def fetch(
     url: str,
     *,
@@ -214,7 +224,7 @@ def fetch(
         started = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read().decode("utf-8", "replace")
+                return FetchedHTML(resp.read().decode("utf-8", "replace"), resp.geturl())
         except Exception as exc:
             elapsed = time.monotonic() - started
             print(
@@ -296,6 +306,71 @@ def extract_topic_body(page_html: str, *, include_supplements: bool = False) -> 
     return strip_invisible_prompt_chars(body_text(page_html, classes=classes))
 
 
+def extract_topic_document(page_html: str, *, expected_url: str, final_url: str | None = None) -> dict:
+    """An HTTP 200 sidebar or login page is not a complete topic document."""
+    from html.parser import HTMLParser
+    from urllib.parse import urlsplit
+    from pylon.shared.html_text import body_text, MAX_BODY_CHARS
+
+    def identity(url):
+        parsed = urlsplit(url)
+        match = re.fullmatch(r'/t/(\d+)/?', parsed.path)
+        return match[1] if parsed.hostname in {'v2ex.com','www.v2ex.com'} and match else None
+
+    expected = identity(expected_url)
+    actual = identity(final_url or getattr(page_html, 'final_url', expected_url))
+    if not expected or actual != expected:
+        raise ValueError('unexpected_topic_redirect')
+
+    class TopicHTML(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=False)
+            self.stack = []; self.parts = []; self.headings = []; self.heading = False
+            self.has_body = False; self.canonical = None; self.actor = ''
+            self.article_start = None; self.article_end = None; self.article_depth = None
+        def handle_starttag(self, tag, attrs):
+            values = dict(attrs)
+            if tag == 'link' and 'canonical' in values.get('rel','').split():
+                self.canonical = identity(values.get('href',''))
+            inside = values.get('id') == 'Main' or any(row[1] for row in self.stack)
+            if inside and tag == 'h1':
+                self.heading = True
+                boxes=[(index,row[2]) for index,row in enumerate(self.stack) if row[2] is not None]
+                if boxes and self.article_start is None:
+                    index,self.article_start=boxes[-1];self.article_depth=index
+            if inside and not self.has_body and tag=='a' and re.fullmatch(r'/member/[A-Za-z0-9_-]+',values.get('href','')):
+                self.actor=values['href']
+            if inside and 'topic_content' in values.get('class','').split(): self.has_body = True
+            start=len(self.parts) if inside and 'box' in values.get('class','').split() else None
+            if inside: self.parts.append(self.get_starttag_text())
+            if tag not in {'br','hr','img','input','meta','link','wbr'}: self.stack.append((tag,inside,start))
+        def handle_endtag(self, tag):
+            if any(row[1] for row in self.stack): self.parts.append('</'+tag+'>')
+            if tag == 'h1': self.heading = False
+            for index in range(len(self.stack)-1,-1,-1):
+                if self.stack[index][0] == tag:
+                    if index==self.article_depth and self.article_end is None:self.article_end=len(self.parts)
+                    del self.stack[index:]; break
+        def handle_data(self, text):
+            if any(row[1] for row in self.stack): self.parts.append(html.escape(text))
+            if self.heading: self.headings.append(text)
+        def handle_entityref(self, name): self.handle_data(html.unescape('&'+name+';'))
+        def handle_charref(self, name): self.handle_data(html.unescape('&#'+name+';'))
+
+    parser = TopicHTML(); parser.feed(str(page_html))
+    title = ''.join(parser.headings).strip()
+    if not title or (parser.canonical is not None and parser.canonical != expected):
+        raise ValueError('topic_identity_missing')
+    parts=parser.parts[parser.article_start:parser.article_end] if parser.article_start is not None else parser.parts
+    body = extract_topic_body(''.join(parts), include_supplements=True)
+    if not parser.has_body or not body:
+        raise ValueError('body_missing_or_incomplete')
+    return {'title':title, 'body_full':body[:MAX_BODY_CHARS],
+            'body_complete':len(body) <= MAX_BODY_CHARS,
+            'source_context':{'actor':__import__('hashlib').sha256(('v2ex:'+parser.actor).encode()).hexdigest()} if parser.actor else {},
+            'body_provenance':{'version':1,'topic_id':expected,'container':'Main','identity_verified':True}}
+
+
 def extract_topic_excerpt(page_html: str) -> str:
     return format_topic_excerpt(extract_topic_body(page_html))
 
@@ -328,7 +403,7 @@ def topic_excerpt_enrichment_candidate(post: Post) -> bool:
 
 def enrich_posts_with_topic_excerpt(posts: List[Post], *, deadline: float | None = None) -> None:
     from pylon.shared.html_text import MAX_BODY_CHARS
-    cache: dict[str, str] = {}
+    cache: dict[str, dict] = {}
     for post in posts:
         if not topic_excerpt_enrichment_candidate(post):
             continue
@@ -337,21 +412,24 @@ def enrich_posts_with_topic_excerpt(posts: List[Post], *, deadline: float | None
             break
         if post.v2ex_url not in cache:
             try:
-                cache[post.v2ex_url] = extract_topic_body(
+                cache[post.v2ex_url] = extract_topic_document(
                     fetch(
                         post.v2ex_url,
                         timeout=TOPIC_REQUEST_TIMEOUT,
                         attempts=TOPIC_FETCH_MAX_ATTEMPTS,
                         phase="v2ex_topic",
-                    ), include_supplements='二手交易' in post.tags
+                    ), expected_url=post.v2ex_url
                 )
             except Exception as exc:
                 print(f"v2ex_topic_enrich_failed id={post.message_id} error={type(exc).__name__}", file=sys.stderr)
-                cache[post.v2ex_url] = ""
-        full = cache[post.v2ex_url]
+                cache[post.v2ex_url] = {}
+        document=cache[post.v2ex_url]
+        full = document.get('body_full','')
         post.body_excerpt = format_topic_excerpt(full)
         post.body_full = full[:MAX_BODY_CHARS]
-        post.body_complete = bool(full) and len(full) <= MAX_BODY_CHARS
+        post.body_complete = bool(document.get('body_complete'))
+        post.body_provenance=document.get('body_provenance',{})
+        post.source_context=document.get('source_context',{})
 
 
 def extract_tags_and_core(title: str) -> tuple[List[str], str]:
@@ -3177,13 +3255,22 @@ def run_once(*, dry_run: bool = False) -> int:
     from pylon.tasks.marketplace import pipeline as marketplace
     if marketplace.enabled():
         trade_posts = [post for post in candidate_posts if marketplace.is_v2ex_trade(post)]
-        if not dry_run:
+        if not dry_run and trade_posts:
             marketplace.ingest('v2ex', [
                 {'id':str(post.message_id),'title':post.title,'url':post.v2ex_url,'posted_at':post.posted_at,
-                 'body_excerpt':post.body_excerpt,'body_full':post.body_full,'body_complete':post.body_complete}
+                 'body_excerpt':post.body_excerpt,'body_full':post.body_full,'body_complete':post.body_complete,
+                 'body_provenance':post.body_provenance,'source_context':post.source_context}
                 for post in trade_posts])
         candidate_posts = [post for post in candidate_posts if not marketplace.is_v2ex_trade(post)]
     enrich_posts_with_topic_excerpt(candidate_posts, deadline=deadline)
+    # Some sharing/offer nodes reveal the sale only in the first post.
+    if marketplace.enabled():
+        extra_trades=[post for post in candidate_posts if marketplace.is_v2ex_trade(post)]
+        if not dry_run and extra_trades:
+            marketplace.ingest('v2ex',[{'id':str(p.message_id),'url':p.v2ex_url,'title':p.title,'posted_at':p.posted_at,
+                'body_full':p.body_full,'body_complete':p.body_complete,'body_provenance':p.body_provenance,
+                'source_context':p.source_context} for p in extra_trades])
+        candidate_posts=[p for p in candidate_posts if not marketplace.is_v2ex_trade(p)]
     route_decisions = route_decisions_by_message_id(candidate_posts)
     arbitrage_posts = arbitrage_scan_posts(candidate_posts, route_decisions)
 

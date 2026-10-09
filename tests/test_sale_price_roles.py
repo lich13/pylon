@@ -146,7 +146,10 @@ def test_role_labels_bind_their_own_amounts(text,expected):
 @pytest.mark.parametrize('text,expected', [
     ('DDR5 32GB 6000', None),
     ('DDR5 32GB 6000 300', 300),
+    ('DDR5 5600 16Gx2 2700', 2700),
+    ('DDR5 32GB 2700', 2700),
     ('DDR5 32GB 6000，售价800', 800),
+    ('出 ATK 鼠标，JD售价199元，卖价150元', 150),
     ('红米音箱2', None),
     ('红米音箱2 150', 150),
     ('京东家政：50', 50),

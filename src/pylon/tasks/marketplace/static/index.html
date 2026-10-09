@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>交易关注 · pylon</title><link rel="stylesheet" href="market.css"><script src="market.js" defer></script></head>
+<body>
+<main>
+  <header><div><p class="brand">pylon</p><h1>选择值得看到的交易</h1><p id="version">CHH、V2EX、NGA、Linux.do，共用一份关注清单。</p></div><button id="logout" class="quiet" hidden>退出登录</button></header>
+  <div id="notice" role="status" aria-live="polite"></div>
+  <section id="login"><h2>从库库干打开</h2><p>在 Telegram 发送 /market，点击「打开交易筛选」。已登录的设备可直接使用收藏的页面。</p></section>
+  <section id="workspace" hidden>
+    <nav aria-label="交易管理"><button data-tab="sale" aria-selected="true">出售与拼车</button><button data-tab="wanted">求购目标</button><button data-tab="review">待核对与新品种</button><button data-tab="check">检查帖子</button></nav>
+    <div class="layout"><section id="content"></section><aside><h2>有效关注清单</h2><div id="summary"></div><p class="muted">未选择的类别不推送。混售帖只需一件命中，只突出命中的商品。</p><button id="preview" class="primary">预览影响</button><button id="rollback" class="quiet">恢复上一版本到草稿</button><p id="save-state" class="muted" role="status">草稿已保存</p></aside></div>
+  </section>
+</main>
+<dialog id="preview-dialog"><form method="dialog"><button class="close" aria-label="关闭">×</button></form><h2>确认关注清单</h2><div id="preview-result"></div><div class="actions"><button id="apply" class="primary">确认应用</button><button id="back">返回调整</button></div></dialog>
+<dialog id="facet-dialog"><form method="dialog"><button class="close" aria-label="关闭">×</button></form><h2 id="facet-title">细化筛选</h2><div id="facets"></div><button id="facet-done" class="primary">完成选择</button></dialog>
+</body></html>

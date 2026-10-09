@@ -44,7 +44,7 @@ def test_all_jobs_keep_schedule_and_native_catchup():
     assert 'OnCalendar=*-*-* 0/6:15:00 Asia/Shanghai' in bootstrap.timer_text('software-update-review', catalog['software-update-review'])
     assert {'software-update-review', 'marketplace-poll', 'marketplace-review', 'marketplace-analyze'} <= catalog.keys()
     assert catalog['marketplace-poll'] == {
-        'name': '三平台二手交易', 'profile': 'webops', 'schedule': '* * * * *',
+        'name': '四平台交易处理', 'profile': 'webops', 'schedule': '* * * * *',
         'deliver': False, 'failure_notify': False, 'timeout': 240,
         'module': 'pylon.tasks.marketplace.poll',
     }

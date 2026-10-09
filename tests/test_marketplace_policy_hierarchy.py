@@ -29,6 +29,21 @@ def test_partial_type_selection_does_not_enable_siblings():
     assert not policy.selected('component.cpu',value)
 
 
+def test_blocked_type_overrides_parent_group_for_future_leaves():
+    value=selection(groups=['component'],blocked_types=['component.memory'])
+    assert not policy.selected('component.memory_ecc',value)
+    assert not policy.selected('component.memory_laptop',value)
+    assert policy.selected('component.gpu',value)
+
+
+def test_partial_type_under_parent_group_requires_an_explicit_leaf():
+    value=selection(groups=['component'],partial_types=['component.memory'],
+                    categories=['component.memory_ecc'])
+    assert policy.selected('component.memory_ecc',value)
+    assert not policy.selected('component.memory_laptop',value)
+    assert policy.selected('component.gpu',value)
+
+
 def test_mixed_post_only_highlights_nonblocked_available_item():
     items=classify_listing('出售几件闲置',
         'RTX 4070 显卡2000元出售\niPhone 15 3000元出售\n相机1000元已售','chiphell',True)

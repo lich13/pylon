@@ -36,9 +36,11 @@ class Store:
             ''')
             from .control import SCHEMA
             db.executescript(SCHEMA)
+            from .ai_prices import SCHEMA as PRICE_SCHEMA
+            db.executescript(PRICE_SCHEMA)
             db.execute('BEGIN IMMEDIATE')
             columns = {row[1] for row in db.execute('PRAGMA table_info(marketplace_posts)')}
-            for column in ('platform_category', 'decision'):
+            for column in ('platform_category', 'decision', 'source_context', 'body_provenance'):
                 if column not in columns:
                     db.execute(f"ALTER TABLE marketplace_posts ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
             analysis_columns={row[1] for row in db.execute('PRAGMA table_info(marketplace_analyses)')}
@@ -59,7 +61,7 @@ class Store:
             return json.loads(row[0]) if row else None
 
     def ingest(self, source: str, posts: list[dict], *, history: bool = False) -> int:
-        if source not in {'v2ex', 'chiphell', 'nga'}:
+        if source not in {'v2ex', 'chiphell', 'nga', 'linuxdo'}:
             raise ValueError('unknown marketplace source')
         from .taxonomy import refresh_extensions
         refresh_extensions()
@@ -82,6 +84,8 @@ class Store:
                     url = 'https://bbs.nga.cn/read.php?tid='+source_id
                 elif source=='chiphell':
                     url = f'https://www.chiphell.com/thread-{source_id}-1-1.html'
+                elif source=='linuxdo':
+                    url = f'https://linux.do/t/topic/{source_id}'
                 body = str(post.get('body_full') or post.get('body_excerpt') or '')
                 complete = bool(post.get('body_complete')) and bool(body)
                 platform_category = str(post.get('platform_category') or '')[:200]
@@ -89,27 +93,30 @@ class Store:
                 stamp = time.time()
                 status = 'historical' if history else 'ready' if complete else 'pending_body'
                 cursor = db.execute('''INSERT OR IGNORE INTO marketplace_posts
-                    (source,source_id,url,title,body,body_complete,posted_at,first_seen,updated_at,items,status,history,platform_category)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (source,source_id,url,title,body,body_complete,posted_at,first_seen,updated_at,items,status,history,platform_category,source_context,body_provenance)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                     (source,source_id,url,title,body,int(complete),str(post.get('posted_at') or ''),stamp,stamp,
-                     json.dumps(items, ensure_ascii=False),status,int(history),platform_category))
+                     json.dumps(items, ensure_ascii=False),status,int(history),platform_category,
+                     json.dumps(post.get('source_context',{}),ensure_ascii=False),json.dumps(post.get('body_provenance',{}))))
                 count += cursor.rowcount
                 # Never replace an enqueued message or promote historical data to live work.
                 if not cursor.rowcount and complete:
                     db.execute('''UPDATE marketplace_posts SET title=?,body=?,body_complete=1,items=?,updated_at=?,
                         posted_at=CASE WHEN ?<>'' THEN ? ELSE posted_at END,
                         status=CASE WHEN history=1 THEN 'historical' ELSE 'ready' END,error='',
-                        platform_category=CASE WHEN ?<>'' THEN ? ELSE platform_category END
+                        platform_category=CASE WHEN ?<>'' THEN ? ELSE platform_category END,
+                        source_context=?,body_provenance=?
                         WHERE source=? AND source_id=? AND status IN ('pending_body','historical','unavailable')''',
                         (title,body,json.dumps(items,ensure_ascii=False),stamp,str(post.get('posted_at') or ''),
-                         str(post.get('posted_at') or ''),platform_category,platform_category,source,source_id))
+                         str(post.get('posted_at') or ''),platform_category,platform_category,
+                         json.dumps(post.get('source_context',{}),ensure_ascii=False),json.dumps(post.get('body_provenance',{})),source,source_id))
                 elif not cursor.rowcount and post.get('posted_at'):
                     db.execute("UPDATE marketplace_posts SET posted_at=? WHERE source=? AND source_id=? AND posted_at=''",
                                (str(post['posted_at']),source,source_id))
         return count
 
     def pending(self, *, history: bool = False, limit: int = 20, source: str | None = None) -> list[dict]:
-        if source is not None and source not in {'v2ex','chiphell','nga'}:
+        if source is not None and source not in {'v2ex','chiphell','nga','linuxdo'}:
             raise ValueError('unknown marketplace source')
         with self.box.connect() as db:
             rows = db.execute('''WITH ranked AS (
@@ -238,8 +245,8 @@ class Store:
     def reclassify_history(self) -> int:
         count = 0
         with self.box.connect() as db:
-            for row in db.execute('SELECT source,source_id,title,body,body_complete FROM marketplace_posts WHERE history=1').fetchall():
-                items = classify_listing(row['title'],row['body'],row['source'],bool(row['body_complete']))
+            for row in db.execute('SELECT source,source_id,title,body,body_complete,platform_category FROM marketplace_posts WHERE history=1').fetchall():
+                items = classify_listing(row['title'],row['body'],row['source'],bool(row['body_complete']),platform_category=row['platform_category'])
                 db.execute('UPDATE marketplace_posts SET items=? WHERE source=? AND source_id=? AND history=1',
                            (json.dumps(items,ensure_ascii=False),row['source'],row['source_id']))
                 count += 1
