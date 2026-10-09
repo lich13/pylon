@@ -60,7 +60,10 @@ def format_message(post: dict, items: list[dict], matches: list[dict]) -> str:
     for item in items[:10]:
         attrs = item['attributes']
         price = (f"{item['price']} 元" if item['price'] is not None else
-                 '正文未标价，见原帖商品链接' if attrs.get('external_price') else '价格未标')
+                 '正文未标价，见原帖商品链接' if attrs.get('external_price') else
+                 '单件价格未拆分' if attrs.get('price_status') == 'bundled' else
+                 '售价有歧义，见原帖' if attrs.get('price_status') == 'ambiguous' else
+                 '未给出售价（仅有参考价）' if attrs.get('price_reason') == 'reference_only' else '价格未标')
         trade = ('仅北京可用' if attrs.get('regional_service') and attrs['beijing'] else
                  '可邮寄' if attrs['shipping'] else '北京自提' if attrs['pickup_only'] and attrs['beijing'] else '交易方式见原帖')
         subject = re.sub(r'https?://\S+','',item['text'].split('\n',1)[0])

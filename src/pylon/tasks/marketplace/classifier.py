@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from .taxonomy import RULES, canonical
 
-VERSION = 5
+VERSION = 6
 
 PATTERNS = [(key, re.compile(pattern, re.I)) for key, _, pattern in RULES]
 SOLD = re.compile(r'已售|已出售(?!中)|已出(?!售)|已预[订定]|售罄|已被预[订定]|预[订定]给|封帖|封贴|结贴|勿拍')
@@ -153,12 +153,16 @@ def category_for(text: str) -> tuple[str, str]:
     return next(iter(hits.items()))
 
 
-def asking_price(text: str) -> int | None:
-    from pylon.tasks.quotes.matching import asking_price as shared_price
-    sale_heading = re.search(r'(?:^|[】\]])\s*(?:出|卖|转让)(?!价|厂|生|现|差)', text)
-    known_sale = bool((SALE.search(text) or sale_heading) and category_for(text)[0] != 'unknown')
-    result = shared_price(text, minimum=1, maximum=1000000, allow_bare=known_sale)
-    return result[0] if result else None
+def price_analysis(text: str):
+    from pylon.shared.sale_price import analyse_price
+    category = canonical(category_for(text)[0])
+    return analyse_price(text, allow_bare=category != 'unknown',
+                         subject=lambda line: category_for(line)[0] != 'unknown',
+                         capacity_context=category.startswith(('phone.','tablet.','computer.','storage.','component.memory')))
+
+
+def asking_price(text: str) -> int | float | None:
+    return price_analysis(text).amount
 
 
 def _blocks(title: str, body: str) -> list[str]:
@@ -352,6 +356,14 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
         price_text = re.sub(r'预算|收价|出价', '售价', text) if intent=='wanted' else text
         attributes['external_price'] = bool(re.search(r'https?://',text)
                                              and re.search(r'闲鱼|咸鱼|价格.{0,12}(?:链接|详见)',text))
-        result.append(dict(index=index, category=canonical(category), text=text, status=status, price=None if bundle_only or shared_bundle else asking_price(price_text),
+        price = price_analysis(price_text)
+        attributes.update(price_status='bundled' if bundle_only or shared_bundle else price.status,
+                          price_reason='shared_bundle_price' if bundle_only or shared_bundle else price.reason,
+                          price_evidence=price.evidence)
+        if (status == 'uncertain' and intent == 'sale' and category != 'unknown'
+                and price.amount is not None and not GIFT.search(text)):
+            status = 'available'
+        result.append(dict(index=index, category=canonical(category), text=text, status=status,
+                           price=None if bundle_only or shared_bundle else price.amount,
                            evidence=evidence, attributes=attributes))
     return result

@@ -1363,7 +1363,7 @@ def test_unscoped_exclusive_bundle_cannot_create_individual_priority_matches():
     matcher.assert_not_called()
     message = format_message(_marketplace_post(body), hits, [])
     assert "仅打包出售，合计 7000 元" in message
-    assert "价格未标" in message
+    assert "单件价格未拆分" in message
     assert "重点比价" not in message
 
 
