@@ -4,7 +4,7 @@ Python 机器人服务、SQLite 待发队列和 systemd timers。维护 Gmail、
 
 ## Linux.do 聚合
 
-`b7a84d1d9f21` 每分钟采集，`linuxdo-review` 独立补证和调用现有 Grok，投递由 outbox 完成。Helper 模式通过专用 Telegram 用户会话读取 `linux_do_helper_bot` 私聊；板块帖子按主题聚合并判断价值，关注者发帖/回复、私信和个人互动提醒直接转发。个人提醒正文独立保存，不进入模型证据；采集不标记已读、不代为回复或点赞。板块、标签和关注用户由使用者在论坛维护。
+`b7a84d1d9f21` 每分钟采集，`linuxdo-review` 独立补证和调用现有 Grok，投递由 outbox 完成。Helper 模式通过专用 Telegram 用户会话读取 `linux_do_helper_bot` 私聊；板块帖子按主题聚合并判断价值。关注者公开发帖/回复先识别交易意图，非交易内容直通，交易按同一价格策略筛选，意图不明则重试。私信和对使用者的回复、提及、引用等个人互动提醒直接入队，正文独立保存，不进入模型证据。采集不标记已读、不代为回复或点赞。板块、标签和关注用户由使用者在论坛维护。
 
 旧版来源配置继续采集 LinuxDoNew、linux_do_channel、linuxdo_tg，直到显式切换。Helper 分页检查点随消息在同一事务内保存，重启续采，首次接入只建立基线。新消息优先，有限回查处理编辑；未知通知保留并合并告警。个人提醒按通知身份去重，同主题不同回复各自保留。同一帖子同时命中板块订阅和个人提醒时，未发送的板块通知让位于个人提醒，已确认或回执不确定的消息不重复发送。
 
@@ -14,7 +14,17 @@ WebOps profile 的 `config/linuxdo_policy.json` 是独立、版本化的关注�
 
 授权入口是 `python -m pylon.tasks.linuxdo helper-auth`，必须在运行用户的交互终端使用。自己的 Telegram API 凭据、登录码和两步验证密码均隐藏输入；凭据与会话位于 WebOps profile 的 `private/linuxdo-helper`，目录权限 0700、文件权限 0600，不提交或输出内容。首次部署需预置该目录并归运行用户所有。`helper-check` 只读最近消息，输出识别计数和读取前后的已读标记是否相同。会话为 Telegram 账号级授权，程序仅访问首次授权固定的 Helper 身份；认证失效提示重新授权，限流按服务端时间延后重试。
 
-Helper 的“某人 发布了”同时用于板块新帖和关注者发帖。使用本机已登录浏览器导出完整关注名单，以运行用户执行 `helper-import-following --input <private-following.json> --apply`，原子写入上述私有目录的 `following.json`。输入须为 0600 文件，包含 `version: 1`、`complete: true`、带时区的 `imported_at` 和从用户资料链接提取的 `usernames` 数组。名单内作者的发帖与回复直通，其余这类通知只有明确指向首帖时才进入价值判断；名单缺失、无效或消息无法确认时保留待解析。私信和明确个人互动提醒不依赖名单。浏览器导入是快照，后续增删关注需重新导入；不另行授权论坛账号或自动修改订阅。
+Helper 的“某人 发布了”同时用于板块新帖和关注者发帖。安装 `tools/linuxdo/linuxdo-following.user.js` 后，在自己的关注页点击“复制关注名单”，将得到的 `/linuxdo_following_import` 消息粘贴到 Pylon 私聊；超长名单自动下载 `linuxdo-following.json`，发送该文件即可。脚本校验当前登录账号，读取完整关注接口，不导出登录信息或交易正文。格式为 `version: 2`、`complete: true`、`owner`、带时区的 `imported_at` 及 `usernames` 数组。只有所有者私聊可以导入；完整快照原子替换名单，拒绝错误账号、旧快照和同时间冲突，重复发送幂等。空数组表示主动清空完整名单。
+
+首次部署需以运行用户执行 `helper-import-following --input <private-following.json> --owner <forum-username> --apply` 绑定账号；输入文件权限为 0600。兼容已有 v1 快照，绑定不会更改其中的名单和时间。Telegram 不能重新绑定论坛身份。名单缺失、无效或通知无法确认时保留待解析；名单更新仅重新解析未解决消息，不批量重发历史通知。私信和明确个人互动提醒不依赖名单。名单是快照，后续增删关注需重新导入；不另行授权论坛账号或自动修改订阅。
+
+AI 交易先由 Grok 提取逐项报价和原文依据，再以十进制金额计算。求购、纯网页交易、批量起购价、已售出/满车和超过三个月预付静默；缺期限、用途、计费倍率、必要费用或个人额度时待补。本人代充、成品独享、独立席位、共享登录、Codex 专用和 API 分别比较，未验证或功能异常的账号不能套用正常账号上限。报价活动截止与账号使用到期分别记录，临期只按实际剩余使用时间折算。API 按提供方、模型、额度单位/周期和倍率匹配，不把站内刀数视为等值官方余额，不自动换汇。
+
+价格配置位于 WebOps 的 `config/linuxdo_prices.json`，仓库不保存个人价格表，缺失配置时所有交易档位保持观察。通过 `python -m pylon.tasks.linuxdo trade-config --input <private-prices.json> --apply` 安装已确认的 0600 配置。顶层字段是 `version: 1`、`revision`、`confirmed_at`、`rules`；每个规则包含 `id`、精确规格 `match`、`monthly_max`、`total_max`、`minimum_days`、`unit_max`、`car_monthly_reference`、`reference_until`，金额均为十进制字符串，不适用项为空字符串。`match` 必含产品、套餐、交付、使用方式、账号状态、币种；API 还须提供方、模型和额度单位/周期。未知或重叠档位不推送，市场挂牌价不能自动修改上限。
+
+共享订阅必须明确包含车主的总人数、每席额度及全部价格档位，整车价逐档求和且不超过整号参考的 120%。`shared_price_mode: "equal_share"` 仅启用有明确同价同额度依据的车，同时将个人月价限制为参考价 × 120% ÷ 总人数；分档车待补对应确认价表。明确确认各席上限后可用 `fixed` 模式逐档计算整车价。独立计费的成员席位不走整车均摊。参考价到期关闭对应拼车推送并提醒复核。
+
+同卖家、同规格重复开帖只通知一次，累计较上次通知降价至少 10%，或明确新增权益/补货/恢复/事实纠正，才可再通知。新版本保留旧个人提醒及其隐私边界，不把已通知历史正文转入模型。正文编辑会撤回尚未开始发送的旧公开报价，再独立判断；已送达和回执不确定状态仍按 outbox 处理。采集不等待价格判断或投递。
 
 切换前停止两个 Linux.do timer，等待在途任务结束，执行 `helper-baseline --apply`。在来源配置原有字段基础上设置 `version: 2`、`mode: "helper"`、`page_size: 100`、`recheck_limit: 100`，然后恢复 timer。只有新 Helper 板块消息进入判断，旧源独有候选停止消费；旧证据、投递记录和待发消息保留。再次启动保持已有基线，不重置游标。需要回到三源时停两个 timer 并等待结束，将 `mode` 改为 `"channels"` 后恢复；Helper 暂时失败不会自动启用三源。
 

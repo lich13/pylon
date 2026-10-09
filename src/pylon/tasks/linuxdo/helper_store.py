@@ -17,7 +17,7 @@ class HelperStore:
         self.parser_version = PARSER_VERSION if followed is None else digest([PARSER_VERSION, sorted(followed)])
 
     def save_page(self, messages: list[dict], checkpoint: dict) -> dict:
-        counts = {'collected': 0, 'board': 0, 'personal': 0, 'unknown': 0, 'queued': 0}
+        counts = {'collected': 0, 'board': 0, 'personal': 0, 'following': 0, 'unknown': 0, 'queued': 0}
         now = time.time()
         with self.box.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -46,9 +46,27 @@ class HelperStore:
                     payload = {'message_id': notice.message_id, 'kind': notice.kind, 'route': route}
                 else:
                     payload.update(_raw=raw, _parser=self.parser_version, _parser_revision=PARSER_VERSION)
-                status = 'queued' if route == 'personal' else 'accepted' if route == 'board' else route
+                status = 'queued' if route == 'personal' else 'accepted' if route in {'board', 'following'} else route
                 if old and old['route'] == 'personal':
                     status = old['status']
+                changed_public = (old and old['route'] in {'board', 'following'}
+                                  and json.loads(old['payload']).get('_raw') != raw)
+                if changed_public:
+                    ref = f'tg:{SOURCE}:{notice.message_id}'
+                    # A sold-out edit must invalidate a price decision and any
+                    # unsent preview before asynchronous reclassification.
+                    pending = db.execute('''SELECT n.facts,e.id FROM linuxdo_notifications n
+                        JOIN events e ON e.id=n.event_id WHERE n.topic_id=?
+                        AND e.status='pending' AND e.attempts=0''', (old['topic_id'],)).fetchall()
+                    for item in pending:
+                        if any(c.get('ref') == ref for fact in json.loads(item['facts']) for c in fact.get('evidence', [])):
+                            db.execute("UPDATE events SET status='suppressed',error='source edited before delivery' WHERE id=?", (item['id'],))
+                    db.execute('DELETE FROM linuxdo_observations WHERE channel=? AND message_id=?', (SOURCE, notice.message_id))
+                    db.execute('DELETE FROM linuxdo_evidence WHERE topic_id=? AND ref=?', (old['topic_id'], ref))
+                    db.execute("""UPDATE linuxdo_topics SET version=version+1,
+                        status=CASE WHEN EXISTS(SELECT 1 FROM linuxdo_evidence e
+                            WHERE e.topic_id=linuxdo_topics.topic_id) THEN 'pending' ELSE 'skip' END,
+                        lease_until=0,next_attempt=0 WHERE topic_id=?""", (old['topic_id'],))
                 db.execute('''INSERT INTO linuxdo_helper_messages VALUES(?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(message_id) DO UPDATE SET kind=excluded.kind,route=excluded.route,
                     topic_id=excluded.topic_id,post_number=excluded.post_number,payload=excluded.payload,
@@ -58,7 +76,7 @@ class HelperStore:
                 counts['collected'] += 1
                 if route in counts:
                     counts[route] += 1
-                if old and old['route'] == 'board' and (route != 'board' or old['topic_id'] != notice.topic_id):
+                if old and not changed_public and old['route'] == 'board' and (route != 'board' or old['topic_id'] != notice.topic_id):
                     db.execute('DELETE FROM linuxdo_observations WHERE channel=? AND message_id=?', (SOURCE, notice.message_id))
                     db.execute('DELETE FROM linuxdo_evidence WHERE topic_id=? AND ref=?',
                                (old['topic_id'], f'tg:{SOURCE}:{notice.message_id}'))
@@ -71,6 +89,16 @@ class HelperStore:
                     self.store.save_page(SOURCE, Page([notice.observation()], [notice.message_id]), checkpoint, connection=db)
                 elif route == 'personal' and not (old and old['route'] == 'personal'):
                     counts['queued'] += self._personal(db, notice, now)
+                elif route == 'following':
+                    if old and old['route'] == 'board':
+                        # A parser rollout must not replay previously evaluated board
+                        # content as new followed-author notifications.
+                        db.execute("UPDATE linuxdo_helper_messages SET status='historical' WHERE message_id=?", (notice.message_id,))
+                        continue
+                    db.execute('''INSERT INTO linuxdo_public_reviews(message_id,content_hash,status) VALUES(?,?,'pending')
+                        ON CONFLICT(message_id) DO UPDATE SET content_hash=excluded.content_hash,
+                        status=CASE WHEN linuxdo_public_reviews.status='direct' THEN 'direct' ELSE 'pending' END,
+                        lease_until=0,next_attempt=0''', (notice.message_id, content_hash))
             self.store.save_page(SOURCE, Page(), checkpoint, connection=db)
             unresolved = db.execute("SELECT count(*) FROM linuxdo_helper_messages WHERE route='unknown'").fetchone()[0]
             key = 'helper:format_alert'
@@ -88,8 +116,10 @@ class HelperStore:
             rows = db.execute('''SELECT payload FROM linuxdo_helper_messages WHERE
                 (route='unknown' AND coalesce(json_extract(payload, '$._parser'), '')<>?)
                 OR (route='board' AND coalesce(json_extract(payload, '$._parser_revision'), '')<>?)
+                OR (route='following' AND coalesce(json_extract(payload, '$._parser'), '')<>?
+                    AND message_id IN (SELECT message_id FROM linuxdo_public_reviews WHERE status IN ('pending','hold')))
                 ORDER BY message_id LIMIT ?''',
-                              (self.parser_version, PARSER_VERSION, max(1, min(limit, 100)))).fetchall()
+                              (self.parser_version, PARSER_VERSION, self.parser_version, max(1, min(limit, 100)))).fetchall()
         messages = [payload['_raw'] for row in rows if '_raw' in (payload := json.loads(row[0]))]
         if not messages:
             return {'collected': 0, 'queued': 0}

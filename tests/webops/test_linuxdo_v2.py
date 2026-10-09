@@ -12,7 +12,7 @@ import pytest
 from pylon import transport
 from pylon.events import text_key
 from pylon.outbox import Outbox
-from pylon.tasks.linuxdo import http, judge, pipeline, policy, sources
+from pylon.tasks.linuxdo import http, judge, pipeline, policy, sources, trade
 from pylon.tasks.linuxdo.common import JOB_ID
 from pylon.tasks.linuxdo.store import Store
 
@@ -303,6 +303,28 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "LEGACY_STATE", tmp_path / "unused-legacy-state.json")
     monkeypatch.delenv("PYLON_RUN_ID", raising=False)
     return Store(Outbox(tmp_path / "outbox.sqlite3"))
+
+
+@pytest.fixture(autouse=True)
+def no_external_trade_requests(monkeypatch):
+    process = pipeline.process_topic
+    review = pipeline.review
+
+    def non_trade(_snapshot):
+        return {"intent": "non_trade", "offers": []}
+
+    def process_topic(*args, **kwargs):
+        kwargs.setdefault("trade_request", non_trade)
+        kwargs.setdefault("trade_config", trade.default_config())
+        return process(*args, **kwargs)
+
+    def pipeline_review(*args, **kwargs):
+        kwargs.setdefault("trade_request", non_trade)
+        kwargs.setdefault("trade_config", trade.default_config())
+        return review(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "process_topic", process_topic)
+    monkeypatch.setattr(pipeline, "review", pipeline_review)
 
 
 def observation(*, channel="LinuxDoNew", message_id=61, topic_id="9201", post_number=1,

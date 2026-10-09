@@ -16,10 +16,12 @@ from .store import Store
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='Linux.do collection and value review')
     parser.add_argument('command', choices=['collect', 'review', 'status', 'replay', 'export-legacy',
-                                            'helper-auth', 'helper-check', 'helper-baseline', 'helper-import-following'])
+                                            'helper-auth', 'helper-check', 'helper-baseline', 'helper-import-following',
+                                            'trade-config'])
     parser.add_argument('--store', type=Path)
     parser.add_argument('--input', type=Path)
-    parser.add_argument('--limit', type=int, default=4)
+    parser.add_argument('--owner', default='', help='bind forum username for following imports')
+    parser.add_argument('--limit', type=int, default=2)
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args(argv)
     if args.command == 'helper-auth':
@@ -34,6 +36,16 @@ def main(argv=None) -> int:
         if not args.apply or not args.input:
             parser.error('helper-import-following requires --apply and a private --input file')
         from .following import install
+        try:
+            print(json.dumps(install(args.input, **({'owner': args.owner} if args.owner else {})), ensure_ascii=False))
+            return 0
+        except Exception as exc:
+            print(json.dumps({'error': type(exc).__name__}))
+            return 1
+    if args.command == 'trade-config':
+        if not args.apply or not args.input:
+            parser.error('trade-config requires --apply and a private --input file')
+        from .trade import install
         try:
             print(json.dumps(install(args.input), ensure_ascii=False))
             return 0

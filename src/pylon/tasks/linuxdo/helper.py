@@ -9,7 +9,8 @@ from .common import URL_RE, clean, digest, safe_url
 from .sources import Observation
 
 SOURCE = 'linux_do_helper_bot'
-PARSER_VERSION = 'helper-20261009-4'
+PARSER_VERSION = 'helper-20261009-5'
+FOLLOWING = {'following_posted', 'following_replied'}
 PERSONAL = {'following_posted', 'following_replied', 'private_message', 'replied', 'mentioned',
             'quoted', 'group_mentioned', 'linked', 'posted', 'event_reminder', 'event_invitation'}
 BOARD = {'watching_first_post', 'watching_category_or_tag'}
@@ -81,7 +82,7 @@ class HelperNotice:
         return digest([SOURCE, identity])
 
     def observation(self) -> Observation:
-        if self.route != 'board' or not self.topic_id or self.post_number < 1:
+        if self.route not in {'board', 'following'} or not self.topic_id or self.post_number < 1:
             raise ValueError('only identified board notices become model evidence')
         return Observation(SOURCE, self.message_id, self.topic_id, self.post_number, clean(self.title, 300),
                            clean(self.text), [], self.published_at, self.url,
@@ -189,6 +190,8 @@ def parse_message(raw: dict, *, followed: frozenset[str] | None = None) -> Helpe
             kind, route = 'watching_first_post', 'board'
     if route == 'board' and not topic:
         route = 'unknown'
+    if route == 'personal' and kind in FOLLOWING:
+        route = 'following' if topic and actor else 'unknown'
     all_links = list(dict.fromkeys(filter(None, [safe_url(row['url']) for row in [*links, *buttons]]
                                                + [safe_url(item) for item in URL_RE.findall(text)])))
     notification_id = ''

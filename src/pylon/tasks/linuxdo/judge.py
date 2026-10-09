@@ -144,7 +144,7 @@ change_kind=restocked/correction 必须有 evidence 明确证明这次新变化�
 def request(snapshot: dict, config: dict) -> dict:
     from pylon.tasks.software.monitor import _request_grok_structured, extract_grok_json
     response, _ = _request_grok_structured(build_prompt(snapshot, config), schema=SCHEMA,
-                                          name='linuxdo_value', timeout=45)
+                                          name='linuxdo_value', timeout=45, total_timeout=120)
     return extract_grok_json(response, label='Linux.do value')
 
 

@@ -13,7 +13,9 @@ import signal
 import sqlite3
 import stat
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from threading import Barrier, Event, Lock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -22,7 +24,7 @@ import pytest
 
 from pylon.outbox import Outbox
 from pylon.tasks.linuxdo import __main__ as linuxdo_main
-from pylon.tasks.linuxdo import following, helper, helper_account, helper_collect, helper_store, judge, pipeline, policy
+from pylon.tasks.linuxdo import following, helper, helper_account, helper_collect, helper_store, judge, pipeline, policy, public_review, trade
 from pylon.tasks.linuxdo.common import TOPIC_RE, digest
 from pylon.tasks.linuxdo.helper import SOURCE, envelope, parse_message
 from pylon.tasks.linuxdo.helper_account import AuthorizationRequired, RateLimited
@@ -116,6 +118,28 @@ def no_external_requests(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_external_trade_requests(monkeypatch):
+    process = pipeline.process_topic
+    review = pipeline.review
+
+    def non_trade(_snapshot):
+        return {'intent': 'non_trade', 'offers': []}
+
+    def process_topic(*args, **kwargs):
+        kwargs.setdefault('trade_request', non_trade)
+        kwargs.setdefault('trade_config', trade.default_config())
+        return process(*args, **kwargs)
+
+    def pipeline_review(*args, **kwargs):
+        kwargs.setdefault('trade_request', non_trade)
+        kwargs.setdefault('trade_config', trade.default_config())
+        return review(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, 'process_topic', process_topic)
+    monkeypatch.setattr(pipeline, 'review', pipeline_review)
+
+
+@pytest.fixture(autouse=True)
 def following_root(tmp_path, monkeypatch):
     root = tmp_path / 'following-private'
     root.mkdir(mode=0o700)
@@ -146,8 +170,8 @@ def clock(monkeypatch):
 
 
 @pytest.mark.parametrize(('kind', 'label', 'route'), [
-    ('following_posted', '关注者发帖', 'personal'),
-    ('following_replied', '关注者回复', 'personal'),
+    ('following_posted', '关注者发帖', 'following'),
+    ('following_replied', '关注者回复', 'following'),
     ('private_message', '私信', 'personal'),
     ('replied', '回复', 'personal'),
     ('mentioned', '提及', 'personal'),
@@ -167,19 +191,19 @@ def test_explicit_notification_types_select_the_expected_route(kind, label, rout
         assert (notice.topic_id, notice.post_number) == ('9101', 3)
 
 
-@pytest.mark.parametrize(('header', 'kind'), [
-    ('合成用户给你发送了私信', 'private_message'),
-    ('你关注的合成用户发布了新帖', 'following_posted'),
-    ('你关注的合成用户回复了主题', 'following_replied'),
-    ('合成用户回复了你的帖子', 'replied'),
-    ('合成用户提及了你', 'mentioned'),
-    ('合成用户引用了你', 'quoted'),
-    ('合成用户链接到了你的帖子', 'linked'),
+@pytest.mark.parametrize(('header', 'kind', 'route'), [
+    ('合成用户给你发送了私信', 'private_message', 'personal'),
+    ('你关注的合成用户发布了新帖', 'following_posted', 'unknown'),
+    ('你关注的合成用户回复了主题', 'following_replied', 'unknown'),
+    ('合成用户回复了你的帖子', 'replied', 'personal'),
+    ('合成用户提及了你', 'mentioned', 'personal'),
+    ('合成用户引用了你', 'quoted', 'personal'),
+    ('合成用户链接到了你的帖子', 'linked', 'personal'),
 ])
-def test_anchored_personal_headers_are_recognized(header, kind):
+def test_anchored_headers_are_recognized_but_following_requires_actor(header, kind, route):
     raw = message()
     raw['text'] = header + '\n' + BODY
-    assert (parse_message(raw).kind, parse_message(raw).route) == (kind, 'personal')
+    assert (parse_message(raw).kind, parse_message(raw).route) == (kind, route)
 
 
 @pytest.mark.parametrize(('header', 'kind'), [
@@ -222,7 +246,7 @@ def test_online_short_link_and_slug_title_identify_the_same_post(
     assert notice.url == raw['buttons'][0]['url']
     assert notice.notification_id == notification_id
     assert (notice.kind, notice.route) == (
-        'following_posted' if post_number == 1 else 'following_replied', 'personal')
+        'following_posted' if post_number == 1 else 'following_replied', 'following')
 
 
 @pytest.mark.parametrize('with_button', [False, True])
@@ -293,8 +317,8 @@ def test_unconfirmed_published_header_stays_unknown_even_with_a_topic_action(sto
     (None, 3, 'unknown', 'unknown'),
     (frozenset(), 1, 'watching_first_post', 'board'),
     (frozenset(), 3, 'unknown', 'unknown'),
-    (frozenset({'fixture_actor'}), 1, 'following_posted', 'personal'),
-    (frozenset({'fixture_actor'}), 3, 'following_replied', 'personal'),
+    (frozenset({'fixture_actor'}), 1, 'following_posted', 'following'),
+    (frozenset({'fixture_actor'}), 3, 'following_replied', 'following'),
     (frozenset({'fixture_other'}), 1, 'watching_first_post', 'board'),
     (frozenset({'fixture_other'}), 3, 'unknown', 'unknown'),
 ])
@@ -313,7 +337,7 @@ def test_following_match_uses_decoded_casefolded_profile_username_not_display_la
 
     notice = parse_message(raw, followed=frozenset({'fixture_actor'}))
 
-    assert (notice.actor, notice.kind, notice.route) == ('FiXtUrE_aCtOr', 'following_posted', 'personal')
+    assert (notice.actor, notice.kind, notice.route) == ('FiXtUrE_aCtOr', 'following_posted', 'following')
 
 
 @pytest.mark.parametrize('mutation', [
@@ -347,7 +371,7 @@ def test_legacy_first_line_profile_link_without_line_metadata_remains_supported(
     raw = published_message()
     raw['links'][0].pop('line')
 
-    assert parse_message(raw, followed=frozenset({'fixture_actor'})).route == 'personal'
+    assert parse_message(raw, followed=frozenset({'fixture_actor'})).route == 'following'
 
 
 def test_plain_text_board_actor_cannot_promote_a_notice_to_personal():
@@ -372,13 +396,17 @@ def test_followed_person_mentioned_only_in_body_does_not_select_personal_route(p
 
 
 @pytest.mark.parametrize('followed', [None, frozenset(), frozenset({'fixture_other'})])
-def test_private_message_ignores_following_configuration_and_never_reaches_grok(store, followed):
+def test_private_message_ignores_following_configuration_and_never_reaches_grok(store, followed, monkeypatch):
     raw = two_line_message(body='合成私信正文只允许进入个人通知队列。')
     request = Mock(side_effect=AssertionError('private messages must not reach Grok'))
+    trade_request = Mock(side_effect=AssertionError('private messages must not reach trade intent review'))
+    price_load = Mock(side_effect=AssertionError('private messages must not read trade price configuration'))
+    monkeypatch.setattr(trade, 'load', price_load)
 
     saved = save(store, raw, followed=followed)
     reviewed = pipeline.review(store, sources={'mode': 'helper'}, config=policy.default_policy(),
                                model='fixture-model', request=request,
+                               trade_request=trade_request, trade_config=None,
                                topic_fetch=Mock(side_effect=AssertionError('no private topic reads')),
                                official_fetch=Mock(side_effect=AssertionError('no private resource reads')))
 
@@ -392,6 +420,135 @@ def test_private_message_ignores_following_configuration_and_never_reaches_grok(
     assert len(event_rows(store)) == 1
     assert reviewed == {'processed': 0, 'errors': 0, 'queued': 0}
     request.assert_not_called()
+    trade_request.assert_not_called()
+    price_load.assert_not_called()
+
+
+def test_following_posts_wait_for_intent_and_only_nontrade_is_direct(store, clock):
+    messages = [
+        published_message(301),
+        published_message(302),
+        short_link_message(303, topic_id='9163', post_number=3),
+    ]
+    saved = save(store, *messages, followed=frozenset({'fixture_actor'}))
+    assert saved['following'] == 3 and saved['queued'] == 0
+    assert rows(store, 'SELECT message_id,route FROM linuxdo_helper_messages ORDER BY message_id') == [
+        {'message_id': 301, 'route': 'following'},
+        {'message_id': 302, 'route': 'following'},
+        {'message_id': 303, 'route': 'following'},
+    ]
+    assert rows(store, 'SELECT * FROM linuxdo_topics') == []
+    assert rows(store, 'SELECT * FROM linuxdo_evidence') == []
+    assert event_rows(store) == []
+
+    trade_request = Mock(side_effect=[
+        {'intent': 'non_trade', 'offers': []},
+        {'intent': 'wanted', 'offers': []},
+        {'intent': 'offer', 'offers': []},
+    ])
+    result = public_review.review(store, limit=3, request=trade_request, config=trade.default_config(),
+                                  model='fixture-model')
+
+    assert result == {'processed': 3, 'errors': 0, 'queued': 1}
+    assert trade_request.call_count == 3
+    assert rows(store, 'SELECT message_id,status FROM linuxdo_public_reviews ORDER BY message_id') == [
+        {'message_id': 301, 'status': 'direct'},
+        {'message_id': 302, 'status': 'skip'},
+        {'message_id': 303, 'status': 'trade'},
+    ]
+    assert rows(store, 'SELECT channel,message_id,topic_id FROM linuxdo_observations') == [
+        {'channel': helper.SOURCE, 'message_id': 303, 'topic_id': '9163'},
+    ]
+    assert rows(store, 'SELECT message_id,kind FROM linuxdo_helper_events') == [
+        {'message_id': 301, 'kind': 'following_posted'},
+    ]
+    assert len(event_rows(store)) == 1
+
+
+def test_following_cloud_offer_joins_board_judgment_and_reuses_public_extraction_cache(store, clock):
+    body = '合成脚本可按顺序执行三个操作。api_key=fixture_secret 联系 user@example.invalid。'
+    save(store, short_link_message(301, topic_id='9163', body=body),
+         followed=frozenset({'fixture_actor'}))
+    intent = Mock(return_value={'intent': 'cloud_offer', 'offers': []})
+
+    result = public_review.review(store, request=intent, config=trade.default_config(), model='fixture-model',
+                                  focus=policy.default_policy())
+
+    assert result == {'processed': 1, 'errors': 0, 'queued': 0}
+    assert rows(store, 'SELECT status FROM linuxdo_public_reviews') == [{'status': 'trade'}]
+    assert rows(store, 'SELECT topic_id FROM linuxdo_observations') == [{'topic_id': '9163'}]
+    reviewed = intent.call_args.args[0]
+    assert 'api_key=[REDACTED]' in reviewed['evidence'][0]['body']
+    assert '[EMAIL]' in reviewed['evidence'][0]['body']
+
+    board_review = Mock(side_effect=lambda snapshot, _config: judgment(snapshot))
+    repeated_intent = Mock(side_effect=AssertionError('the cached public intent must be reused for its topic'))
+    processed = pipeline.process_topic(
+        store, '9163', policy.default_policy(), model='fixture-model', request=board_review,
+        topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [],
+        trade_request=repeated_intent, trade_config=trade.default_config(),
+    )
+
+    assert processed['decision'] == 'push'
+    assert board_review.call_count == 1
+    repeated_intent.assert_not_called()
+    assert store.snapshot('9163')['previously_notified'] is True
+
+
+def test_public_and_board_model_calls_run_concurrently_without_holding_the_collection_database(store, clock):
+    save(store, message(message_id=301, kind='watching_first_post', topic_id='9161'))
+    save(store, short_link_message(302, topic_id='9162'), followed=frozenset({'fixture_actor'}))
+    clock[0] += 31
+    started = Barrier(2)
+    release = Event()
+    both_waiting = Event()
+    call_lock = Lock()
+    calls = []
+
+    def intent(snapshot):
+        with call_lock:
+            calls.append(snapshot['topic_id'])
+            if len(calls) == 2:
+                both_waiting.set()
+        started.wait(timeout=4)
+        if not release.wait(timeout=4):
+            raise TimeoutError('model gate was not released')
+        return {'intent': 'non_trade', 'offers': []}
+
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        future = caller.submit(
+            pipeline.review, store, sources={'mode': 'helper'}, config=policy.default_policy(),
+            model='fixture-model', request=lambda snapshot, _config: judgment(snapshot),
+            trade_request=intent, trade_config=trade.default_config(),
+            topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [],
+        )
+        try:
+            assert both_waiting.wait(timeout=4)
+            with store.box.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                db.execute("INSERT OR REPLACE INTO linuxdo_meta(key,value) VALUES('fixture_concurrent_write','ok')")
+                db.commit()
+        finally:
+            release.set()
+        result = future.result(timeout=6)
+
+    assert len(calls) == 2 and set(calls) == {'9161', '9162'}
+    assert result == {'processed': 2, 'errors': 0, 'queued': 2}
+    assert rows(store, "SELECT value FROM linuxdo_meta WHERE key='fixture_concurrent_write'") == [{'value': 'ok'}]
+
+
+def test_following_posts_older_than_seven_days_never_call_model_even_after_edit(store, clock):
+    raw = published_message(301) | {'published_at': '2025-12-24T00:00:00Z', 'edited_at': PUBLISHED_AT}
+    assert save(store, raw, followed=frozenset({'fixture_actor'}))['following'] == 1
+    request = Mock(side_effect=AssertionError('expired following posts must not consume model calls'))
+
+    result = public_review.review(store, request=request, config=trade.default_config(), model='fixture-model')
+
+    assert result == {'processed': 1, 'queued': 0, 'errors': 0}
+    request.assert_not_called()
+    assert rows(store, 'SELECT status,lease_until FROM linuxdo_public_reviews') == [{'status': 'skip', 'lease_until': 0}]
+    assert rows(store, 'SELECT * FROM linuxdo_evidence') == []
+    assert event_rows(store) == []
 
 
 def test_welcome_template_is_silent_and_does_not_retain_its_body(store):
@@ -609,13 +766,18 @@ def process(store, topic_id='9101', *, request=None):
                                   topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [])
 
 
-def test_personal_notice_has_no_model_evidence_or_value_judgment(store):
-    raw = message(body='合成个人正文只应保留于独立消息表。')
+@pytest.mark.parametrize('kind', ['replied', 'mentioned', 'quoted', 'group_mentioned', 'linked', 'posted'])
+def test_personal_notice_has_no_model_evidence_or_value_judgment(store, kind, monkeypatch):
+    raw = message(kind=kind, body='合成个人正文只应保留于独立消息表。')
     saved = save(store, raw)
     request = Mock(side_effect=AssertionError('personal notices must not reach the value model'))
+    trade_request = Mock(side_effect=AssertionError('personal notices must not reach the trade model'))
+    price_load = Mock(side_effect=AssertionError('personal notices must not read trade prices'))
+    monkeypatch.setattr(trade, 'load', price_load)
 
     reviewed = pipeline.review(store, sources={'mode': 'helper'}, config=policy.default_policy(),
                                model='fixture-model', request=request,
+                               trade_request=trade_request, trade_config=None,
                                topic_fetch=Mock(side_effect=AssertionError('no topic reads')),
                                official_fetch=Mock(side_effect=AssertionError('no official reads')))
 
@@ -633,6 +795,8 @@ def test_personal_notice_has_no_model_evidence_or_value_judgment(store):
     assert events[0]['status'] == 'pending'
     assert reviewed == {'processed': 0, 'errors': 0, 'queued': 0}
     request.assert_not_called()
+    trade_request.assert_not_called()
+    price_load.assert_not_called()
 
 
 def test_personal_notice_preserves_external_urls_hidden_behind_body_anchor_text(store):
@@ -704,12 +868,16 @@ def test_personal_replies_at_different_post_numbers_are_distinct_events(store):
     assert len({row['event_id'] for row in events}) == 2
 
 
-def test_short_link_personal_replies_keep_independent_events_for_each_floor(store):
+def test_short_link_following_replies_keep_independent_events_after_nontrade_confirmation(store, clock):
     messages = [short_link_message(301, post_number=3), short_link_message(302, post_number=4)]
 
     result = save(store, *messages, followed=frozenset({'fixture_actor'}))
 
-    assert result['personal'] == result['queued'] == 2
+    assert result['following'] == 2 and result['personal'] == result['queued'] == 0
+    trade_request = Mock(return_value={'intent': 'non_trade', 'offers': []})
+    assert public_review.review(store, limit=2, request=trade_request, config=trade.default_config(),
+                                model='fixture-model') == {'processed': 2, 'queued': 2, 'errors': 0}
+    assert trade_request.call_count == 2
     events = rows(store, '''SELECT topic_id,post_number,event_key,event_id
         FROM linuxdo_helper_events ORDER BY post_number''')
     assert [(row['topic_id'], row['post_number']) for row in events] == [('9160', 3), ('9160', 4)]
@@ -1019,28 +1187,72 @@ def test_new_following_fingerprint_reparses_old_unknown_once_without_a_recent_re
 
     result = collect(Store(Outbox(store.box.path)), account)
 
-    assert result['error'] == '' and result['changed'] == result['queued'] == 1
+    assert result['error'] == '' and result['changed'] == 1 and result['queued'] == 0
     assert result['following']['configured'] is True
     assert result['following']['count'] == 1
     assert account.calls == [{'after': 401, 'limit': 2}]
     assert store.checkpoint(SOURCE)['cursor'] == 401
     updated = rows(store, 'SELECT kind,route,payload FROM linuxdo_helper_messages WHERE message_id=301')[0]
-    assert (updated['kind'], updated['route']) == ('following_replied', 'personal')
+    assert (updated['kind'], updated['route']) == ('following_replied', 'following')
     assert json.loads(updated['payload'])['_parser'] != before['_parser']
     assert json.loads(updated['payload'])['_raw'] == raw
     assert rows(store, 'SELECT * FROM linuxdo_observations') == []
     assert rows(store, 'SELECT * FROM linuxdo_evidence') == []
-    assert len(rows(store, 'SELECT * FROM linuxdo_helper_events')) == 1
+    assert rows(store, 'SELECT * FROM linuxdo_helper_events') == []
 
     repeated = collect(Store(Outbox(store.box.path)), FakeAccount([[]]))
     assert repeated['changed'] == repeated['queued'] == 0
     assert save(store, raw, followed=frozenset({'fixture_other'}))['queued'] == 0
-    assert rows(store, 'SELECT route FROM linuxdo_helper_messages WHERE message_id=301') == [{'route': 'personal'}]
+    assert rows(store, 'SELECT route FROM linuxdo_helper_messages WHERE message_id=301') == [{'route': 'unknown'}]
     assert rows(store, 'SELECT * FROM linuxdo_evidence') == []
     assert save(store, raw, raw | {'message_id': 402},
                 followed=frozenset({'fixture_actor', 'fixture_other'}))['queued'] == 0
-    assert len(rows(store, 'SELECT * FROM linuxdo_helper_events')) == 1
-    assert len(event_rows(store)) == 2  # One format alert and one personal notification.
+    assert rows(store, 'SELECT * FROM linuxdo_helper_events') == []
+
+
+@pytest.mark.parametrize('review_state', ['pending', 'hold'])
+def test_following_snapshot_change_reparses_unresolved_public_notices(store, following_root, review_state):
+    raw = published_message(301, post_number=3, body='合成关注者公开帖等待意图判断。')
+    assert save(store, raw, followed=frozenset({'fixture_actor'}))['following'] == 1
+    with store.box.connect() as db:
+        db.execute('UPDATE linuxdo_public_reviews SET status=?,next_attempt=0 WHERE message_id=301', (review_state,))
+    write_following(following_root, [])
+
+    changed = HelperStore(store, followed=frozenset()).reparse_pending()
+
+    assert changed['collected'] == 1 and changed['queued'] == 0
+    assert rows(store, 'SELECT route,status FROM linuxdo_helper_messages WHERE message_id=301') == [
+        {'route': 'unknown', 'status': 'unknown'},
+    ]
+    request = Mock(side_effect=AssertionError('removed accounts must not reach public intent review'))
+    assert public_review.review(store, request=request, config=trade.default_config(),
+                                model='fixture-model') == {'processed': 0, 'errors': 0, 'queued': 0}
+    request.assert_not_called()
+    assert rows(store, 'SELECT status FROM linuxdo_public_reviews') == [{'status': review_state}]
+    assert rows(store, 'SELECT * FROM linuxdo_observations') == []
+
+
+def test_following_snapshot_change_does_not_replay_already_direct_notice(store, clock, following_root):
+    raw = published_message(301, body='合成关注者公开的非交易内容。')
+    assert save(store, raw, followed=frozenset({'fixture_actor'}))['following'] == 1
+    request = Mock(return_value={'intent': 'non_trade', 'offers': []})
+    assert public_review.review(store, request=request, config=trade.default_config(),
+                                model='fixture-model')['queued'] == 1
+    assert rows(store, 'SELECT status FROM linuxdo_public_reviews') == [{'status': 'direct'}]
+    before = len(event_rows(store))
+    write_following(following_root, [])
+
+    changed = HelperStore(store, followed=frozenset()).reparse_pending()
+
+    assert changed == {'collected': 0, 'queued': 0}
+    assert rows(store, 'SELECT route,status FROM linuxdo_helper_messages WHERE message_id=301') == [
+        {'route': 'following', 'status': 'queued'},
+    ]
+    assert rows(store, 'SELECT status FROM linuxdo_public_reviews') == [{'status': 'direct'}]
+    assert public_review.review(store, request=Mock(side_effect=AssertionError('direct notices are terminal')),
+                                config=trade.default_config(), model='fixture-model') == {
+                                    'processed': 0, 'errors': 0, 'queued': 0}
+    assert len(event_rows(store)) == before == 1
 
 
 def test_corrupt_following_snapshot_does_not_interrupt_personal_collection(store, clock, following_root):
@@ -1084,7 +1296,7 @@ def test_helper_check_uses_the_list_but_outputs_no_names_message_content_or_link
     result = json.loads(output.out)
     assert output.err == ''
     assert result['authorized'] is True and result['sample_count'] == 4
-    assert result['routes'] == {'personal:following_posted': 1, 'board:watching_first_post': 1,
+    assert result['routes'] == {'following:following_posted': 1, 'board:watching_first_post': 1,
                                 'unknown:unknown': 1, 'personal:private_message': 1}
     assert result['following']['configured'] is True and result['following']['count'] == 2
     assert result['read_marker_unchanged'] is True
@@ -1281,20 +1493,28 @@ def test_following_change_reparses_unknown_without_replaying_judged_short_link_b
 
     result = collect(Store(Outbox(store.box.path)), account)
 
-    assert result['error'] == '' and result['changed'] == result['queued'] == 1
+    assert result['error'] == '' and result['changed'] == 1 and result['queued'] == 0
     assert account.calls == [{'after': 303, 'limit': 2}]
     assert store.checkpoint(SOURCE) == previous_checkpoint
     assert rows(store, "SELECT * FROM linuxdo_helper_messages WHERE route='board' ORDER BY message_id") == boards_before
     assert rows(store, 'SELECT * FROM linuxdo_topics ORDER BY topic_id') == topics_before
     assert rows(store, 'SELECT * FROM linuxdo_evidence ORDER BY topic_id,ref') == evidence_before
+    assert rows(store, 'SELECT * FROM linuxdo_helper_events') == []
+    assert len(event_rows(store)) == event_count
+    request = Mock(side_effect=AssertionError('nontrade following posts bypass the value judge'))
+    trade_request = Mock(return_value={'intent': 'non_trade', 'offers': []})
+    reviewed = pipeline.review(store, sources={'mode': 'helper'}, config=policy.default_policy(),
+                               model='fixture-model', request=request, trade_request=trade_request,
+                               topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [])
+
+    assert reviewed == {'processed': 1, 'errors': 0, 'queued': 1}
+    request.assert_not_called()
+    trade_request.assert_called_once()
     assert rows(store, 'SELECT message_id,kind,topic_id,post_number FROM linuxdo_helper_events') == [
         {'message_id': 303, 'kind': 'following_replied', 'topic_id': '9163', 'post_number': 4},
     ]
     assert len(event_rows(store)) == event_count + 1
-    request = Mock(side_effect=AssertionError('following changes must not replay judged boards'))
-    assert pipeline.review(store, sources={'mode': 'helper'}, config=policy.default_policy(),
-                           model='fixture-model', request=request) == {'processed': 0, 'errors': 0, 'queued': 0}
-    request.assert_not_called()
+    assert rows(store, 'SELECT status FROM linuxdo_public_reviews WHERE message_id=303') == [{'status': 'direct'}]
     assert HelperStore(store, followed=frozenset({'fixture_alpha', 'fixture_reply'})).reparse_pending() == {
         'collected': 0, 'queued': 0,
     }

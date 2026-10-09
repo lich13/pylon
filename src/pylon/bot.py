@@ -20,6 +20,7 @@ log = logging.getLogger("pylon")
 
 
 def store_updates(box: Outbox, profile: str, updates: list[dict]):
+    from .tasks.linuxdo.following_import import accepts
     not_before = box.get('commands_not_before', 0)
     with box.connect() as db:
         for update in updates:
@@ -33,6 +34,10 @@ def store_updates(box: Outbox, profile: str, updates: list[dict]):
             }
             if authorized(profile, message) and isinstance(message.get('text'), str) and message.get('date', not_before) >= not_before:
                 db.execute("INSERT OR IGNORE INTO updates(profile,update_id,payload,kind,chat_id,message_id) VALUES(?,?,?,'message',?,?)",
+                           (profile, update['update_id'], json.dumps(message, ensure_ascii=False),
+                            str(message.get('chat', {}).get('id', '')), message.get('message_id')))
+            elif authorized(profile, message) and accepts(profile, message) and message.get('date', not_before) >= not_before:
+                db.execute("INSERT OR IGNORE INTO updates(profile,update_id,payload,kind,chat_id,message_id) VALUES(?,?,?,'following_document',?,?)",
                            (profile, update['update_id'], json.dumps(message, ensure_ascii=False),
                             str(message.get('chat', {}).get('id', '')), message.get('message_id')))
             elif authorized(profile, callback_owner) and isinstance(callback.get('data'), str) and callback_owner.get('date', not_before) >= not_before:
@@ -81,14 +86,19 @@ def command_once(box: Outbox) -> bool:
         env.pop('PYLON_REPLY_MESSAGE_ID', None)
         if type(reply_id) is int and reply_id > 0:
             env['PYLON_REPLY_MESSAGE_ID'] = str(reply_id)
-        if is_callback:
+        if row.get('kind') == 'following_document':
+            from .tasks.linuxdo.following_import import document
+            reply, status = document(row['profile'], message), 'done'
+            proc = None
+        elif is_callback:
             proc = subprocess.run([str(home() / 'venv/bin/python'), '-m', 'pylon.commands', row['profile'], '--callback'],
                                   input=json.dumps(message, ensure_ascii=False), capture_output=True, text=True, timeout=180, env=env)
         else:
             proc = subprocess.run([str(home() / 'venv/bin/python'), '-m', 'pylon.commands', row['profile']],
                                   input=message['text'], capture_output=True, text=True, timeout=180, env=env)
-        reply = proc.stdout.strip() or '操作失败，请查看 pylon 日志'
-        status = 'done' if proc.returncode == 0 else 'failed'
+        if proc is not None:
+            reply = proc.stdout.strip() or '操作失败，请查看 pylon 日志'
+            status = 'done' if proc.returncode == 0 else 'failed'
     except Exception as exc:
         reply, status = '操作结果不确定，请重新打开对应入口核对后再操作', 'uncertain'
         log.warning("command %s: %s", row['update_id'], redact(str(exc)))

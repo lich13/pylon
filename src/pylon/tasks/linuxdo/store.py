@@ -59,6 +59,8 @@ class Store:
             columns = {row[1] for row in db.execute('PRAGMA table_info(linuxdo_helper_events)')}
             if 'post_fingerprint' not in columns:
                 db.execute("ALTER TABLE linuxdo_helper_events ADD COLUMN post_fingerprint TEXT NOT NULL DEFAULT ''")
+            from .trade_store import initialize
+            initialize(db)
 
     def checkpoint(self, channel: str) -> dict | None:
         with self.box.connect() as db:
@@ -188,9 +190,10 @@ class Store:
                 AND status IN ('pending','hold') AND next_attempt<=? AND lease_until<=?
                 AND (?='' OR EXISTS(SELECT 1 FROM linuxdo_observations o
                     WHERE o.topic_id=linuxdo_topics.topic_id AND o.channel=?))
-                ORDER BY first_seen,topic_id LIMIT ?''', (now, now, source, source, limit)).fetchall()
+                ORDER BY CASE WHEN first_seen<? THEN 0 WHEN lower(title) LIKE '%codex%' THEN 1 ELSE 2 END,
+                    first_seen,topic_id LIMIT ?''', (now, now, source, source, now - 3600, limit)).fetchall()
             for row in rows:
-                db.execute('UPDATE linuxdo_topics SET lease_until=? WHERE topic_id=?', (now + 300, row[0]))
+                db.execute('UPDATE linuxdo_topics SET lease_until=? WHERE topic_id=?', (now + 390, row[0]))
         return [row[0] for row in rows]
 
     def snapshot(self, topic_id: str) -> dict:
@@ -208,6 +211,14 @@ class Store:
                                       (topic_id,)).fetchall()
             personal = [dict(row) for row in db.execute('''SELECT n.post_number,n.source_time,n.post_fingerprint FROM linuxdo_helper_events n
                 JOIN events e ON e.id=n.event_id WHERE n.topic_id=? AND e.status<>'suppressed' ''', (topic_id,))]
+            public = db.execute("SELECT message_id,post_number,payload FROM linuxdo_helper_messages WHERE topic_id=? AND route IN ('board','following')", (topic_id,)).fetchall()
+        actors, post_actors = {}, {}
+        for item in public:
+            actor = json.loads(item['payload']).get('actor', '')
+            if actor:
+                hashed = digest(actor.casefold())
+                actors[f"tg:linux_do_helper_bot:{item['message_id']}"] = hashed
+                post_actors.setdefault(item['post_number'], set()).add(hashed)
         observations = {f"tg:{row['channel']}:{row['message_id']}": json.loads(row['payload']) for row in observations}
         positions = {ref: row['post_number'] for ref, row in observations.items()}
         for row in evidence:
@@ -216,11 +227,13 @@ class Store:
             row['source_published_at'] = source_time if timestamp(source_time) is not None else ''
             row['source_edited_at'] = observations.get(row['ref'], {}).get('edited_at', '')
             positions[row['ref']] = row['post_number']
+            if row['origin'] == 'topic' and len(post_actors.get(row['post_number'], set())) == 1:
+                actors[row['ref']] = next(iter(post_actors[row['post_number']]))
         for row in notifications:
             row['facts'] = json.loads(row['facts'])
         result = dict(topic)
         result.update(evidence=evidence, notifications=notifications, evidence_positions=positions,
-                      personal_posts=personal,
+                      personal_posts=personal, actors=actors,
                       previously_notified=bool(legacy or personal or any(n['delivery_status'] != 'suppressed' for n in notifications)))
         # Collection times do not renew an offer. Publication times can change relative deadlines.
         facts = {(r['post_number'], re.sub(r'\s+', ' ', r['title']), re.sub(r'\s+', ' ', r['body'])) for r in evidence}
@@ -313,7 +326,7 @@ class Store:
                 SELECT CASE WHEN e.status='pending' THEN 'queued' ELSE e.status END
                 FROM linuxdo_helper_events n JOIN events e ON e.id=n.event_id
                 WHERE n.message_id=linuxdo_helper_messages.message_id LIMIT 1)
-                WHERE route='personal' AND EXISTS(SELECT 1 FROM linuxdo_helper_events n
+                WHERE route IN ('personal','following') AND EXISTS(SELECT 1 FROM linuxdo_helper_events n
                     WHERE n.message_id=linuxdo_helper_messages.message_id)''')
             db.execute('''UPDATE linuxdo_topics SET status='delivered' WHERE status='queued'
                 AND EXISTS(SELECT 1 FROM linuxdo_notifications n JOIN events e ON e.id=n.event_id

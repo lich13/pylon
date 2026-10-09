@@ -278,6 +278,9 @@ def handle(profile: str, text: str) -> str:
         if profile=='webops' and name!='market':
             from .tasks.marketplace.interface import clear_input
             clear_input(profile)
+        if name == 'linuxdo_following_import':
+            from .tasks.linuxdo.following import import_text
+            return import_text(profile, argument)
         if name == 'start':
             return help_text(profile=profile)
         if name.startswith('gmail_') or (name == 'gmail' and argument):

@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from pylon.shared import paths, state_json
-from . import http, judge, policy
+from . import http, judge, policy, trade, trade_store
 from .common import CHANNELS, clean, timestamp
 from .sources import Page, parse_page
 from .store import Store
@@ -119,13 +119,15 @@ def collect(store: Store | None = None, *, config: dict | None = None, getter=ht
 
 def process_topic(store: Store, topic_id: str, config: dict, *, model: str,
                   request=judge.request, topic_fetch=http.topic_evidence,
-                  official_fetch=http.official_evidence) -> dict:
+                  official_fetch=http.official_evidence, trade_request=trade.request,
+                  trade_config: dict | None = None) -> dict:
     try:
         snapshot = store.snapshot(topic_id)
         from .helper_store import covered_by_personal
         if covered_by_personal(snapshot):
             store.finish(snapshot, {'decision': 'skip', 'expires_at': ''})
             return {'topic_id': topic_id, 'decision': 'skip', 'event_id': None, 'error': ''}
+        trade_config = trade.load() if trade_config is None else trade.validate_config(trade_config)
         if ((snapshot['expires_at'] and snapshot['expires_at'] <= time.time())
                 or time.time() - snapshot['updated_at'] > 7 * 86400):
             store.finish(snapshot, {'decision': 'skip', 'expires_at': ''})
@@ -141,6 +143,23 @@ def process_topic(store: Store, topic_id: str, config: dict, *, model: str,
             snapshot = store.snapshot(topic_id)
             store.add_evidence(topic_id, official_fetch(snapshot), attempted=False)
             snapshot = store.snapshot(topic_id)
+        trade_key = trade.cache_key(snapshot, trade_config, model, focus=config)
+        extracted = store.cached(trade_key)
+        if extracted is None:
+            extracted = trade.validate(trade_request(snapshot), snapshot)
+            store.save_decision(trade_key, topic_id, extracted)
+        else:
+            extracted = trade.validate(extracted, snapshot)
+        if extracted['intent'] not in {'non_trade', 'cloud_offer'}:
+            allowed = policy.allowed_categories(config)
+            filtered = [offer for offer in extracted['offers']
+                if ('B1' if offer['access'] == 'codex' else 'B2' if offer['access'] == 'claude_code' else 'A2') in allowed]
+            if extracted['offers'] and not filtered:
+                store.finish(snapshot, {'decision': 'skip', 'expires_at': ''})
+                return {'topic_id': topic_id, 'decision': 'skip', 'event_id': None, 'error': ''}
+            extracted = dict(extracted, offers=filtered)
+            return {'topic_id': topic_id} | trade_store.finish(store, snapshot, extracted, trade_config,
+                                                             run_id=os.environ.get('PYLON_RUN_ID', ''))
         key = judge.cache_key(snapshot, config, model)
         result = store.cached(key)
         if result is None:
@@ -157,26 +176,53 @@ def process_topic(store: Store, topic_id: str, config: dict, *, model: str,
         return {'topic_id': topic_id, 'decision': 'hold', 'error': type(exc).__name__}
 
 
-def review(store: Store | None = None, *, config: dict | None = None, limit: int = 4,
+def review(store: Store | None = None, *, config: dict | None = None, limit: int = 2,
            model: str | None = None, request=judge.request,
            topic_fetch=http.topic_evidence, official_fetch=http.official_evidence,
-           sources: dict | None = None) -> dict:
+           sources: dict | None = None, trade_request=trade.request,
+           trade_config: dict | None = None) -> dict:
     store = store or Store()
-    config = config or policy.load()
     sources = sources if sources is not None else source_config()
     from .helper import SOURCE
-    topic_ids = store.claim(limit=max(1, min(limit, 20)), source=SOURCE if sources.get('mode') == 'helper' else '')
-    if not topic_ids:
+    with store.box.connect() as db:
+        has_public = sources.get('mode') == 'helper' and db.execute('''SELECT 1
+            FROM linuxdo_public_reviews r JOIN linuxdo_helper_messages m USING(message_id)
+            WHERE m.route='following' AND r.status IN ('pending','hold') LIMIT 1''').fetchone()
+        has_topics = db.execute('''SELECT 1 FROM linuxdo_topics t
+            WHERE historical=0 AND status IN ('pending','hold') AND (?='' OR EXISTS(
+                SELECT 1 FROM linuxdo_observations o WHERE o.topic_id=t.topic_id AND o.channel=?)) LIMIT 1''',
+            (SOURCE if sources.get('mode') == 'helper' else '', SOURCE)).fetchone()
+    if not has_public and not has_topics:
         store.sync_deliveries()
         return {'processed': 0, 'errors': 0, 'queued': 0}
+    config = config or policy.load()
+    trade_config = trade.load() if trade_config is None else trade.validate_config(trade_config)
     model = model or judge.model_name()
-    results = []
+    trade_store.refresh_policy(store, trade_config, config, model)
+    # Public-author intent and board value reviews share two model slots. Neither
+    # queue must wait for the other queue's model request to finish before starting.
+    topic_ids = store.claim(limit=1 if has_public else max(1, min(limit, 2)),
+                            source=SOURCE if sources.get('mode') == 'helper' else '')
+    if not topic_ids and not has_public:
+        store.sync_deliveries()
+        return {'processed': 0, 'errors': 0, 'queued': 0}
+    summary = {'processed': 0, 'errors': 0, 'queued': 0}
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(process_topic, store, topic_id, config, model=model, request=request,
-                               topic_fetch=topic_fetch, official_fetch=official_fetch) for topic_id in topic_ids]
+        futures = {pool.submit(process_topic, store, topic_id, config, model=model, request=request,
+                               topic_fetch=topic_fetch, official_fetch=official_fetch,
+                               trade_request=trade_request, trade_config=trade_config): 'topic' for topic_id in topic_ids}
+        if has_public:
+            from . import public_review
+            for _ in range(2 - len(topic_ids)):
+                futures[pool.submit(public_review.review, store, limit=1, request=trade_request,
+                                    config=trade_config, model=model, focus=config)] = 'public'
         for future in as_completed(futures):
-            results.append(future.result())
-    errors = sum(bool(result.get('error')) for result in results)
-    store.health('judge', bool(errors))
+            result = future.result()
+            if futures[future] == 'topic':
+                result = {'processed': 1, 'errors': int(bool(result.get('error'))),
+                          'queued': int(bool(result.get('event_id')))}
+            for key in summary:
+                summary[key] += result[key]
+    store.health('judge', bool(summary['errors']))
     store.sync_deliveries()
-    return {'processed': len(results), 'errors': errors, 'queued': sum(bool(r.get('event_id')) for r in results)}
+    return summary

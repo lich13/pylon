@@ -133,7 +133,8 @@ def test_import_atomically_replaces_a_private_snapshot_and_keeps_the_source(priv
     root, source = private_paths
     target = write_snapshot(root / 'following.json', snapshot(usernames=['fixture_existing']))
     previous = target.read_bytes()
-    incoming = write_snapshot(source / 'incoming.json', snapshot(usernames=['FiXtUrE_Actor', 'fixture_actor']))
+    incoming = write_snapshot(source / 'incoming.json', snapshot(
+        imported_at='2026-02-03T04:05:06Z', usernames=['FiXtUrE_Actor', 'fixture_actor']))
     source_bytes = incoming.read_bytes()
     replace = helper_account.os.replace
     replacements = []
@@ -143,7 +144,8 @@ def test_import_atomically_replaces_a_private_snapshot_and_keeps_the_source(priv
         assert destination == target and destination.read_bytes() == previous
         assert temporary.parent == target.parent
         assert stat.S_IMODE(temporary.stat().st_mode) == 0o600
-        assert json.loads(temporary.read_text()) == snapshot(usernames=['fixture_actor'])
+        assert json.loads(temporary.read_text()) == snapshot(
+            imported_at='2026-02-03T04:05:06Z', usernames=['fixture_actor'])
         replacements.append((temporary, destination))
         replace(temporary, destination)
 
@@ -167,7 +169,8 @@ def test_failed_import_preserves_previous_snapshot_and_removes_its_temporary_fil
     root, source = private_paths
     target = write_snapshot(root / 'following.json', snapshot(usernames=['fixture_existing']))
     previous = target.read_bytes()
-    incoming = write_snapshot(source / 'incoming.json', snapshot(complete=failure != 'partial-input'))
+    incoming = write_snapshot(source / 'incoming.json', snapshot(
+        imported_at='2026-02-03T04:05:06Z', complete=failure != 'partial-input'))
     if failure == 'replace-failed':
         monkeypatch.setattr(helper_account.os, 'replace', Mock(side_effect=OSError('synthetic atomic replace failure')))
 
@@ -200,7 +203,9 @@ def test_import_cli_installs_the_complete_snapshot_and_prints_only_summary(priva
 
     output = capsys.readouterr()
     assert output.err == ''
-    assert json.loads(output.out) == following.load(root / 'following.json').summary()
+    assert json.loads(output.out) == following.load(root / 'following.json').summary() | {
+        'added': 1, 'removed': 0, 'changed': True,
+    }
     assert 'fixture_actor' not in output.out
     assert str(incoming) not in output.out
 
