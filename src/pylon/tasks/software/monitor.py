@@ -2067,13 +2067,15 @@ def validate_grok_digest(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _request_grok_structured(prompt: str, *, schema: dict[str, Any], name: str,
-                             timeout: int = GROK_DIGEST_TIMEOUT_SECONDS) -> tuple[dict[str, Any], str]:
+                             timeout: int = GROK_DIGEST_TIMEOUT_SECONDS,
+                             total_timeout: int | None = None) -> tuple[dict[str, Any], str]:
     env = read_env(GROK_ENDPOINT_ENV) | os.environ.copy()
     base = env.get('GROK_MODELS_BASE_URL', '').rstrip('/')
     key = env.get('XAI_API_KEY', '')
     if not base or not key:
         raise GrokDigestError('Grok API configuration is missing')
     request_id = uuid.uuid4().hex
+    deadline = time.monotonic() + total_timeout if total_timeout else None
     payload = {
         'model': env.get('PYLON_GROK_MODEL', 'grok-4.7'),
         'input': [{'role': 'user', 'content': prompt}],
@@ -2094,6 +2096,8 @@ def _request_grok_structured(prompt: str, *, schema: dict[str, Any], name: str,
                     raise GrokDigestError(f'Grok HTTP {response.status_code}')
                 data_lines: list[str] = []
                 for line in response.iter_lines():
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise GrokDigestError('Grok total deadline exceeded')
                     if line.startswith('data:'):
                         data_lines.append(line[5:].lstrip())
                     elif not line and data_lines:

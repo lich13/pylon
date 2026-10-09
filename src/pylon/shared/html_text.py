@@ -1,6 +1,7 @@
 """Extract body evidence without losing paragraphs or nested elements."""
 from html.parser import HTMLParser
 import re
+from urllib.parse import urlsplit
 
 MAX_BODY_CHARS = 32000
 
@@ -9,7 +10,7 @@ class BodyText(HTMLParser):
     def __init__(self, classes: set[str] | None = None):
         super().__init__(convert_charrefs=True)
         self.classes = classes
-        self.stack: list[tuple[str, bool, bool]] = []
+        self.stack: list[tuple[str, bool, bool, str]] = []
         self.parts: list[str] = []
 
     def handle_starttag(self, tag, attrs):
@@ -17,20 +18,37 @@ class BodyText(HTMLParser):
         active = self.classes is None or any(v[1] for v in self.stack) or bool(self.classes.intersection(values.get('class', '').split()))
         hidden = tag in {'script', 'style', 'blockquote'} or any(v[2] for v in self.stack)
         if active and not hidden and tag in {'br', 'p', 'div', 'li', 'tr'}:
-            self.parts.append('\n')
+            self.parts.append(' ' if tag!='tr' and any(v[0] in {'td','th'} for v in self.stack) else '\n')
         if tag not in {'br', 'hr', 'img', 'input', 'meta', 'link', 'wbr'}:
-            self.stack.append((tag, active, hidden))
+            href = values.get('href', '') if tag == 'a' and active and not hidden else ''
+            try:
+                parsed = urlsplit(href)
+                if parsed.scheme not in {'http','https'} or not parsed.hostname or parsed.username or parsed.password:
+                    href = ''
+            except ValueError:
+                href = ''
+            self.stack.append((tag, active, hidden, href))
 
     def handle_endtag(self, tag):
         if self.stack and any(v[1] and not v[2] for v in self.stack) and tag in {'p', 'div', 'li', 'tr'}:
-            self.parts.append('\n')
+            self.parts.append(' ' if tag!='tr' and any(v[0] in {'td','th'} for v in self.stack) else '\n')
         for i in range(len(self.stack)-1, -1, -1):
             if self.stack[i][0] == tag:
+                _, active, hidden, href = self.stack[i]
+                if active and not hidden:
+                    if tag in {'td','th'}:
+                        self.parts.append(' | ')
+                    if href and not ''.join(self.parts[-4:]).rstrip().endswith(href):
+                        self.parts.append(' '+href)
                 del self.stack[i:]
                 break
 
     def handle_data(self, data):
         if (self.classes is None or any(v[1] for v in self.stack)) and not any(v[2] for v in self.stack):
+            if any(v[0] in {'table','tr','td','th'} for v in self.stack):
+                if not data.strip():
+                    return
+                data=re.sub(r'\s+',' ',data)
             self.parts.append(data)
 
     def text(self):

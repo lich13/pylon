@@ -25,6 +25,14 @@ class Store:
                 CREATE INDEX IF NOT EXISTS marketplace_pending ON marketplace_posts(status,next_attempt);
                 CREATE TABLE IF NOT EXISTS marketplace_checkpoints (
                     name TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS marketplace_analyses (
+                    fingerprint TEXT PRIMARY KEY, source TEXT NOT NULL, source_id TEXT NOT NULL,
+                    status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt REAL NOT NULL DEFAULT 0, started_at REAL,
+                    updated_at REAL NOT NULL, model TEXT NOT NULL, request_id TEXT,
+                    result TEXT, error TEXT NOT NULL DEFAULT '');
+                CREATE INDEX IF NOT EXISTS marketplace_analysis_pending
+                    ON marketplace_analyses(status,next_attempt);
             ''')
             db.execute('BEGIN IMMEDIATE')
             if 'wanted_policy_version' not in {row[1] for row in db.execute('PRAGMA table_info(marketplace_posts)')}:

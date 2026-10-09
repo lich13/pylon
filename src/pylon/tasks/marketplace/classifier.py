@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from .taxonomy import RULES, canonical
 
-VERSION = 6
+VERSION = 7
 
 PATTERNS = [(key, re.compile(pattern, re.I)) for key, _, pattern in RULES]
 SOLD = re.compile(r'已售|已出售(?!中)|已出(?!售)|已预[订定]|售罄|已被预[订定]|预[订定]给|封帖|封贴|结贴|勿拍')
@@ -273,13 +273,20 @@ def _sale_parts(text: str) -> list[str]:
     return [text]
 
 
-def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete: bool = True) -> list[dict]:
+def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete: bool = True,
+                     *, single_item: bool = False) -> list[dict]:
     result = []
     if not body_complete:
         body = ''
-    body = _sale_body(body,source)
-    blocks = [(part, len(parts)>1 and bool(BUNDLE.search(block)))
-              for block in _blocks(title, body) for parts in [_sale_parts(block)] for part in parts]
+    # Normalise grouped amounts before segmentation, not after commas have
+    # already split a table price into separate apparent products.
+    normalise_amounts = lambda text: re.sub(r'(?<![\d,])\d{1,3}(?:,\d{3})+(?![\d,])',
+                                          lambda m:m[0].replace(',', ''),text)
+    title = normalise_amounts(title)
+    body = normalise_amounts(_sale_body(body,source))
+    blocks = ([(body or title, False)] if single_item else
+              [(part, len(parts)>1 and bool(BUNDLE.search(block)))
+               for block in _blocks(title, body) for parts in [_sale_parts(block)] for part in parts])
     title_buy = bool((BUY.search(title) or WANTED.search(title)) and not re.search(r'另出|同时出|出售', title))
     title_sold = bool(re.match(r'^\s*(?:\[|【)?(?:已售|已出|全出|全部已)', title)
                       and not re.search(r'另出|还有|继续出|其他|剩余|分别|、|，|,',title))

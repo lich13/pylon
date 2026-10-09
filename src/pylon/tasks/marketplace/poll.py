@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pylon import events
-from . import pipeline, sources
+from . import pipeline, sources, enrich
 from .store import Store
 
 
@@ -71,19 +71,24 @@ def main() -> int:
         return 0
     store=Store()
     errors=[]
-    count=0
+    count=pipeline.process(store)
     deadline=time.monotonic()+180
-    with ThreadPoolExecutor(max_workers=3,thread_name_prefix='marketplace-source') as pool:
+    with ThreadPoolExecutor(max_workers=4,thread_name_prefix='marketplace-source') as pool:
         futures={pool.submit(poll_source,store,source,deadline):source for source in ('v2ex','chiphell','nga')}
+        futures[pool.submit(enrich.run_pending,store)]='enrichment'
         for future in as_completed(futures):
             source=futures[future]
+            if source=='enrichment':
+                future.result()
+                count+=pipeline.process(store)
+                continue
             source_errors=future.result() or []
             errors.extend(source_errors)
             record_health(store,source,source_errors)
             # Queue this source immediately, without waiting for NGA's browser.
             count+=pipeline.process(store,source=source)
     events.result('failed' if errors else 'ok' if count else 'no_change',
-                  ';'.join(errors) or f'交易通知入队 {count}',changed=bool(count))
+                  (';'.join(errors) or f'交易通知入队 {count}')+'；'+enrich.summary(store),changed=bool(count))
     print('{"wakeAgent":false}')
     return 0
 
