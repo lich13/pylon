@@ -119,9 +119,19 @@
     "name": "Linux.do 监控",
     "profile": "webops",
     "schedule": "* * * * *",
-    "deliver": true,
-    "timeout": 1800,
-    "module": "pylon.tasks.forums.linuxdo"
+    "deliver": false,
+    "timeout": 180,
+    "module": "pylon.tasks.linuxdo",
+    "args": ["collect"]
+  },
+  "linuxdo-review": {
+    "name": "Linux.do 价值判断",
+    "profile": "webops",
+    "schedule": "* * * * *",
+    "deliver": false,
+    "timeout": 360,
+    "module": "pylon.tasks.linuxdo",
+    "args": ["review"]
   },
   "de91ae783a36": {
     "name": "通知补发核对",

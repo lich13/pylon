@@ -2,6 +2,18 @@
 
 Python 机器人服务、SQLite 待发队列和 systemd timers。维护 Gmail、线报、V2EX、Linux.do、Chiphell、日港 iTunes、KDocs 报价、软件更新、数据清理、SSH 和软件维护任务；新增三平台二手交易处理任务在关注策略明确启用后工作。
 
+## Linux.do 聚合
+
+LinuxDoNew、linux_do_channel、linuxdo_tg 每分钟独立采集，按主题合并频道预览、首楼和关联回复。`b7a84d1d9f21` 负责采集，`linuxdo-review` 独立补证和调用现有 Grok；模型或投递积压不阻断采集。来源断档保留分页续接点，首次接入只建立基线，不发送历史帖子。
+
+WebOps profile 的 `config/linuxdo_policy.json` 是独立、版本化的关注目录，缺省采用已确认策略。支持 `groups`、`categories` 和优先级更高的 `excluded_categories`；类别见 `pylon.tasks.linuxdo.policy.CATEGORIES`，未知类别拒绝。默认关注顶级 AI 资源，Codex、Claude Code、Grok Build、MCP/Skills、API 工具，开发自动化、自托管、代理稳定性、登录支付方法，以及全国/北京实用福利。DNS/CDN/证书、安全故障资讯、普通效率软件与硬件类关闭。纯国产模型、影音/PT、游戏素材、论文、邮箱账号、非北京限定和 WPS 福利继续排除；涉及这些产品的可复用技术方法独立判断。
+
+主机促销仅腾讯云、阿里云，地域包含大陆、香港和海外；域名和转售排除。配置、地域、实付价格、周期和参与资格须有匹配的官方原文依据，续费未说明时明确标注。`config/linuxdo_sources.json` 可设置来源列表、分页数、请求超时和单来源预算；默认值见 `pipeline.source_config`。
+
+Grok 只处理合并后的证据并返回结构化判断，不执行操作。关注范围、证据引用、链接、关键条件和重复事实由本地校验。缺证据或暂时失败的候选退避重试，普通提问可在补充明确答案后重新判断。相同证据按策略、模型和提示词版本缓存；候选最长保留七天待处理，明确过期则关闭。通知只发 Telegram，无日报和新增机器人菜单。通知与判断在同一事务中保存；入队不等于送达，失败/不确定回执沿用 outbox。
+
+上线前停止原 Linux.do timer 并等待在途任务结束；首次新采集会原子导入旧游标、已投主题和旧待发队列。新旧入口不得同时运行。运维入口为 `python -m pylon.tasks.linuxdo status`；隔离回放使用 `replay --store <analysis.sqlite3> --input <observations.json> --limit 4`，输入是 `sources.Observation` 字段数组，回放数据库不可设为正式 outbox，且不连接发送器。回退须先停两个新 timer、等待任务结束，再执行 `python -m pylon.tasks.linuxdo export-legacy --apply`，最后恢复旧模块入口与原 timer；正式 outbox 保持原样继续投递。
+
 ## 三平台二手交易
 
 `config/marketplace.json` 是统一关注策略，必须显式设置 `version`、`enabled` 和 `categories`。`groups` 关注整个大类，`types` 关注小类及其细分类，`categories` 只关注指定细分类；`blocked_groups` 优先级最高，屏蔽该大类全部现有和未来子类，子类关注不能绕过。未选类别不推送，品牌、型号和规格仅作属性。类别使用 `pylon.tasks.marketplace.taxonomy` 中的稳定标识；缺失策略时保留旧流程，新 NGA 任务静默。启用后，V2EX 频道的二手交易分流、CHH 抓取结果和 NGA 新帖统一进入持久化处理队列，其他 V2EX 业务不变。
