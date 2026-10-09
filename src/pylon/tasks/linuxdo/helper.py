@@ -5,11 +5,11 @@ from dataclasses import asdict, dataclass
 import re
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .common import TOPIC_RE, URL_RE, clean, digest, safe_url
+from .common import URL_RE, clean, digest, safe_url
 from .sources import Observation
 
 SOURCE = 'linux_do_helper_bot'
-PARSER_VERSION = 'helper-20261009-3'
+PARSER_VERSION = 'helper-20261009-4'
 PERSONAL = {'following_posted', 'following_replied', 'private_message', 'replied', 'mentioned',
             'quoted', 'group_mentioned', 'linked', 'posted', 'event_reminder', 'event_invitation'}
 BOARD = {'watching_first_post', 'watching_category_or_tag'}
@@ -85,7 +85,7 @@ class HelperNotice:
             raise ValueError('only identified board notices become model evidence')
         return Observation(SOURCE, self.message_id, self.topic_id, self.post_number, clean(self.title, 300),
                            clean(self.text), [], self.published_at, self.url,
-                           [url for url in self.links if not TOPIC_RE.search(url)], self.edited_at)
+                           [url for url in self.links if not _topic_link(url)], self.edited_at)
 
 
 def _kind(header: str) -> str:
@@ -111,7 +111,13 @@ def _kind(header: str) -> str:
 
 
 def _topic_link(url: str):
-    return TOPIC_RE.match(url) if urlsplit(url).hostname == 'linux.do' else None
+    parts = urlsplit(url)
+    if parts.hostname != 'linux.do':
+        return None
+    # Helper buttons omit the slug; parse these before the slugged title link.
+    # Otherwise /t/123/4 would be mistaken for topic 4 with a numeric slug.
+    return (re.fullmatch(r'/t/([0-9]+)(?:/([0-9]+))?/?', parts.path)
+            or re.fullmatch(r'/t/[^/\s<>]+/([0-9]+)(?:/([0-9]+))?/?', parts.path))
 
 
 def _template_kind(header: str, actor_links: list[dict]) -> str:

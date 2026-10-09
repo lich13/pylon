@@ -45,7 +45,7 @@ class HelperStore:
                 if route == 'silent':
                     payload = {'message_id': notice.message_id, 'kind': notice.kind, 'route': route}
                 else:
-                    payload.update(_raw=raw, _parser=self.parser_version)
+                    payload.update(_raw=raw, _parser=self.parser_version, _parser_revision=PARSER_VERSION)
                 status = 'queued' if route == 'personal' else 'accepted' if route == 'board' else route
                 if old and old['route'] == 'personal':
                     status = old['status']
@@ -62,7 +62,10 @@ class HelperStore:
                     db.execute('DELETE FROM linuxdo_observations WHERE channel=? AND message_id=?', (SOURCE, notice.message_id))
                     db.execute('DELETE FROM linuxdo_evidence WHERE topic_id=? AND ref=?',
                                (old['topic_id'], f'tg:{SOURCE}:{notice.message_id}'))
-                    db.execute("UPDATE linuxdo_topics SET version=version+1,status='pending',lease_until=0 WHERE topic_id=?",
+                    db.execute("""UPDATE linuxdo_topics SET version=version+1,
+                        status=CASE WHEN EXISTS(SELECT 1 FROM linuxdo_evidence e
+                            WHERE e.topic_id=linuxdo_topics.topic_id) THEN 'pending' ELSE 'skip' END,
+                        lease_until=0 WHERE topic_id=?""",
                                (old['topic_id'],))
                 if route == 'board':
                     self.store.save_page(SOURCE, Page([notice.observation()], [notice.message_id]), checkpoint, connection=db)
@@ -82,9 +85,11 @@ class HelperStore:
 
     def reparse_pending(self, *, limit: int = 100) -> dict:
         with self.box.connect() as db:
-            rows = db.execute('''SELECT payload FROM linuxdo_helper_messages WHERE route='unknown'
-                AND coalesce(json_extract(payload, '$._parser'), '')<>? ORDER BY message_id LIMIT ?''',
-                              (self.parser_version, max(1, min(limit, 100)))).fetchall()
+            rows = db.execute('''SELECT payload FROM linuxdo_helper_messages WHERE
+                (route='unknown' AND coalesce(json_extract(payload, '$._parser'), '')<>?)
+                OR (route='board' AND coalesce(json_extract(payload, '$._parser_revision'), '')<>?)
+                ORDER BY message_id LIMIT ?''',
+                              (self.parser_version, PARSER_VERSION, max(1, min(limit, 100)))).fetchall()
         messages = [payload['_raw'] for row in rows if '_raw' in (payload := json.loads(row[0]))]
         if not messages:
             return {'collected': 0, 'queued': 0}

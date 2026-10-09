@@ -23,7 +23,7 @@ import pytest
 from pylon.outbox import Outbox
 from pylon.tasks.linuxdo import __main__ as linuxdo_main
 from pylon.tasks.linuxdo import following, helper, helper_account, helper_collect, helper_store, judge, pipeline, policy
-from pylon.tasks.linuxdo.common import digest
+from pylon.tasks.linuxdo.common import TOPIC_RE, digest
 from pylon.tasks.linuxdo.helper import SOURCE, envelope, parse_message
 from pylon.tasks.linuxdo.helper_account import AuthorizationRequired, RateLimited
 from pylon.tasks.linuxdo.helper_store import HelperStore
@@ -70,6 +70,15 @@ def published_message(message_id=301, *, actor='fixture_actor', post_number=1, b
     raw = two_line_message(message_id, header=f'💬 @{actor} 发布了', body=body)
     raw['links'][0].update(label=f'@{actor}', url=f'https://linux.do/u/{actor}')
     raw['links'][1]['url'] = f'https://linux.do/t/topic/9150/{post_number}'
+    return raw
+
+
+def short_link_message(message_id=301, *, actor='fixture_actor', topic_id='9160',
+                       post_number=1, title='合成短链主题', body=BODY):
+    raw = published_message(message_id, actor=actor, post_number=post_number, body=body)
+    raw['text'] = raw['text'].replace('合成通知主题', title, 1)
+    raw['links'][1].update(label=title, url=f'https://linux.do/t/topic/{topic_id}/{post_number}')
+    raw['buttons'] = [{'label': '在线查看', 'url': f'https://linux.do/t/{topic_id}/{post_number}'}]
     return raw
 
 
@@ -189,6 +198,54 @@ def test_two_line_templates_route_personal_notices_and_use_the_topic_header(head
     assert (notice.kind, notice.route, notice.actor) == (kind, 'personal', 'fixture_actor')
     assert (notice.topic_id, notice.post_number, notice.url) == ('9150', 3, 'https://linux.do/t/topic/9150/3')
     assert notice.title == '合成通知主题'
+
+
+@pytest.mark.parametrize('slug', ['topic', 'fixture-slug'])
+@pytest.mark.parametrize(('action_path', 'post_number', 'notification_id'), [
+    ('/t/9160', 1, ''),
+    ('/t/9160/', 1, ''),
+    ('/t/9160/1', 1, ''),
+    ('/t/9160/7', 7, ''),
+    ('/t/9160/7/', 7, ''),
+    ('/t/9160/7?notification_id=72001', 7, '72001'),
+    ('/t/9160/7/?notification_id=72001', 7, '72001'),
+])
+def test_online_short_link_and_slug_title_identify_the_same_post(
+        slug, action_path, post_number, notification_id):
+    raw = short_link_message(post_number=post_number)
+    raw['links'][1]['url'] = f'https://linux.do/t/{slug}/9160/{post_number}'
+    raw['buttons'][0]['url'] = 'https://linux.do' + action_path
+
+    notice = parse_message(raw, followed=frozenset({'fixture_actor'}))
+
+    assert (notice.topic_id, notice.post_number, notice.title) == ('9160', post_number, '合成短链主题')
+    assert notice.url == raw['buttons'][0]['url']
+    assert notice.notification_id == notification_id
+    assert (notice.kind, notice.route) == (
+        'following_posted' if post_number == 1 else 'following_replied', 'personal')
+
+
+@pytest.mark.parametrize('with_button', [False, True])
+def test_short_link_original_and_title_win_over_earlier_body_references(with_button):
+    raw = short_link_message(post_number=7, body='正文引用合成短链主题。\n' + BODY)
+    raw['links'].insert(0, {
+        'label': '合成短链主题', 'url': 'https://linux.do/t/8160/2?notification_id=72002',
+        'header': False, 'line': 4,
+    })
+    if with_button:
+        raw['buttons'][0]['url'] += '?notification_id=72001'
+        raw['links'].insert(0, {
+            'label': '另一合成主题', 'url': 'https://linux.do/t/8161/4', 'header': True, 'line': 1,
+        })
+    else:
+        raw['buttons'] = []
+
+    notice = parse_message(raw, followed=frozenset({'fixture_actor'}))
+
+    assert (notice.topic_id, notice.post_number, notice.title) == ('9160', 7, '合成短链主题')
+    assert notice.url == ('https://linux.do/t/9160/7?notification_id=72001'
+                          if with_button else 'https://linux.do/t/topic/9160/7')
+    assert notice.notification_id == ('72001' if with_button else '')
 
 
 def test_body_reference_before_the_two_line_header_link_never_becomes_the_original_post():
@@ -647,6 +704,22 @@ def test_personal_replies_at_different_post_numbers_are_distinct_events(store):
     assert len({row['event_id'] for row in events}) == 2
 
 
+def test_short_link_personal_replies_keep_independent_events_for_each_floor(store):
+    messages = [short_link_message(301, post_number=3), short_link_message(302, post_number=4)]
+
+    result = save(store, *messages, followed=frozenset({'fixture_actor'}))
+
+    assert result['personal'] == result['queued'] == 2
+    events = rows(store, '''SELECT topic_id,post_number,event_key,event_id
+        FROM linuxdo_helper_events ORDER BY post_number''')
+    assert [(row['topic_id'], row['post_number']) for row in events] == [('9160', 3), ('9160', 4)]
+    assert len({row['event_key'] for row in events}) == len({row['event_id'] for row in events}) == 2
+    assert rows(store, 'SELECT * FROM linuxdo_observations') == []
+    assert rows(store, 'SELECT * FROM linuxdo_evidence') == []
+    assert save(store, *messages, followed=frozenset({'fixture_actor'}))['queued'] == 0
+    assert len(event_rows(store)) == 2
+
+
 def test_personal_message_cannot_become_model_input_after_a_board_shaped_edit(store):
     save(store, message())
     edited = message(kind='watching_first_post') | {'edited_at': EDITED_AT}
@@ -671,6 +744,32 @@ def test_board_notice_enters_existing_value_pipeline(store, clock):
     assert result['decision'] == 'push' and not result['error']
     assert result['event_id'] is not None
     assert store.box.counts() == {'pending': 1}
+
+
+def test_short_link_first_posts_keep_different_topics_and_titles_separate(store):
+    messages = [
+        short_link_message(301, actor='fixture_alpha', topic_id='9161', title='合成主题甲'),
+        short_link_message(302, actor='fixture_beta', topic_id='9162', title='合成主题乙'),
+    ]
+
+    result = save(store, *messages, followed=frozenset())
+
+    assert result['collected'] == result['board'] == 2 and result['queued'] == 0
+    assert rows(store, 'SELECT topic_id,title FROM linuxdo_topics ORDER BY topic_id') == [
+        {'topic_id': '9161', 'title': '合成主题甲'}, {'topic_id': '9162', 'title': '合成主题乙'},
+    ]
+    assert rows(store, 'SELECT message_id,topic_id FROM linuxdo_observations ORDER BY message_id') == [
+        {'message_id': 301, 'topic_id': '9161'}, {'message_id': 302, 'topic_id': '9162'},
+    ]
+    for raw, topic_id, title in zip(messages, ('9161', '9162'), ('合成主题甲', '合成主题乙')):
+        evidence = store.snapshot(topic_id)['evidence']
+        assert [(row['ref'], row['post_number'], row['title']) for row in evidence] == [
+            (f"tg:{SOURCE}:{raw['message_id']}", 1, title),
+        ]
+        assert evidence[0]['url'] == raw['buttons'][0]['url']
+        assert raw['buttons'][0]['url'] not in evidence[0]['links']
+        assert raw['links'][1]['url'] not in evidence[0]['links']
+    assert event_rows(store) == []
 
 
 def test_board_edit_moves_the_message_and_evidence_to_its_new_topic(store, clock):
@@ -1083,6 +1182,122 @@ def test_parser_upgrade_revisits_old_unknown_messages_outside_the_recent_window(
     assert replay['changed'] == 0
     assert len(rows(store, 'SELECT * FROM linuxdo_helper_events')) == queued
     assert len(event_rows(store)) == 1 + queued
+
+
+@pytest.mark.parametrize('revision_marker', ['missing', 'stale'])
+def test_parser_upgrade_moves_old_short_link_boards_from_raw_without_replaying_history(
+        store, clock, following_root, monkeypatch, revision_marker):
+    messages = [
+        short_link_message(301, actor='fixture_alpha', topic_id='9161', title='合成主题甲'),
+        short_link_message(302, actor='fixture_beta', topic_id='9162', title='合成主题乙'),
+    ]
+    recent = message(501) | {'text': '操作成功'}
+    with monkeypatch.context() as legacy:
+        legacy.setattr(helper, '_topic_link', TOPIC_RE.match)
+        legacy.setattr(helper_store, 'PARSER_VERSION', 'fixture-previous-parser')
+        assert save(store, *messages, recent, followed=frozenset())['board'] == 2
+    assert rows(store, 'SELECT topic_id FROM linuxdo_topics') == [{'topic_id': '1'}]
+    assert len(store.snapshot('1')['evidence']) == 2
+    store.finish(store.snapshot('1'), {'decision': 'skip', 'expires_at': ''})
+    if revision_marker == 'missing':
+        with store.box.connect() as db:
+            db.execute("""UPDATE linuxdo_helper_messages
+                SET payload=json_remove(payload, '$._parser_revision') WHERE route='board'""")
+    previous_checkpoint = store.checkpoint(SOURCE)
+    write_following(following_root, [])
+    account = FakeAccount([[]])
+
+    result = collect(Store(Outbox(store.box.path)), account)
+
+    assert result['error'] == '' and result['caught_up'] is True
+    assert result['changed'] == 2 and result['queued'] == 0
+    assert account.calls == [{'after': 501, 'limit': 2}]
+    assert store.checkpoint(SOURCE) == previous_checkpoint
+    assert store.snapshot('1')['status'] == 'skip'
+    assert store.snapshot('1')['evidence'] == []
+    assert rows(store, 'SELECT message_id,topic_id FROM linuxdo_observations ORDER BY message_id') == [
+        {'message_id': 301, 'topic_id': '9161'}, {'message_id': 302, 'topic_id': '9162'},
+    ]
+    retained = rows(store, "SELECT topic_id,post_number,payload FROM linuxdo_helper_messages WHERE route='board' ORDER BY message_id")
+    assert [(row['topic_id'], row['post_number']) for row in retained] == [('9161', 1), ('9162', 1)]
+    for row, raw in zip(retained, messages):
+        payload = json.loads(row['payload'])
+        assert payload['_raw'] == raw
+        assert payload['_parser_revision'] == helper_store.PARSER_VERSION
+        assert payload['title'] == raw['links'][1]['label']
+        assert [(item['ref'], item['post_number']) for item in store.snapshot(row['topic_id'])['evidence']] == [
+            (f"tg:{SOURCE}:{raw['message_id']}", 1),
+        ]
+    clock[0] += 31
+    request = Mock(side_effect=lambda snapshot, config: judgment(snapshot))
+    reviewed = pipeline.review(store, sources={'mode': 'helper'}, config=policy.default_policy(),
+                               model='fixture-model', request=request,
+                               topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [])
+    assert reviewed == {'processed': 2, 'errors': 0, 'queued': 2}
+    assert {call.args[0]['topic_id'] for call in request.call_args_list} == {'9161', '9162'}
+    assert all(call.args[0]['evidence'] for call in request.call_args_list)
+    messages_after = rows(store, 'SELECT * FROM linuxdo_helper_messages ORDER BY message_id')
+    evidence_after = rows(store, 'SELECT * FROM linuxdo_evidence ORDER BY topic_id,ref')
+    events_after = event_rows(store)
+
+    repeated_account = FakeAccount([[]])
+    repeated = collect(Store(Outbox(store.box.path)), repeated_account)
+
+    assert repeated['error'] == '' and repeated['changed'] == repeated['queued'] == 0
+    assert repeated_account.calls == [{'after': 501, 'limit': 2}]
+    assert store.checkpoint(SOURCE) == previous_checkpoint
+    assert HelperStore(store, followed=frozenset()).reparse_pending() == {'collected': 0, 'queued': 0}
+    assert rows(store, 'SELECT * FROM linuxdo_helper_messages ORDER BY message_id') == messages_after
+    assert rows(store, 'SELECT * FROM linuxdo_evidence ORDER BY topic_id,ref') == evidence_after
+    assert event_rows(store) == events_after
+    assert store.claim(source=SOURCE) == []
+
+
+@pytest.mark.parametrize('previous_status', ['skip', 'delivered'])
+def test_following_change_reparses_unknown_without_replaying_judged_short_link_boards(
+        store, clock, following_root, previous_status):
+    boards = [
+        short_link_message(301, actor='fixture_alpha', topic_id='9161', title='合成主题甲'),
+        short_link_message(302, actor='fixture_beta', topic_id='9162', title='合成主题乙'),
+    ]
+    unknown = short_link_message(303, actor='fixture_reply', topic_id='9163', post_number=4)
+    assert save(store, *boards, unknown, followed=frozenset())['unknown'] == 1
+    for topic_id in ('9161', '9162'):
+        if previous_status == 'delivered':
+            event_id = process(store, topic_id)['event_id']
+            assert event_id is not None
+            store.box.finish(event_id, 'delivered', receipt={'message_id': 601})
+        else:
+            store.finish(store.snapshot(topic_id), {'decision': 'skip', 'expires_at': ''})
+    store.sync_deliveries()
+    topics_before = rows(store, 'SELECT * FROM linuxdo_topics ORDER BY topic_id')
+    assert {row['status'] for row in topics_before} == {previous_status}
+    boards_before = rows(store, "SELECT * FROM linuxdo_helper_messages WHERE route='board' ORDER BY message_id")
+    evidence_before = rows(store, 'SELECT * FROM linuxdo_evidence ORDER BY topic_id,ref')
+    event_count = len(event_rows(store))
+    previous_checkpoint = store.checkpoint(SOURCE)
+    write_following(following_root, ['fixture_alpha', 'fixture_reply'])
+    account = FakeAccount([[]])
+
+    result = collect(Store(Outbox(store.box.path)), account)
+
+    assert result['error'] == '' and result['changed'] == result['queued'] == 1
+    assert account.calls == [{'after': 303, 'limit': 2}]
+    assert store.checkpoint(SOURCE) == previous_checkpoint
+    assert rows(store, "SELECT * FROM linuxdo_helper_messages WHERE route='board' ORDER BY message_id") == boards_before
+    assert rows(store, 'SELECT * FROM linuxdo_topics ORDER BY topic_id') == topics_before
+    assert rows(store, 'SELECT * FROM linuxdo_evidence ORDER BY topic_id,ref') == evidence_before
+    assert rows(store, 'SELECT message_id,kind,topic_id,post_number FROM linuxdo_helper_events') == [
+        {'message_id': 303, 'kind': 'following_replied', 'topic_id': '9163', 'post_number': 4},
+    ]
+    assert len(event_rows(store)) == event_count + 1
+    request = Mock(side_effect=AssertionError('following changes must not replay judged boards'))
+    assert pipeline.review(store, sources={'mode': 'helper'}, config=policy.default_policy(),
+                           model='fixture-model', request=request) == {'processed': 0, 'errors': 0, 'queued': 0}
+    request.assert_not_called()
+    assert HelperStore(store, followed=frozenset({'fixture_alpha', 'fixture_reply'})).reparse_pending() == {
+        'collected': 0, 'queued': 0,
+    }
 
 
 def test_reparse_limit_does_not_let_an_unsupported_old_notice_starve_the_next_notice(store, monkeypatch):
