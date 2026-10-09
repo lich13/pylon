@@ -4,13 +4,16 @@ from __future__ import annotations
 import re
 from .taxonomy import RULES, canonical
 
-VERSION = 8
+VERSION = 9
 
 PATTERNS = [(key, re.compile(pattern, re.I)) for key, _, pattern in RULES]
 SOLD = re.compile(r'已售|已出售(?!中)|已出(?!售)|已预[订定]|售罄|已被预[订定]|预[订定]给|封帖|封贴|结贴|勿拍')
 ALL_SOLD = re.compile(r'(?:全部|所有|全都|均)(?:已经|已)(?:售出|出售|出完|售罄|出清|出掉|出了|出(?=\W|$))|(?:全部|所有|全都|均)(?:售罄|出完|出清|出了)')
 BUY = re.compile(r'求购|求收|想收|询价|价格咨询|什么价|值多少|行情多少|求推荐|求助|求问|询问|估价|不出售|不是出货|[\[【](?:收|求购|预收)[\]】]|(?:^|[\]】])\s*(?:收|预收)\s*(?:一|个|台|张|两|[A-Za-z0-9])')
-WANTED = re.compile(r'求购|求收|想收|[\[【](?:收|求购|预收)[\]】]|(?:^|[\n。；;\]】])\s*(?:收|预收)(?!到|齐|件|款|货|藏|据|入)\s*\S|求(?:一|两|二|几)[张台个只件]|有没有人(?:卖|出)')
+ACQUIRE = r'收(?!到|齐|件|款|货|藏|据|入|益|费|音|纳|尾|拾)'
+WANTED_BUDGET = re.compile(r'(?<![\d.A-Za-z])([¥￥]?\d+(?:\.\d+)?\s*(?:元|块)?)\s*(?='+ACQUIRE+r')')
+WANTED = re.compile(r'求购|求收|想收|[\[【](?:收|求购|预收)[\]】]|(?:^|[\s。；;，,\]】])\s*(?:预)?'+ACQUIRE+r'\s*\S|'
+                    +WANTED_BUDGET.pattern+r'|(?:长期|持续|一直)\s*收(?:\W|$)|求(?:一|两|二|几)[张台个只件]|有没有人(?:卖|出)')
 WANTED_CLOSED = re.compile(r'已收(?:到|齐|到货)?(?:\W|$)|[\[【]已收[\]】]|不收了|停止收购|需求已(?:解决|满足)|已找到')
 INQUIRY = re.compile(r'询价|价格咨询|行情多少|值多少|求推荐|求助|求问|询问|估价|只了解行情')
 SALE = re.compile(r'出售|闲置|转让|明盘|卖|(?:^|[\s，,])出|元出|包邮|可刀|走鱼|闲鱼|挂价|议价|私聊')
@@ -361,6 +364,8 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
         if category=='phone.apple' and '苹果' not in attributes['brands']:
             attributes['brands'].append('苹果')
         price_text = re.sub(r'预算|收价|出价', '售价', text) if intent=='wanted' else text
+        if intent=='wanted':
+            price_text = WANTED_BUDGET.sub(r'出价\1 ',price_text)
         attributes['external_price'] = bool(re.search(r'https?://',text)
                                              and re.search(r'闲鱼|咸鱼|价格.{0,12}(?:链接|详见)',text))
         price = price_analysis(price_text)

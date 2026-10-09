@@ -299,3 +299,41 @@ def test_marketplace_grok_total_deadline_closes_stream(monkeypatch):
                                          timeout=20,total_timeout=120)
     assert captured['closed']
     assert captured['payload']['store'] is False and captured['payload']['tools']==[]
+
+
+def narrative():
+    post=dict(source='chiphell',source_id='45',title='成色一般的 iQOO11 12+256G 1543 附言',
+              body='用过的主力手机。\n挂一个 1543 试试。要盒子+45，90W充电器自己留着。\n可以邮寄。',
+              body_complete=True,url='https://example.invalid/t/45',history=0)
+    value={'items':[dict(name='iQOO11',category='phone.smartphone',start_line=0,end_line=2,
+                         price=1543,price_line=2,status='available',link_ids=[])],
+           'common_lines':[3],'shared_link_ids':[]}
+    return post,value
+
+
+def test_marketplace_narrative_price_uses_grok_without_changing_addon_into_price():
+    post,value=narrative()
+    local=classifier.classify_listing(post['title'],post['body'],post['source'])
+    assert local[0]['price'] is None and enrich.needs_analysis(post,local)
+    item=enrich.validate(value,post)[0]
+    assert item['price']==1543 and item['status']=='available'
+    assert item['attributes']['condition']!='全新'
+    candidates=classifier.price_analysis(post['body']).candidates
+    assert any(c.amount==45 and c.reason=='optional_surcharge' for c in candidates)
+    value['items'][0]['price']=45
+    with pytest.raises(enrich.AnalysisError,match='price_without_evidence'):enrich.validate(value,post)
+
+
+@pytest.mark.parametrize('body',[
+    '官网价1543元，要盒子+45','买入1543元，电池90%','型号1543，90W充电器',
+])
+def test_marketplace_grok_cannot_reinterpret_excluded_price_roles(body):
+    post,value=narrative();post['body']=body
+    value['items'][0].update(end_line=1,price_line=1)
+    value['common_lines']=[]
+    with pytest.raises(enrich.AnalysisError,match='price_without_evidence'):enrich.validate(value,post)
+
+
+def test_marketplace_grok_prompt_removes_wx_contact():
+    post,_=narrative();post['body']+='\nwx: fixture_contact'
+    assert 'fixture_contact' not in enrich.build_prompt(post)

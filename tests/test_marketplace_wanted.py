@@ -17,6 +17,31 @@ def inventory(model='iPhone 15 Pro', category='phone.smartphone', **fields):
         {'category':category,'model':model,**fields}]})
 
 
+@pytest.mark.parametrize('title',[
+    '【二手交易】北京 65 收 2 小时京东家政（长期）',
+    '北京65收2小时京东家政','65元收北京京东家政2小时',
+    '北京 京东家政 2小时，65块收','北京京东家政2小时长期收，预算65元',
+])
+def test_wanted_budget_before_verb_and_long_term_requests(title):
+    requests=items(title,'长期收')
+    assert len(requests)==1 and requests[0]['status']=='buy'
+    assert requests[0]['attributes']['intent']=='wanted' and requests[0]['price']==65
+    assert wanted.evaluate(requests,inventory('京东家政','virtual.service',region='北京',specs={'hours':2}))==requests
+    assert not policy.evaluate(requests,{'enabled':True,'groups':['virtual'],'categories':[]})
+
+
+@pytest.mark.parametrize('suffix',['65元收货前确认','65元收款后发货','65元，支持验收','65元，附送收纳盒'])
+def test_wanted_verb_does_not_capture_receipt_or_payment(suffix):
+    requests=items('出售 iPhone 15 Pro',suffix)
+    assert all(i['status']!='buy' and i['attributes']['intent']!='wanted' for i in requests)
+
+
+def test_wanted_budget_does_not_change_service_city_or_duration():
+    selected=inventory('京东家政','virtual.service',region='北京',specs={'hours':2})
+    assert not wanted.evaluate(items('上海65收2小时京东家政','长期收'),selected)
+    assert not wanted.evaluate(items('北京65收4小时京东家政','长期收'),selected)
+
+
 def test_wanted_inventory_is_independent_from_sales_and_not_enabled_by_default(tmp_path):
     requests=items('求购 iPhone 15 Pro','预算4500元')
     assert not wanted.evaluate(requests,wanted.load(tmp_path/'missing.json'))

@@ -19,7 +19,7 @@ REFERENCE = re.compile(
     r"(?:现价|售价|价格|报价|到手价|到手|价)|原价|官网|官方价|参考价|市场价|全新价|面值|"
     r"购入|买入|入手|买时|到手价|购价|购买价|收购价|回收价|报价|预算", re.I)
 EXPENSE = re.compile(r"定金|订金|押金|补贴|优惠券|省了|便宜了|立减|直降|降了|运费|邮费|维修|换屏|电池更换|首付|每月|分期", re.I)
-METADATA = re.compile(r"微信|QQ|电话|联系|编号|信用|IMEI|序列号|浏览|查看|阅读|回复|楼层|下载次数|电池(?:健康|寿命|效率)?|循环|充电次数|频率|频宽|频段|主频|刷新率|分辨率|尺寸|重量|容量|功率|使用时间|剩余(?:容量|电量)|保修至", re.I)
+METADATA = re.compile(r"微信|QQ|\b(?:wx|vx|wechat)\b|电话|联系|编号|型号|信用|IMEI|序列号|浏览|查看|阅读|回复|楼层|下载次数|电池(?:健康|寿命|效率)?|循环|充电次数|频率|频宽|频段|主频|刷新率|分辨率|尺寸|重量|容量|功率|使用时间|剩余(?:容量|电量)|保修至", re.I)
 UNIT = re.compile(r"^(?:%|％|GB|TB|MB|MHz|GHz|Hz|mAh|kWh|kW|Wh|W(?![a-z])|V(?![a-z])|mm|cm|kg|寸|英寸|毫米|厘米|公里|小时|分钟|秒|年|月|日|号|代|款|成新|新|次|个|台|部|件|只|张|套|核|线程|页|千米|天|个月|[GT](?![a-z]))", re.I)
 MODEL_PREFIX = re.compile(r"(?:AirPods(?:\s*(?:Pro|Max))?|(?:Apple\s*)?Watch(?:\s*(?:Ultra|Series|SE))?|iPhone|iPad(?:\s*(?:Pro|Air|mini))?|苹果|Mate(?:Pad|Book)?|Pura|Galaxy\s*[AS]?|小米|红米|Redmi|荣耀|Honor|OPPO|vivo|iQOO|RTX|GTX|RX|DDR|Ryzen\s*[3579]?|Core\s*Ultra\s*[579]?|\bi[3579]|\bR[3579])\s*$", re.I)
 DEVICE = re.compile(r"iPhone|iPad|MacBook|Mate|Pura|Galaxy|小米|红米|Redmi|荣耀|Honor|OPPO|vivo|iQOO|手机|平板|笔记本|电脑|内存|硬盘|SSD|NAS", re.I)
@@ -102,6 +102,8 @@ def analyse_price(text: str, *, minimum: int = 1, maximum: int = 1000000,
             reason = ''
             if any(left <= position < right for left, right in protected):
                 reason = 'protected_metadata'
+            elif re.search(r'(?:\+|另加|加收|加价|补差)\s*$',before):
+                reason = 'optional_surcharge'
             elif (not match['prefix'] and start and re.match(r'[A-Za-z0-9_.]', line[start-1])) or (MODEL_PREFIX.search(before) and not marked):
                 reason = 'model_identifier'
             elif re.match(r'[A-Za-z0-9_]', raw_after) and not scale and not match['suffix']:
