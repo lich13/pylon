@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from .taxonomy import RULES, canonical
 
-VERSION = 3
+VERSION = 4
 
 PATTERNS = [(key, re.compile(pattern, re.I)) for key, _, pattern in RULES]
 SOLD = re.compile(r'已售|已出售(?!中)|已出(?!售)|已预[订定]|售罄|已被预[订定]|预[订定]给|封帖|封贴|结贴|勿拍')
@@ -17,8 +17,6 @@ SALE = re.compile(r'出售|闲置|转让|明盘|卖|(?:^|[\s，,])出|元出|包
 GIFT = re.compile(r'赠送|赠品|送的|随.{0,12}赠|附赠')
 BUNDLE = re.compile(r'打包|整套|不拆卖|不单卖|一起出|合计')
 EXCLUSIVE_BUNDLE = re.compile(r'不拆(?:卖|出)?|不单卖|(?:只|仅|必须|全部)打包|打包(?:一起)?(?:出|出售)|整套(?:出|出售)')
-PRICE = re.compile(r'(?:[¥￥]\s*(\d{1,6}(?:\.\d+)?)|(?<![A-Za-z0-9_.])(\d{1,6}(?:\.\d+)?)\s*(?:元|块|人民币|包邮|包顺丰)|(?:明盘|售价|现价|卖价|价格)\s*[:：]?\s*(\d{1,6}(?:\.\d+)?))')
-NON_PRICE = re.compile(r'原价|购入|买入|入手价|官网价|定金|押金|运费|维修费|预算|补贴|返现')
 NUMBERED = re.compile(r'^\s*(?:\d{1,2}(?:[、)）]|\.(?!\d))|[一二三四五六七八九十][、.])\s*')
 ATTACHMENT_HEADER = re.compile(
     r'^.{1,240}\.(?:jpe?g|png|gif|webp|bmp|heic)\s*[（(]\s*\d+(?:\.\d+)?\s*'
@@ -147,15 +145,11 @@ def category_for(text: str) -> tuple[str, str]:
 
 
 def asking_price(text: str) -> int | None:
-    prices = set()
-    for line in re.split(r'[\n，,；;。]', re.sub(r'https?://\S+', '', text)):
-        for match in PRICE.finditer(line):
-            if NON_PRICE.search(line[:match.start()]):
-                continue
-            value = float(next(v for v in match.groups() if v is not None))
-            if 0 < value <= 1000000 and value.is_integer():
-                prices.add(int(value))
-    return next(iter(prices)) if len(prices) == 1 else None
+    from pylon.tasks.quotes.matching import asking_price as shared_price
+    sale_heading = re.search(r'(?:^|[】\]])\s*(?:出|卖|转让)(?!价|厂|生|现|差)', text)
+    known_sale = bool((SALE.search(text) or sale_heading) and category_for(text)[0] != 'unknown')
+    result = shared_price(text, minimum=1, maximum=1000000, allow_bare=known_sale)
+    return result[0] if result else None
 
 
 def _blocks(title: str, body: str) -> list[str]:
@@ -347,6 +341,8 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
         if category=='phone.apple' and '苹果' not in attributes['brands']:
             attributes['brands'].append('苹果')
         price_text = re.sub(r'预算|收价|出价', '售价', text) if intent=='wanted' else text
+        attributes['external_price'] = bool(re.search(r'https?://',text)
+                                             and re.search(r'闲鱼|咸鱼|价格.{0,12}(?:链接|详见)',text))
         result.append(dict(index=index, category=canonical(category), text=text, status=status, price=None if bundle_only or shared_bundle else asking_price(price_text),
                            evidence=evidence, attributes=attributes))
     return result
