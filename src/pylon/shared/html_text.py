@@ -1,7 +1,7 @@
 """Extract body evidence without losing paragraphs or nested elements."""
 from html.parser import HTMLParser
 import re
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 
 MAX_BODY_CHARS = 32000
 
@@ -24,6 +24,11 @@ class BodyText(HTMLParser):
             try:
                 parsed = urlsplit(href)
                 if parsed.scheme not in {'http','https'} or not parsed.hostname or parsed.username or parsed.password:
+                    href = ''
+                elif (re.search(r'\.(?:jpe?g|png|gif|webp|bmp|heic)$',parsed.path,re.I)
+                      or parsed.path.endswith('/attachment.php')
+                      or parse_qs(parsed.query).get('mod')==['attachment']):
+                    # Forum image download controls are not transaction links.
                     href = ''
             except ValueError:
                 href = ''

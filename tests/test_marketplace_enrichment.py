@@ -59,6 +59,14 @@ def test_marketplace_pretty_html_does_not_break_table_cells_into_rows():
     assert rows[1].count('|')==3 and '2,345' in rows[1]
 
 
+def test_marketplace_image_download_controls_do_not_become_trade_links():
+    text=body_text('<a href="https://example.invalid/forum.php?mod=attachment&amp;aid=fixture">下载附件</a>'
+                   '<a href="https://example.invalid/photo.jpg?sig=fixture">photo.jpg</a>'
+                   '<a href="https://example.invalid/item/42">商品详情</a>')
+    assert 'aid=' not in text and 'sig=' not in text
+    assert enrich.links(text)==['https://example.invalid/item/42']
+
+
 def test_marketplace_touchpad_does_not_expand_mouse_subscription():
     items=classifier.classify_listing('闲置出售','Magic Trackpad 678元出\nMagic Keyboard 456元出')
     assert {i['category'] for i in items}=={'input.touchpad','input.keyboard'}
@@ -70,6 +78,29 @@ def test_marketplace_summary_title_not_copied_to_each_product():
     value=answer();value['common_lines'].append(0)
     items=enrich.validate(value,post)
     assert 'AirPods' not in items[0]['text']
+
+
+def test_marketplace_unknown_unselected_item_does_not_block_known_products():
+    post=example();post['body']=post['body'].replace('耳机 | AirPods4 | 678 |','小物件 | 物件甲 | 678 |')
+    value=answer();value['items'][-1].update(name='物件甲',category='unknown')
+    items=enrich.validate(value,post)
+    assert items[-1]['category']=='unknown'
+    assert len(policy.evaluate(items,{'enabled':True,'groups':['phone'],'categories':[]}))==1
+
+
+def test_marketplace_gifted_accessory_does_not_cancel_device_sale():
+    post=example();post['body']=post['body'].replace('4,123 |','4,123 | 送手机壳')
+    value=answer()
+    # Gift accessories do not supply the device's price or condition.
+    items=enrich.validate(value,post)
+    assert items[0]['category']=='phone.smartphone' and items[0]['price']==4123
+    assert items[0]['status']=='available'
+
+
+def test_marketplace_device_name_on_case_is_not_a_device():
+    post=example();post['body']=post['body'].replace('手机 | iPhone 15 Pro |','手机壳 | iPhone 15 Pro |')
+    with pytest.raises(enrich.AnalysisError,match='unsupported_category'):
+        enrich.validate(answer(),post)
 
 
 def test_marketplace_thousands_not_split_into_items_or_model_numbers():

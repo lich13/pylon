@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from .taxonomy import RULES, canonical
 
-VERSION = 7
+VERSION = 8
 
 PATTERNS = [(key, re.compile(pattern, re.I)) for key, _, pattern in RULES]
 SOLD = re.compile(r'已售|已出售(?!中)|已出(?!售)|已预[订定]|售罄|已被预[订定]|预[订定]给|封帖|封贴|结贴|勿拍')
@@ -14,7 +14,7 @@ WANTED = re.compile(r'求购|求收|想收|[\[【](?:收|求购|预收)[\]】]|(
 WANTED_CLOSED = re.compile(r'已收(?:到|齐|到货)?(?:\W|$)|[\[【]已收[\]】]|不收了|停止收购|需求已(?:解决|满足)|已找到')
 INQUIRY = re.compile(r'询价|价格咨询|行情多少|值多少|求推荐|求助|求问|询问|估价|只了解行情')
 SALE = re.compile(r'出售|闲置|转让|明盘|卖|(?:^|[\s，,])出|元出|包邮|可刀|走鱼|闲鱼|挂价|议价|私聊')
-GIFT = re.compile(r'赠送|赠品|送的|随.{0,12}赠|附赠')
+GIFT = re.compile(r'赠送|赠品|送的|随.{0,12}赠|附赠|(?:^|[\s|，,。；;])送(?!货|达|修|到|测|检)')
 BUNDLE = re.compile(r'打包|整套|不拆卖|不单卖|一起出|合计')
 EXCLUSIVE_BUNDLE = re.compile(r'不拆(?:卖|出)?|不单卖|(?:只|仅|必须|全部)打包|打包(?:一起)?(?:出|出售)|整套(?:出|出售)')
 NUMBERED = re.compile(r'^\s*(?:\d{1,2}(?:[、)）]|\.(?!\d))|[一二三四五六七八九十][、.])\s*')
@@ -60,7 +60,7 @@ def _sale_body(body: str, source: str) -> str:
 
 def _clean_subject(text: str) -> str:
     # Gifts and descriptions of compatible devices are not sale subjects.
-    lines = ['，'.join(FILM_USE.sub('', clause) for clause in re.split(r'[，,。]', line)
+    lines = ['，'.join(FILM_USE.sub('', clause) for clause in re.split(r'[，,。|]', line)
                       if (not GIFT.search(clause) or WANTED.search(clause))
                       and not re.match(r'^\s*(?:不含|不包括|不包含|不带)',clause)).strip()
              for line in text.splitlines()]
