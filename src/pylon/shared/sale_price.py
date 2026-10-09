@@ -20,7 +20,8 @@ REFERENCE = re.compile(
     r"购入|买入|入手|买时|到手价|购价|购买价|收购价|回收价|报价|预算", re.I)
 EXPENSE = re.compile(r"定金|订金|押金|补贴|优惠券|省了|便宜了|立减|直降|降了|运费|邮费|维修|换屏|电池更换|首付|每月|分期", re.I)
 METADATA = re.compile(r"微信|QQ|\b(?:wx|vx|wechat)\b|电话|联系|编号|型号|信用|IMEI|序列号|浏览|查看|阅读|回复|楼层|下载次数|电池(?:健康|寿命|效率)?|循环|充电次数|频率|频宽|频段|主频|刷新率|分辨率|尺寸|重量|容量|功率|使用时间|剩余(?:容量|电量)|保修至", re.I)
-UNIT = re.compile(r"^(?:%|％|GB|TB|MB|MHz|GHz|Hz|mAh|kWh|kW|Wh|W(?![a-z])|V(?![a-z])|mm|cm|kg|寸|英寸|毫米|厘米|公里|小时|分钟|秒|年|月|日|号|代|款|成新|新|次|个|台|部|件|只|张|套|核|线程|页|千米|天|个月|[GT](?![a-z]))", re.I)
+# Edition labels following a price are not the quantity 台 or date unit 日.
+UNIT = re.compile(r"^(?:%|％|GB|TB|MB|MHz|GHz|Hz|mAh|kWh|kW|Wh|W(?![a-z])|V(?![a-z])|mm|cm|kg|寸|英寸|毫米|厘米|公里|小时|分钟|秒|年|月|日(?!本?版)|号|代|款|成新|新|次|个|台(?!湾?版)|部|件|只|张|套|核|线程|页|千米|天|个月|[GT](?![a-z]))", re.I)
 MODEL_PREFIX = re.compile(r"(?:AirPods(?:\s*(?:Pro|Max))?|(?:Apple\s*)?Watch(?:\s*(?:Ultra|Series|SE))?|iPhone|iPad(?:\s*(?:Pro|Air|mini))?|苹果|Mate(?:Pad|Book)?|Pura|Galaxy\s*[AS]?|小米|红米|Redmi|荣耀|Honor|OPPO|vivo|iQOO|RTX|GTX|RX|DDR|Ryzen\s*[3579]?|Core\s*Ultra\s*[579]?|\bi[3579]|\bR[3579])\s*$", re.I)
 DEVICE = re.compile(r"iPhone|iPad|MacBook|Mate|Pura|Galaxy|小米|红米|Redmi|荣耀|Honor|OPPO|vivo|iQOO|手机|平板|笔记本|电脑|内存|硬盘|SSD|NAS", re.I)
 CAPACITIES = {8, 16, 32, 64, 128, 256, 512, 1024, 2048}
