@@ -10,12 +10,12 @@ from urllib.parse import urlsplit
 from . import classifier
 from .taxonomy import CATEGORIES, type_for
 
-VERSION = 'marketplace-items-v5'
+VERSION = 'marketplace-items-v6'
 CONSTRAINT = re.compile(r'已售|已出|预[订定]|求购|求收|不出售|赠送|赠品|不含|不带|打包|不拆|不单卖|'
                         r'本地|同城|自提|面交|地区|邮寄|快递|包邮|顺丰|外地|全国|'
                         r'电池|循环|维修|拆修|使用|划痕|磕碰|成新|全新|未拆|未激活')
 URL = re.compile(r'https?://[^\s<>\[\]"]+', re.I)
-CONTACT_LABEL = r'(?:微信(?:号)?|(?<![A-Za-z0-9_])(?:WX|VX|WeChat|QQ)(?!-)|电话(?:号码)?|手机号码?)'
+CONTACT_LABEL = r'(?:微信(?:号)?|(?<![A-Za-z0-9_])(?:WX|VX|WeChat|QQ)(?!-)|(?<![A-Za-z0-9_])V(?=[ \t]*[:：])|电话(?:号码)?|手机号码?)'
 CONTACT = re.compile(CONTACT_LABEL + r'(?:\s*[:：=]\s*[^\s，,；;]+|\s*[A-Za-z0-9_.+@-]{3,})', re.I)
 SCHEMA = {'type':'object','additionalProperties':False,'properties':{
     'items':{'type':'array','items':{'type':'object','additionalProperties':False,'properties':{

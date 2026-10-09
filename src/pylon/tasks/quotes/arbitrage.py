@@ -95,9 +95,14 @@ TSV_COLOR_PRICE_RE = re.compile(
 TSV_PRICE_RE = re.compile(r"\d{2,5}")
 TSV_SECTION_RE = re.compile(r"(苹果配件|苹果手表|华为耳机|华为手表|手表手环)", re.I)
 BASE64_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])([A-Za-z0-9+/_-]{8,}(?:={0,2}))(?![A-Za-z0-9+/=_-])")
-CONTACT_CONTEXT_RE = re.compile(r"(联系方式|联系|微信|VX|WX|WeChat|QQ|加Q|加V|base64|解码|有意|购买)", re.I)
-WECHAT_CONTEXT_RE = re.compile(r"(微信|VX|WX|WeChat|加V)", re.I)
-QQ_CONTEXT_RE = re.compile(r"(QQ|加Q)", re.I)
+CONTACT_LABEL = r"(?:微信(?:号)?|(?<![A-Za-z0-9_])(?:VX|WX|WeChat|QQ)(?!-)|加Q|加V|(?<![A-Za-z0-9_])V(?=[ \t]*[:：])|联系方式|联系)"
+CONTACT_CONTEXT_RE = re.compile(CONTACT_LABEL, re.I)
+WECHAT_CONTEXT_RE = re.compile(r"微信|(?<![A-Za-z0-9_])(?:VX|WX|WeChat)(?!-)|加V|(?<![A-Za-z0-9_])V(?=[ \t]*[:：])", re.I)
+QQ_CONTEXT_RE = re.compile(r"(?<![A-Za-z0-9_])QQ|加Q", re.I)
+CONTACT_URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>]+", re.I)
+CONTACT_FILE_RE = re.compile(
+    r"[^\s<>\[\]（）()，,；;：:]+\.(?:jpe?g|png|gif|webp|bmp|heic|avif|svg|mp4|mov|webm|pdf|zip|7z|rar|txt)"
+    r"(?:\?[^\s<>]*)?(?=$|[\s，,；;。()（）\[\]}>])", re.I)
 DEFAULT_BARK_BURST_COUNT = 4
 DEFAULT_BARK_BURST_INTERVAL_SECONDS = 5.0
 MAX_BARK_BURST_COUNT = 8
@@ -1221,22 +1226,28 @@ def _normalize_contact_label(label: str) -> str:
     raw = (label or "").strip()
     if re.search(r"QQ|加Q", raw, re.I):
         return "QQ"
-    if re.search(r"微信|VX|WX|WeChat|加V", raw, re.I):
+    if re.search(r"微信|VX|WX|WeChat|加V", raw, re.I) or raw.casefold() == 'v':
         return "微信"
     return "联系方式"
+
+
+def _contact_source(text: str) -> str:
+    # URLs and attachment names are identifiers, even when their random
+    # characters contain WX/QQ or happen to decode as printable base64.
+    return CONTACT_FILE_RE.sub('', CONTACT_URL_RE.sub('', text or ''))
 
 
 def extract_plaintext_contacts(text: str, limit: int = 3) -> list[dict[str, str]]:
     contacts: list[dict[str, str]] = []
     seen: set[str] = set()
-    hay = text or ""
+    hay = _contact_source(text)
     for match in re.finditer(
-        r"(?P<label>微信|VX|WX|WeChat|QQ|加Q|加V|联系方式|联系)\s*[:：]?\s*(?P<value>[A-Za-z0-9_@.+-]{3,64})",
+        rf"(?P<label>{CONTACT_LABEL})[ \t]*[:：]?[ \t]*(?P<value>[A-Za-z0-9_@.+-]{{3,64}})(?![A-Za-z0-9_@.+-])",
         hay,
         re.I,
     ):
         value = match.group("value").strip()
-        if not value or value in seen:
+        if not value or value in seen or value.casefold() in {'http','https','www','base64','wechat','weixin','wx','vx','qq'}:
             continue
         if _decode_base64_candidate(value) is not None:
             continue
@@ -1270,25 +1281,35 @@ def _decode_base64_candidate(token: str) -> str | None:
         return None
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in decoded):
         return None
-    # Contacts hidden with base64 in these posts are usually WeChat/QQ handles.
-    # Keep this strict so product specs or random ASCII are not surfaced.
-    if not re.fullmatch(r"[A-Za-z0-9_@.+-]{3,64}", decoded):
-        return None
     return decoded
 
 
 def extract_decoded_base64_contacts(text: str, limit: int = 3) -> list[dict[str, str]]:
     contacts: list[dict[str, str]] = []
     seen: set[str] = set()
-    hay = text or ""
+    hay = _contact_source(text)
     for match in BASE64_TOKEN_RE.finditer(hay):
         token = match.group(1)
         decoded = _decode_base64_candidate(token)
         if not decoded or decoded in seen:
             continue
-        before = hay[max(0, match.start() - 50) : match.start()]
-        after = hay[match.end() : min(len(hay), match.end() + 50)]
+        # Decodable text is not automatically an account. Reject paths and
+        # media even when somebody labels an encoded attachment as a contact.
+        if (not re.fullmatch(r"[A-Za-z0-9_@.+-]{3,64}",decoded)
+                or CONTACT_FILE_RE.search(decoded) or CONTACT_URL_RE.search(decoded)):
+            continue
+        line_start = hay.rfind('\n',0,match.start())+1
+        line_end = hay.find('\n',match.end())
+        if line_end<0:line_end=len(hay)
+        before = hay[max(line_start, match.start() - 50) : match.start()]
+        after = hay[match.end() : min(line_end, match.end() + 50)]
         window = f"{before} {after}"
+        if not CONTACT_CONTEXT_RE.search(window):
+            previous=hay[:line_start].rstrip().rsplit('\n',1)[-1]
+            if re.fullmatch(CONTACT_LABEL+r'[ \t:：]*',previous,re.I):
+                window=previous
+            else:
+                continue
         if WECHAT_CONTEXT_RE.search(window):
             label = "微信"
         elif QQ_CONTEXT_RE.search(window):
@@ -1296,7 +1317,7 @@ def extract_decoded_base64_contacts(text: str, limit: int = 3) -> list[dict[str,
         elif CONTACT_CONTEXT_RE.search(window):
             label = "联系方式"
         else:
-            label = "疑似联系方式"
+            continue
         contacts.append({"label": label, "encoded": token, "decoded": decoded})
         seen.add(decoded)
         if len(contacts) >= limit:
@@ -1306,7 +1327,8 @@ def extract_decoded_base64_contacts(text: str, limit: int = 3) -> list[dict[str,
 
 def format_contact_note(text: str) -> str:
     existing = _contact_note_from_alert_message(text)
-    if existing:
+    if (existing and not CONTACT_FILE_RE.search(existing) and not CONTACT_URL_RE.search(existing)
+            and extract_plaintext_contacts(existing)):
         return existing
 
     plain_contacts = extract_plaintext_contacts(text)

@@ -359,11 +359,11 @@ def test_marketplace_watch_subject_owns_its_model_and_price(label):
 
 def test_marketplace_contact_redaction_preserves_product_nouns_and_model_names():
     post=example();post['title']='电话手表 Z8、电话卡、WX-1000 耳机、QQ音乐会员'
-    post['body']='电话: 12345678901\n微信fixture_contact\nVX: sample_handle\nQQ123456\nWXfixture_direct\n电话手表可邮寄'
+    post['body']='电话: 12345678901\n微信fixture_contact\nVX: sample_handle\nQQ123456\nWXfixture_direct\nV: fixture_short\n电话手表可邮寄'
     prompt=enrich.build_prompt(post)
     for term in ['电话手表 Z8','电话卡','WX-1000','QQ音乐会员','电话手表可邮寄']:
         assert term in prompt
-    for term in ['12345678901','fixture_contact','sample_handle','123456','fixture_direct']:
+    for term in ['12345678901','fixture_contact','sample_handle','123456','fixture_direct','fixture_short']:
         assert term not in prompt
 
 
