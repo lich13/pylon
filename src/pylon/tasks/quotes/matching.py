@@ -11,6 +11,10 @@ UNAVAILABLE = re.compile(r"已售|已出(?!售中)|售出|售罄|已预[订定]|
 USED = re.compile(r"几乎全新|接近全新|近乎全新|充新|充全新|靓机|[九八七六五四三二一\d][成\.\d]*新|成色如图|二手自用|自用机|使用全程|全程(?:带|戴)壳|(?:买来|一直)贴膜|过保|电池(?:健康|寿命|手机显示|效率)?\s*[:：]?\s*(?:[1-9]\d|100)\s*%?|循环\s*\d+|激活.*?保修", re.I)
 ACCESSORY = re.compile(r"(?:原盒原线|原装线|原线|数据线|充电线|线材|充电器|充电头|包装|原盒|盒子|配件|手机壳|保护壳)[^。；;，,\n]{0,35}(?:全新|未拆(?:封)?|未开封|未使用|未用|原封)", re.I)
 NON_SALE_PRICE = re.compile(r"原价|官网|官方价|购入|买入|入手|买时|到手价|购价|购买价|收购价|回收价|报价|预算|定金|订金|押金|补贴|优惠券|省了|便宜了|立减|直降|降了|运费|邮费|维修|换屏|电池更换|首付|每月|分期|微信|QQ|电话|联系|编号|信用|IMEI|序列号", re.I)
+REFERENCE_PRICE = re.compile(
+    r'(?:官网|官方|京东|淘宝|天猫|拼多多|商城|专柜|旗舰店)'
+    r'[^\d\n。；;，,]{0,12}?(?:现价|售价|价格|报价|到手价|到手|价)'
+    r'|参考价|市场价|全新价|面值', re.I)
 SALE_PRICE = re.compile(r"明盘|现价|售价|卖价|价格|挂价|自刀(?:到)?|再刀(?:到)?|刀至|降至|降到|现在|现出|现卖|出价|一口价", re.I)
 MULTI = re.compile(r"另有|另出|另外|同时出|再出|第二台|两台|两部|两件|多台|多部|多件|各一台|价格分别|价格内详", re.I)
 MONEY = re.compile(r"(?<![\dA-Za-z+])(?P<prefix>[¥￥])?\s*(?P<n>\d{1,6}(?:\.\d+)?)(?P<unit>\s*[万wWkK])?\s*(?P<suffix>元|块|RMB|人民币)?(?![\dA-Za-z+%％]|\s*(?:[GgTt款年代月日新]|小时|分钟|次|寸|毫米))", re.I)
@@ -49,9 +53,12 @@ def asking_price(text: str, *, minimum: int = 100, maximum: int = 50000,
                          r'RTX|GTX|RX|DDR\s*[345]|iPhone|iPad|Mate|Pura|Galaxy\s*[AS]?|小米|红米|Redmi)\s*$', before, re.I):
                 continue
             # A role label applies up to the next explicit sale-price label.
-            negative = list(NON_SALE_PRICE.finditer(before))
+            negative = sorted([*NON_SALE_PRICE.finditer(before), *REFERENCE_PRICE.finditer(before)],
+                              key=lambda m: m.end())
             positive = list(SALE_PRICE.finditer(before))
-            if negative and (not positive or negative[-1].start() >= positive[-1].start()):
+            # A price word inside "官网现价" is part of the reference role.
+            # A later independent "明盘/售价" starts the seller's asking price.
+            if negative and (not positive or negative[-1].end() > positive[-1].start()):
                 continue
             unit = (match['unit'] or '').strip().lower()
             number = float(match['n']) * (10000 if unit in {'w', '万'} else 1000 if unit == 'k' else 1)

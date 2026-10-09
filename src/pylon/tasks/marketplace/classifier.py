@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from .taxonomy import RULES, canonical
 
-VERSION = 4
+VERSION = 5
 
 PATTERNS = [(key, re.compile(pattern, re.I)) for key, _, pattern in RULES]
 SOLD = re.compile(r'已售|已出售(?!中)|已出(?!售)|已预[订定]|售罄|已被预[订定]|预[订定]给|封帖|封贴|结贴|勿拍')
@@ -92,6 +92,15 @@ def category_for(text: str) -> tuple[str, str]:
         positions[key] = match.start()
     if not hits:
         return 'unknown', ''
+    # A manufacturer name is an attribute, not proof of a smartphone. Prefer
+    # the adjacent explicit product noun (红米音箱, OPPO耳机, 荣耀路由器).
+    # A concrete phone model between brand and another noun keeps its role.
+    if hits.get('phone.android','').casefold() in {'红米','redmi','galaxy','iqoo','oneplus','一加','oppo','vivo','荣耀'}:
+        end = positions['phone.android'] + len(hits['phone.android'])
+        if any(not key.startswith('phone.') and 0 <= positions[key]-end <= 12
+               and not re.search(r'\d|手机', subject[end:positions[key]])
+               for key in hits):
+            del hits['phone.android']
     if 'virtual.service' in hits and re.search(r'京东\s*(?:家政|保洁)|天鹅到家.{0,6}(?:家政|保洁)',subject):
         return 'virtual.service',hits['virtual.service']
     virtual = [key for key in ('virtual.cloud_host','virtual.sim') if key in hits]

@@ -16,6 +16,18 @@ from pylon.tasks.quotes import matching
     ('出 iPhone 15 Pro 256G，售价0.36万', 3600),
     ('出 iPhone 15 Pro 256G，原价6000元 现价3600元', 3600),
     ('出 iPhone 15 Pro 256G，原价6000元，现在3600到付', 3600),
+    ('出个红米音箱，官网现价199元，明盘70元', 70),
+    ('出个红米音箱，官网售价199元，明盘70元', 70),
+    ('出个红米音箱，京东现在价格199元，明盘70元', 70),
+    ('出个红米音箱，官方价格199元，卖价70元', 70),
+    ('出个红米音箱，官网现价199元 明盘70元', 70),
+    ('出个红米音箱，官网199元 现价70元', 70),
+    ('出个红米音箱，官网价太高我卖价70元', 70),
+    ('出个红米音箱，官网现价199元', None),
+    ('出个红米音箱，市场价199元，明盘70元', 70),
+    ('出个红米音箱，参考价199元，明盘70元', 70),
+    ('出个红米音箱，明盘70元，运费10元', 70),
+    ('出个红米音箱，明盘70元，另一种套餐90元', None),
     ('出 iPhone 15 Pro 256G\n3600', 3600),
     ('出北京京东家政50', 50),
     ('【二手交易】出北京京东家政50', 50),
@@ -71,3 +83,29 @@ def test_external_link_without_text_price_is_honest_and_never_prioritised():
     message = format_message(post,[item],[])
     assert '正文未标价，见原帖商品链接' in message
     assert '0 元' not in message and '重点比价' not in message
+
+
+@pytest.mark.parametrize('subject,category', [
+    ('红米音箱','audio.speaker'), ('Redmi音箱','audio.speaker'),
+    ('redmi音箱','audio.speaker'), ('oppo耳机','audio.headphone'),
+    ('红米小爱智能音箱','audio.portable'), ('OPPO耳机','audio.headphone'),
+    ('荣耀路由器','network.router'), ('红米K70手机','phone.smartphone'),
+    ('荣耀Magic7手机','phone.smartphone'),
+])
+def test_brand_does_not_override_the_product_type(subject,category):
+    items = classifier.classify_listing('出个'+subject, '官网现价199元，明盘70元','v2ex',True)
+    assert len(items)==1 and items[0]['category']==category and items[0]['price']==70
+
+
+def test_redmi_speaker_has_a_price_but_does_not_hit_phone_watch_list():
+    from pylon.tasks.marketplace import policy
+    items = classifier.classify_listing('【二手交易】出个红米音箱',
+        '官网现价199元，明盘70元','v2ex',True)
+    assert items[0]['category']=='audio.speaker' and items[0]['price']==70
+    assert policy.evaluate(items,{'enabled':True,'groups':['phone'],'categories':[]})==[]
+    assert policy.evaluate(items,{'enabled':True,'categories':['audio.speaker']})==items
+
+
+def test_reference_price_does_not_block_strict_quote_sale_price():
+    text='出 iPhone 15 Pro 256G 全新未激活，官网现价6999元，明盘3600元'
+    assert matching.asking_price(text)[0]==classifier.asking_price(text)==3600
