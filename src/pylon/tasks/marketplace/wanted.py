@@ -166,6 +166,10 @@ def validate(value: dict) -> dict:
 
 
 def load(path: Path | None = None) -> dict:
+    if path is None:
+        from .control import current
+        active=current()
+        if active:return active[1]['wanted']
     path=path or home()/'config/marketplace-wanted.json'
     return validate(json.loads(path.read_text())) if path.is_file() else {'version':1,'enabled':False,'targets':[]}
 
@@ -192,6 +196,8 @@ def evaluate(items: list[dict], policy: dict) -> list[dict]:
                 continue
             if any(target.get('specs',{}).get(key)!=number for key,number in identity['specs'].items()):
                 continue
+            from .policy import attribute_decision
+            if attribute_decision(item,policy)[0]!='match':continue
             result.append(item)
             break
     return result

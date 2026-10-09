@@ -132,20 +132,26 @@ class PollerFaultIntegrationTests(unittest.TestCase):
             poller._run_cycle(self.args, observe=False)
         self.assertEqual(self.pending_count(), 0)
 
-    def test_normal_poll_submits_questions_but_observe_does_not(self):
-        candidate = {"id": "post-unknown", "title": "新奇设备", "body_excerpt": "正文"}
-        result = ("OK", [candidate], [candidate], {"navigation_duration_ms": 100})
-        fake_base.should_notify_post = lambda post: True
-        fake_base.collect_arbitrage_messages = lambda source, posts: []
-        fake_base.format_alerts = lambda messages: ""
-        fake_base.format_telegram_message = lambda posts, fid: "fixture notification"
-        with mock.patch.object(poller, "_collect_proxy_once", return_value=result), mock.patch.object(
-            poller.categories, "publish_unknown_prompts", return_value=1
-        ) as publish:
-            poller._run_cycle(self.args, observe=True)
-            publish.assert_not_called()
-            poller._run_cycle(self.args, observe=False)
-            publish.assert_called_once_with([candidate])
+    def test_normal_poll_preserves_all_candidates_for_unified_ingestion_without_legacy_controls(self):
+        candidates = [
+            {"id": "11", "title": "已知商品", "body_excerpt": "合成正文"},
+            {"id": "12", "title": "新奇设备", "body_excerpt": "合成正文"},
+        ]
+        result = ("OK", candidates, candidates[:1], {"navigation_duration_ms": 100})
+        fake_base.should_notify_post = lambda post: post["id"] == "11"
+        fake_base.collect_arbitrage_messages = mock.Mock(side_effect=AssertionError("legacy alert path"))
+        fake_base.format_alerts = mock.Mock(side_effect=AssertionError("legacy alert path"))
+        fake_base.format_telegram_message = mock.Mock(side_effect=AssertionError("legacy notification path"))
+        self.assertFalse(hasattr(poller, "categories"))
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), mock.patch.object(poller, "_collect_proxy_once", return_value=result), \
+                 mock.patch("pylon.tasks.marketplace.pipeline.enabled", return_value=enabled), \
+                 mock.patch("pylon.tasks.marketplace.pipeline.ingest") as ingest:
+                poller._run_cycle(self.args, observe=True)
+                ingest.assert_not_called()
+                poller._run_cycle(self.args, observe=False)
+                ingest.assert_called_once_with("chiphell", candidates)
+                self.assertEqual(self.pending_count(), 0)
 
     def test_observe_does_not_collect_or_persist_arbitrage_alerts(self):
         candidate = {"id": "post-1", "title": "普通帖子", "body_excerpt": "正文"}

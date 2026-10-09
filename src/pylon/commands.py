@@ -121,11 +121,6 @@ def status_text() -> str:
         lines.append('软件更新提炼状态暂不可读：' + redact(str(exc))[:160])
     from .tasks.quotes.health import status_text as quote_status
     lines.append(quote_status(box=box))
-    try:
-        from .tasks.chiphell.categories import policy_status_line
-        lines.append(policy_status_line())
-    except Exception as exc:
-        lines.append('CHH 分类策略暂不可读：' + redact(str(exc))[:160])
     return "\n".join(lines)
 
 
@@ -264,6 +259,9 @@ def handle(profile: str, text: str) -> str:
     value = text.strip()
     reply_id = os.environ.get('PYLON_REPLY_MESSAGE_ID', '')
     if not value.startswith('/'):
+        from .tasks.marketplace import interface as market_interface
+        market_result = market_interface.reply(profile,int(reply_id) if reply_id.isdigit() else 0,value)
+        if market_result is not None:return encode_response(market_result['text'],market_result.get('reply_markup'))
         from .tasks.gmail import review as gmail_review
         result = gmail_review.bind_reason(profile, int(reply_id) if reply_id.isdigit() else 0, value)
         if result is not None:
@@ -277,8 +275,11 @@ def handle(profile: str, text: str) -> str:
     if value.startswith('/'):
         token, *rest = value.split(maxsplit=1)
         name, argument = token[1:].split('@', 1)[0].lower(), rest[0].strip() if rest else ''
+        if profile=='webops' and name!='market':
+            from .tasks.marketplace.interface import clear_input
+            clear_input(profile)
         if name == 'start':
-            return help_text()
+            return help_text(profile=profile)
         if name.startswith('gmail_') or (name == 'gmail' and argument):
             return 'Gmail 操作已合并，请使用 /gmail'
         if name in {'ssh', 'chiphell'}:
@@ -294,11 +295,15 @@ def handle(profile: str, text: str) -> str:
         if item is None:
             return '没有这个命令。发送 /help 查看可用命令。'
         if item.route == 'help':
-            return help_text(argument)
+            return help_text(argument,profile=profile)
         if item.argument and not item.argument.startswith('[') and not argument:
             return help_text(name)
         if not item.argument and argument:
             raise ValueError('此操作不接受参数；用法：' + item.usage)
+        if item.route == 'market':
+            from .tasks.marketplace import interface
+            result=interface.command(profile,argument)
+            return encode_response(result['text'],result.get('reply_markup'))
         if item.route == 'updates':
             if argument not in {'', 'all'}:
                 return help_text(name)
@@ -329,7 +334,10 @@ def handle(profile: str, text: str) -> str:
 
 def handle_callback(profile: str, payload: dict) -> str:
     value = str(payload.get('data') or '')
-    if value.startswith('st1|'):
+    if value.startswith('mk1|'):
+        from .tasks.marketplace import interface
+        result=interface.callback(profile,payload)
+    elif value.startswith('st1|'):
         from . import ssh_travel
         result = ssh_travel.callback(profile, payload)
     elif value.startswith('g3|'):
@@ -339,8 +347,7 @@ def handle_callback(profile: str, payload: dict) -> str:
         from . import software_updates
         result = software_updates.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
     elif value.startswith('ch1|') or value.startswith('ch2|'):
-        from .tasks.chiphell import categories
-        result = categories.callback(profile, payload)
+        result = {'text':'旧 CHH 分类入口已移除，请在库库干使用 /market。'}
     else:
         from .inline import owns_callback
         if not owns_callback(profile, payload):

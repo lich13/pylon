@@ -12,7 +12,6 @@ from typing import Any
 
 
 from pylon.tasks.chiphell import monitor as base
-from pylon.tasks.chiphell import categories
 from pylon.tasks.chiphell.runtime import (
     CHIPHELL_ALERT_SOURCE,
     CHIPHELL_FID,
@@ -156,7 +155,9 @@ def _collect_proxy_once(
                     try:
                         thread_page.goto(post["url"], wait_until="domcontentloaded", timeout=args.timeout_ms)
                         thread_page.wait_for_timeout(args.settle_ms)
-                        post.update(base.post_body_fields(thread_page, args.body_limit))
+                        fields=base.post_body_fields(thread_page,args.body_limit)
+                        if not fields.get('platform_category'):fields['platform_category']=post.get('platform_category','')
+                        post.update(fields)
                     except Exception as error:
                         post["body_excerpt"] = f"正文抓取失败：{type(error).__name__}"
                     finally:
@@ -165,10 +166,7 @@ def _collect_proxy_once(
                 for post in candidates:
                     post["body_excerpt"] = ""
             base_candidates = [post for post in candidates if base.should_notify_post(post)]
-            # Category policy is only for the ordinary feed.  The caller
-            # derives quote candidates from the full candidate list so a
-            # silent category can never suppress a strict price alert.
-            notify_candidates = categories.filter_normal_posts(base_candidates)
+            notify_candidates = base_candidates
             return "OK", candidates, notify_candidates, diagnostics
         finally:
             context.close()
@@ -269,14 +267,12 @@ def _run_cycle(args: argparse.Namespace, *, observe: bool) -> int:
         from pylon.tasks.marketplace import pipeline as marketplace
         unified = marketplace.enabled()
         quote_posts = [post for post in candidates if base.should_notify_post(post)]
-        if not observe and not unified:
-            categories.publish_unknown_prompts(posts)
         # The observe path is used by health checks and must not format or
         # persist quote alerts: collect_arbitrage_messages records matches
         # and may send Bark notifications as part of its normal path.
-        if not observe and unified:
+        if not observe:
             marketplace.ingest('chiphell',candidates)
-        notification = "" if observe or unified else _format_notification(posts, args.fid, quote_posts)
+        notification = ""  # Ordinary and priority trades are owned only by marketplace.
         if not observe and notification:
             ids = [str(post["id"]) for post in candidates]
             queue.enqueue(f"posts:{','.join(ids)}", notification, now=now)

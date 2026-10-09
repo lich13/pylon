@@ -4,7 +4,8 @@ from __future__ import annotations
 import re
 from .taxonomy import RULES, canonical
 
-VERSION = 10
+VERSION = 11
+from . import subjects
 
 PATTERNS = [(key, re.compile(pattern, re.I)) for key, _, pattern in RULES]
 SOLD = re.compile(r'已售|已出售(?!中)|已出(?!售)|已预[订定]|售罄|已被预[订定]|预[订定]给|封帖|封贴|结贴|勿拍')
@@ -63,6 +64,7 @@ def _sale_body(body: str, source: str) -> str:
 
 def _clean_subject(text: str) -> str:
     # Gifts and descriptions of compatible devices are not sale subjects.
+    text = subjects.subject_text(text)
     lines = ['，'.join(FILM_USE.sub('', clause) for clause in re.split(r'[，,。|]', line)
                       if (not GIFT.search(clause) or WANTED.search(clause))
                       and not re.match(r'^\s*(?:不含|不包括|不包含|不带)',clause)).strip()
@@ -80,6 +82,10 @@ def category_for(text: str) -> tuple[str, str]:
                 match = dict(PATTERNS)[key].search(subject)
                 if match:
                     return key, match[0]
+        if (category=='unknown' and re.search(r'[A-Za-z].*\d|\d.*[A-Za-z]',heading)
+                and re.search(r'(?:^|[\]】])\s*(?:出|转让|出售|求购|收)',heading)
+                and not re.search(r'多件|若干|一堆|一批|如下|内详|分别|配置',heading)):
+            return 'unknown',''
         if category!='unknown' and not re.search(r'多件|若干|一堆|一批|如下|内详|分别',heading):
             return category,evidence
     hits = {}
@@ -94,7 +100,8 @@ def category_for(text: str) -> tuple[str, str]:
         hits[key] = match[0]
         positions[key] = match.start()
     if not hits:
-        return 'unknown', ''
+        from .taxonomy import extension_category
+        return extension_category(subject) or ('unknown', '')
     # A manufacturer name is an attribute, not proof of a smartphone. Prefer
     # the adjacent explicit product noun (红米音箱, OPPO耳机, 荣耀路由器).
     # A concrete phone model between brand and another noun keeps its role.
@@ -175,6 +182,12 @@ def _blocks(title: str, body: str) -> list[str]:
     title_category = category_for(title)[0]
     configuration = False
     for position, line in enumerate(lines):
+        if (subjects.incidental(line) or subjects.PROTECTION.search(line)) and not subjects.SEPARATE.search(line) and not NUMBERED.match(line):
+            if blocks:
+                blocks[-1] += '\n' + line
+            else:
+                blocks.append(line)
+            continue
         if GIFT.search(line) and not SALE.search(line) and not NUMBERED.match(line):
             if blocks:
                 blocks[-1] += '\n' + line
@@ -205,18 +218,22 @@ def _blocks(title: str, body: str) -> list[str]:
     if not blocks:
         return [title]
     if len(blocks) == 1:
-        if category_for(blocks[0])[0] != 'unknown' and GIFT.search(blocks[0]):
+        if (GIFT.search(blocks[0]) and category_for(blocks[0])[0]!='unknown'
+                and re.search(r'和|与|及|、',title) and category_for(title)[0].startswith('accessory.')):
             return blocks
         body_category = category_for(blocks[0])[0]
         title_category = category_for(title)[0]
         # A clearly priced sale in the body owns its subject and amount. Do
         # not attach a different device title to a separately sold accessory.
         if (body_category!='unknown' and body_category!=title_category and SALE.search(blocks[0])
+                and subjects.SEPARATE.search(subjects.heading(blocks[0]))
                 and asking_price(blocks[0]) is not None and title_category!='unknown'
                 and not (title_category.startswith('computer.') and not re.search(r'单出|单卖|另外',blocks[0]))):
             return blocks
         return [title + '\n' + blocks[0]]
     first_category = category_for(blocks[0])[0]
+    if title_category != 'unknown' and first_category == title_category:
+        blocks[0] = title + '\n' + blocks[0]
     if ((first_category == 'unknown' and title_category != 'unknown') or
             (title_category.startswith('computer.') and first_category.startswith(('component.','storage.'))
              and not re.search(r'单出|单卖|另外|元出|出售',blocks[0]))):
@@ -224,7 +241,7 @@ def _blocks(title: str, body: str) -> list[str]:
     return blocks
 
 
-def _sale_parts(text: str) -> list[str]:
+def _sale_parts(text: str, *, title: str = '') -> list[str]:
     """Split explicit coordinated items, never a system specification list."""
     category, _ = category_for(text)
     raw_parts = [p.strip() for p in re.split(r'(?<!\d)[、]|\s*(?:以及|另有|另外)\s*|(?<!\d)\s*\+\s*(?!\d)|[，,]',text) if p.strip()]
@@ -268,6 +285,30 @@ def _sale_parts(text: str) -> list[str]:
                 grouped.append(part)
             else:
                 grouped[-1] += '，' + part
+        # A title plus a repeated description of the same device is one sale.
+        # Do not leave a live title-only phantom when its body says it sold.
+        prefix_body=grouped[0].partition('\n')[2]
+        if (len(grouped)>1 and title and grouped[0].startswith(title+'\n')
+                and category_for(prefix_body)[0]=='unknown' and asking_price(prefix_body) is None):
+            from .wanted import MODELS, normalize
+            def identities(value):
+                owned=_clean_subject(value)
+                if canonical(category_for(value)[0])=='phone.smartphone':
+                    owned=re.sub(r'(?<![A-Za-z0-9])((?:1[0-9])\s*(?:pro\s*max|pm|pro|plus|mini))(?![A-Za-z])',r'iPhone \1',owned,flags=re.I)
+                    owned=re.sub(r'\b(iPhone\s*\d+)\s*pm\b',r'\1 Pro Max',owned,flags=re.I)
+                return {normalize(m[0]) for pattern in MODELS for m in pattern.finditer(owned)}
+            first=identities(grouped[0])
+            if first and any(first & identities(p) for p in grouped[1:]):
+                merged=[grouped[0]]
+                capacities=lambda value:set(re.findall(r'(?<![A-Za-z0-9])(\d{2,4})\s*(?:GB|G)(?![A-Za-z])',value,re.I))
+                original_capacity=capacities(grouped[0])
+                for part in grouped[1:]:
+                    current_capacity=capacities(part)
+                    if (first==identities(part) and not subjects.SEPARATE.search(subjects.heading(part))
+                            and not (original_capacity and current_capacity and original_capacity!=current_capacity)):
+                        merged[0]+='，'+part
+                    else:merged.append(part)
+                grouped=merged
         return grouped
     explicit_sales = all(asking_price(part) is not None or SOLD.search(part) or SALE.search(part) for part in parts)
     if (len(parts)>1 and all(c!='unknown' for c in categories)
@@ -277,7 +318,7 @@ def _sale_parts(text: str) -> list[str]:
 
 
 def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete: bool = True,
-                     *, single_item: bool = False) -> list[dict]:
+                     *, single_item: bool = False, platform_category: str = '') -> list[dict]:
     result = []
     if not body_complete:
         body = ''
@@ -289,7 +330,7 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
     body = normalise_amounts(_sale_body(body,source))
     blocks = ([(body or title, False)] if single_item else
               [(part, len(parts)>1 and bool(BUNDLE.search(block)))
-               for block in _blocks(title, body) for parts in [_sale_parts(block)] for part in parts])
+               for block in _blocks(title, body) for parts in [_sale_parts(block,title=title)] for part in parts])
     title_buy = bool((BUY.search(title) or WANTED.search(title)) and not re.search(r'另出|同时出|出售', title))
     title_sold = bool(re.match(r'^\s*(?:\[|【)?(?:已售|已出|全出|全部已)', title)
                       and not re.search(r'另出|还有|继续出|其他|剩余|分别|、|，|,',title))
@@ -316,6 +357,16 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
     bundle_price = asking_price('\n'.join(bundle_terms)) if bundle_only else None
     for index, (text, shared_bundle) in enumerate(blocks):
         category, evidence = category_for(text)
+        identity = subjects.subject_text(text)
+        identity_head = subjects.heading(text)
+        candidate_clauses=[clause.strip() for line in text.splitlines() for clause in re.split(r'[，,。；;]',line)
+                           if clause.strip() and not subjects.incidental(clause)]
+        subject=next((clause for clause in candidate_clauses if category_for(clause)[0]!='unknown'
+                      or re.search(r'(?:^|[\]】])\s*(?:出|转让|出售|求购|收)',NUMBERED.sub('',clause))),subjects.heading(text))
+        if category == 'unknown' or (category=='computer.desktop' and not re.search(r'台式|电脑|主机|配置',identity)):
+            hinted = subjects.platform_hint(platform_category, identity)
+            if hinted:
+                category, evidence = hinted, subject
         if len(blocks)>1 and category=='unknown' and not NUMBERED.match(text) and not SALE.search(text):
             continue
         own_sale = bool(SALE.search(text) and not WANTED.search(text))
@@ -350,11 +401,11 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
                 ('OPPO',r'OPPO|OnePlus|一加'),('vivo',r'vivo|iQOO'),('索尼',r'索尼|Sony|PlayStation'),
                 ('大疆',r'大疆|DJI|Osmo|Mavic'),('联想',r'联想|Lenovo|ThinkPad|Legion'),('华硕',r'华硕|ASUS|ROG'),
                 ('微星',r'微星|MSI'),('英伟达',r'NVIDIA|英伟达|RTX|GTX'),('AMD',r'AMD|Ryzen|锐龙'),
-                ('Intel',r'Intel|英特尔|酷睿')) if re.search(pattern,text,re.I)],
-            'specs': re.findall(r'(?<![\dA-Za-z])\d+(?:\+\d+)?\s*(?:GB|TB|G|T|mm|英寸)(?![A-Za-z])', text, re.I),
-            'models': re.findall(r'(?:iPhone|iPad\s*(?:Pro|Air|mini)?|Mate(?:Pad)?|Pura|Galaxy\s*[AS]?|RTX|GTX|RX|小米|Redmi|Ryzen|ROG)\s*\d{1,5}(?:\s*(?:Pro\s*Max|Pro|Plus|Ultra|SUPER|Ti|X3D|X))?',text,re.I),
-            'series': re.findall(r'iPhone|iPad|MacBook|ThinkPad|Galaxy|MatePad|Mate|Pura|Redmi|RTX|GTX|Ryzen|Osmo|Mavic',text,re.I),
-            'generation': re.findall(r'(?:iPhone|iPad\s*(?:Pro|Air|mini)?|Mate|Pura|小米|Redmi)\s*(\d{1,3})',text,re.I),
+                ('Intel',r'Intel|英特尔|酷睿')) if re.search(pattern,identity_head,re.I)],
+            'specs': re.findall(r'(?<![\dA-Za-z])\d+(?:\+\d+)?\s*(?:GB|TB|G|T|mm|英寸)(?![A-Za-z])', identity, re.I),
+            'models': re.findall(r'(?:iPhone|iPad\s*(?:Pro|Air|mini)?|Mate(?:Pad)?|Pura|Galaxy\s*[AS]?|RTX|GTX|RX|小米|Redmi|Ryzen|ROG)\s*\d{1,5}(?:\s*(?:Pro\s*Max|Pro|Plus|Ultra|SUPER|Ti|X3D|X))?',identity_head,re.I),
+            'series': re.findall(r'iPhone|iPad|MacBook|ThinkPad|Galaxy|MatePad|Mate|Pura|Redmi|RTX|GTX|Ryzen|Osmo|Mavic',identity_head,re.I),
+            'generation': re.findall(r'(?:iPhone|iPad\s*(?:Pro|Air|mini)?|Mate|Pura|小米|Redmi)\s*(\d{1,3})',identity_head,re.I),
             'classifier_version': VERSION,
         }
         if not body_complete:
@@ -375,6 +426,10 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
         if (status == 'uncertain' and intent == 'sale' and category != 'unknown'
                 and price.amount is not None and not GIFT.search(text)):
             status = 'available'
+        attributes['subject'] = subject
+        attributes['platform_category'] = platform_category
+        attributes['facts'], attributes['attribute_evidence'] = subjects.facts(identity,attributes,price=price.amount,category=canonical(category))
+        attributes['condition'] = attributes['facts'].get('condition','成色未注明') if body_complete else '成色待确认'
         result.append(dict(index=index, category=canonical(category), text=text, status=status,
                            price=None if bundle_only or shared_bundle else price.amount,
                            evidence=evidence, attributes=attributes))

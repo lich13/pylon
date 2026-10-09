@@ -15,7 +15,7 @@ from pylon.transport import DeliveryError
 
 
 def test_catalog_is_valid_chinese_and_has_detailed_help():
-    assert len(COMMANDS) == 19
+    assert len(COMMANDS) == 20
     assert len({row['command'] for row in menu_commands()}) == sum(item.menu for item in COMMANDS.values())
     assert [row['command'] for row in menu_commands()] == ['gmail', 'updates', 'monitors', 'add_monitor', 'remove_monitor', 'ssh_travel', 'agent_codex', 'agent_grok', 'update_codex', 'update_grok', 'help']
     assert 'gmail_feedback' not in {row['command'] for row in menu_commands()}
@@ -88,8 +88,21 @@ def test_every_menu_entry_reaches_its_existing_operation(name, monkeypatch):
         agent.assert_called_once_with(item.action, argument, 'default')
     elif item.route == 'help':
         assert result == help_text('status')
+    elif item.route == 'market':
+        assert '库库干' in result and '/market' in result
     else:
         calls[item.route + '_text'].assert_called_once_with()
+
+
+def test_market_command_and_menu_are_webops_only():
+    webops = menu_commands('webops')
+    default = menu_commands('default')
+    assert 'market' in {row['command'] for row in webops}
+    assert 'market' not in {row['command'] for row in default}
+    assert 'market' in help_text(profile='webops')
+    assert 'market' not in help_text(profile='default')
+    assert '库库干' in commands.handle('default', '/market')
+    assert '/market' in commands.handle('webops', '/help market')
 
 
 @pytest.mark.parametrize('old,new', [('/gmail list', '/gmail_candidates'),
@@ -201,7 +214,11 @@ def test_both_bots_all_scopes_languages_buttons_and_idempotence(telegram):
         assert result['ok'] and result['checked'] == 11 and result['changed'] == 11
         assert bot_menu.synchronize(profile, http=object())['changed'] == 0
     assert len(writes) == 22
-    assert len([v for (_, field, _), v in state.items() if field == 'commands' and v == menu_commands()]) == 18
+    for profile in bot_menu.PROFILES:
+        configured = [value for (token, field, _), value in state.items()
+                      if token == 'token-' + profile and field == 'commands']
+        assert len(configured) == 9
+        assert all(value == menu_commands(profile) for value in configured)
     assert not any('Hermes' in json.dumps(v) for v in state.values())
 
 

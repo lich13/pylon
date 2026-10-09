@@ -6,7 +6,7 @@ import re
 import time
 import os
 import sqlite3
-from . import policy, wanted
+from . import policy, wanted, control
 from .classifier import VERSION as CLASSIFIER_VERSION, classify_listing
 from .store import Store, key
 from .taxonomy import CATEGORIES
@@ -76,6 +76,9 @@ def format_message(post: dict, items: list[dict], matches: list[dict]) -> str:
         else:
             lines.append(f"- {subject or CATEGORIES[item['category']]}｜{price}｜{attrs['condition']}｜{trade}")
         lines.append(f"  分类：{CATEGORIES[item['category']]}")
+        facts=attrs.get('facts',{})
+        if facts.get('ram_gb') and facts.get('storage_gb'):
+            lines.append(f"  规格：{facts['ram_gb']}+{facts['storage_gb']}G")
         for url in dict.fromkeys(attrs.get('links',[]) or links(item['text'])):
             lines.append(f'  商品链接：{url}')
         shared_links.extend(attrs.get('shared_links',[]))
@@ -101,6 +104,8 @@ def format_message(post: dict, items: list[dict], matches: list[dict]) -> str:
 def process(store: Store | None = None, *, current_policy: dict | None = None,
             wanted_policy: dict | None = None, limit: int = 30, source: str | None = None) -> int:
     from pylon.tasks.quotes import arbitrage, health
+    from .taxonomy import refresh_extensions
+    refresh_extensions()
     current_policy = current_policy or policy.load()
     wanted_policy = wanted.load() if wanted_policy is None else wanted_policy
     if not current_policy['enabled'] and not wanted_policy['enabled']:
@@ -126,15 +131,44 @@ def process(store: Store | None = None, *, current_policy: dict | None = None,
             parsed_items = json.loads(post['items'])
             if any(item['attributes'].get('classifier_version', CLASSIFIER_VERSION) != CLASSIFIER_VERSION
                    for item in parsed_items):
-                parsed_items = classify_listing(post['title'], post['body'], post['source'], bool(post['body_complete']))
+                parsed_items = classify_listing(post['title'], post['body'], post['source'], bool(post['body_complete']),platform_category=post.get('platform_category',''))
                 db.execute('UPDATE marketplace_posts SET items=? WHERE source=? AND source_id=?',
                            (json.dumps(parsed_items, ensure_ascii=False), post['source'], post['source_id']))
+            decisions=[]
+            for item in parsed_items:
+                decision,reasons=policy.decision(item,current_policy)
+                if item['status']=='buy':
+                    eligible=wanted.evaluate([item],{**wanted_policy,'filters':{}})
+                    decision,reasons=policy.attribute_decision(item,wanted_policy) if eligible else ('exclude',['不符合独立求购目标'])
+                decisions.append({'index':item['index'],'category':item['category'],'state':decision,'reasons':reasons})
+                if decision=='review':
+                    item['attributes']['required_missing']=[r for r in reasons if r in __import__('pylon.tasks.marketplace.subjects',fromlist=['FIELDS']).FIELDS]
+                    control.review(db,post,item['index'],'、'.join(reasons))
+            db.execute('UPDATE marketplace_posts SET items=? WHERE source=? AND source_id=?',(json.dumps(parsed_items,ensure_ascii=False),post['source'],post['source_id']))
+            post['items']=json.dumps(parsed_items,ensure_ascii=False)
             from .enrich import prepare
             parsed_items = prepare(db,post,parsed_items)
             if parsed_items is None:
+                status=db.execute('SELECT status FROM marketplace_posts WHERE source=? AND source_id=?',(post['source'],post['source_id'])).fetchone()[0]
+                control.audit(db,post,decisions,status=status,policy_version=current_policy['version'])
                 continue
+            original_indices={d['index'] for d in decisions}
+            # Keep unresolved source items while a partial notification proceeds.
+            existing=json.loads(post['items'])
+            by_index={i['index']:i for i in existing}
+            by_index.update({i['index']:i for i in parsed_items})
+            persisted=list(by_index.values()) if len(original_indices)>len(parsed_items) else parsed_items
             db.execute('UPDATE marketplace_posts SET items=? WHERE source=? AND source_id=?',
-                       (json.dumps(parsed_items,ensure_ascii=False),post['source'],post['source_id']))
+                       (json.dumps(persisted,ensure_ascii=False),post['source'],post['source_id']))
+            decisions=[]
+            for item in persisted:
+                state,reasons=policy.decision(item,current_policy)
+                if item['status']=='buy':
+                    eligible=wanted.evaluate([item],{**wanted_policy,'filters':{}})
+                    state,reasons=policy.attribute_decision(item,wanted_policy) if eligible else ('exclude',['不符合独立求购目标'])
+                decisions.append({'index':item['index'],'category':item['category'],'state':state,'reasons':reasons})
+                if state=='review':control.review(db,post,item['index'],'、'.join(reasons))
+                else:db.execute("UPDATE market_reviews SET status='resolved' WHERE source=? AND source_id=? AND item_index=?",(post['source'],post['source_id'],item['index']))
             items = policy.evaluate(parsed_items,current_policy) + wanted.evaluate(parsed_items,wanted_policy)
             matches = _quote_matches(items,bool(post['body_complete']),quotes)
             text = format_message(post,items,matches)
@@ -156,6 +190,8 @@ def process(store: Store | None = None, *, current_policy: dict | None = None,
                                 payload={'body':body,'api_base':os.environ.get('BARK_API_BASE',DEFAULT_API_BASE)},
                                 key=key(post['source'],post['source_id'])+f':{number}',delay=number*interval,run_id=run_id,connection=db)
                 count += 1
+            state='queued' if event_id else 'needs_review' if any(d['state']=='review' for d in decisions) else 'skipped'
+            control.audit(db,post,decisions,status=state,event_id=event_id,policy_version=current_policy['version'])
             db.execute('UPDATE marketplace_posts SET status=?,event_id=?,policy_version=?,wanted_policy_version=?,updated_at=? WHERE source=? AND source_id=?',
-                       ('queued' if event_id else 'skipped',event_id,current_policy['version'],wanted_policy['version'],time.time(),post['source'],post['source_id']))
+                       (state,event_id,current_policy['version'],wanted_policy['version'],time.time(),post['source'],post['source_id']))
     return count

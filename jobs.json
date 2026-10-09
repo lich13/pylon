@@ -189,5 +189,23 @@
     "failure_notify": false,
     "timeout": 240,
     "module": "pylon.tasks.marketplace.poll"
+  },
+  "marketplace-review": {
+    "name": "交易新品种审核汇总",
+    "profile": "webops",
+    "schedule": "0 21 * * *",
+    "deliver": false,
+    "failure_notify": true,
+    "timeout": 60,
+    "module": "pylon.tasks.marketplace.novelty"
+  },
+  "marketplace-analyze": {
+    "name": "交易主体与属性分析",
+    "profile": "webops",
+    "schedule": "* * * * *",
+    "deliver": false,
+    "failure_notify": false,
+    "timeout": 300,
+    "module": "pylon.tasks.marketplace.enrich"
   }
 }

@@ -23,7 +23,7 @@ def synchronize(profile: str, *, apply: bool = True, http=None) -> dict:
     token, owner = env.get('TELEGRAM_BOT_TOKEN', ''), env.get('TELEGRAM_HOME_CHANNEL', '')
     if not token or not re.fullmatch(r'[1-9][0-9]*', owner):
         raise ValueError('机器人 token 或本人私聊 ID 未配置')
-    expected = menu_commands()
+    expected = menu_commands(profile)
     scopes = ({'type': 'default'}, {'type': 'all_private_chats'}, {'type': 'chat', 'chat_id': int(owner)})
     differences, changed, checked = [], 0, 0
 

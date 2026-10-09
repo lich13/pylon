@@ -155,7 +155,7 @@ def list_page(ctx, source: str, page_number: int = 1) -> list[dict]:
         records = page.locator(selector).evaluate_all('''nodes=>nodes.map(e=>{
             const row=e.closest('tr')||e.parentElement;
             const posted=row.querySelector('.postdate, [id^="t_pt"], td.by em span');
-            return {title:e.innerText,url:e.href,rowText:row.innerText,
+            return {title:e.innerText,url:e.href,rowText:row.innerText,platform_category:[...row.querySelectorAll('a[href*=typeid], .topic_tag')].map(n=>n.innerText).join(' / '),
                 posted:posted?(posted.getAttribute('title')||posted.innerText):'',
                 dates:[...row.querySelectorAll('[title]')].map(n=>n.getAttribute('title')).join(' ')};})''')
         result = []
@@ -171,7 +171,7 @@ def list_page(ctx, source: str, page_number: int = 1) -> list[dict]:
                 continue
             result.append({'id':sid,'title':item['title'],'url':item['url'],
                            'posted_at':date_text(item.get('posted','') or item['dates']+' '+item['rowText']),
-                           'body_full':'','body_complete':False})
+                           'body_full':'','body_complete':False,'platform_category':item.get('platform_category','')})
         return result
     finally:
         page.close()
@@ -204,7 +204,10 @@ def detail(ctx, source: str, post: dict, *, page=None) -> dict:
         body = extract_topic_body(raw,include_supplements=True)
         if not body:
             raise ContentUnavailable(content_gap(body_text(raw)))
-        return {**post,'body_full':body[:MAX_BODY_CHARS],'body_complete':bool(body) and len(body)<=MAX_BODY_CHARS}
+        heading=re.search(r'<h1\b[^>]*>(.*?)</h1>',raw,re.I|re.S)
+        title=body_text(heading[1]).strip() if heading else ''
+        return {**post,'title':title or post['title'],'title_refreshed':bool(title),
+                'body_full':body[:MAX_BODY_CHARS],'body_complete':bool(body) and len(body)<=MAX_BODY_CHARS}
     owned_page = page is None
     page = ctx.new_page() if owned_page else page
     try:
@@ -234,6 +237,12 @@ def detail(ctx, source: str, post: dict, *, page=None) -> dict:
             body = body_text(raw)
             fields = dict(body_full=body[:MAX_BODY_CHARS],body_complete=bool(body) and len(body)<=MAX_BODY_CHARS)
         dates = page.locator('[id^="postdate"], [id^="authorposton"]').all_text_contents()
+        if not fields.get('platform_category') and post.get('platform_category'):
+            fields['platform_category']=post['platform_category']
+        title=''
+        heading=page.locator('#postsubject0' if source=='nga' else '#thread_subject')
+        if heading.count():title=heading.first.inner_text().strip()
+        fields.update(title=title or post['title'],title_refreshed=bool(title))
         return {**post,**fields,'posted_at':date_text(' '.join(dates)) or post.get('posted_at','')}
     finally:
         if owned_page:

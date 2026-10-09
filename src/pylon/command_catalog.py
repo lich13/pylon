@@ -56,6 +56,8 @@ COMMANDS = {item.name: item for item in (
             '识别支持的发布源，保存后校验配置；重复源不会重复添加。不支持的网站会明确提示。原“增加监控 URL”“加监控 owner/repo”仍可使用。'),
     Command('remove_monitor', '列出可移除的监控，回复对应编号完成移除', 'monitor', 'remove',
             detail='先发送此命令取得列表，再单独回复编号。编号对应此次列表中的项目；成功后结束本次选择。原“移除监控”仍可使用。'),
+    Command('market', '统一管理交易筛选、求购目标、新品种确认及漏推原因', 'market', argument='[原帖链接]',
+            detail='仅库库干提供。点击大类、细类和属性进行批量组合筛选；先预览再确认应用，可恢复上一版本。出售和求购分别设置。新品种先由 Grok 建议，21:00 汇总新待办，确认后才用于未来处理；旧历史不自动补发。粘贴帖子链接可查看分类、策略和投递原因。'),
     Command('gmail', '批量选择邮件样本、生成逻辑规则并预览应用', 'gmail', 'review',
             detail='一批最多 20 个样本，可跨多个发件人；点击应删除或必须保留后直接发送原因，选好后一次提交 Grok。预览和应用不删除当前邮件，新规则只用于后续收到的邮件；已确认规则照常自动清理。'),
     Command('ssh_travel', '查看或切换外地 SSH 放行状态', 'ssh_travel', argument='[开启|关闭]',
@@ -81,18 +83,18 @@ RETIRED = {'status', 'run', 'pause', 'resume', 'logs', 'outbox', 'chiphell_statu
 RETIRED_MESSAGE = '该入口已下线，请使用 /help'
 
 
-def menu_commands() -> list[dict[str, str]]:
-    return [{'command': item.name, 'description': item.description} for item in COMMANDS.values() if item.menu]
+def menu_commands(profile: str = 'default') -> list[dict[str, str]]:
+    return [{'command': item.name, 'description': item.description} for item in COMMANDS.values() if item.menu or (profile=='webops' and item.name=='market')]
 
 
 def task_list() -> str:
     return '任务编号：\n' + '\n'.join(f"{i}. {job['name']}（{key}）" for i, (key, job) in enumerate(jobs().items(), 1))
 
 
-def help_text(name: str = '') -> str:
+def help_text(name: str = '', profile: str = 'default') -> str:
     name = name.strip().removeprefix('/').split('@', 1)[0]
     if not name:
-        return 'pylon 命令\n\n' + '\n'.join(f'/{c.name} — {c.description}' for c in COMMANDS.values() if c.menu) + '\n\n详细用法：/help 命令，例如 /help gmail'
+        return 'pylon 命令\n\n' + '\n'.join(f'/{c.name} — {c.description}' for c in COMMANDS.values() if c.menu or (profile=='webops' and c.name=='market')) + '\n\n详细用法：/help 命令，例如 /help gmail'
     if name in RETIRED:
         return RETIRED_MESSAGE
     if name.startswith('gmail_'):

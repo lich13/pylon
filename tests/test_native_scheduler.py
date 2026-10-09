@@ -42,14 +42,21 @@ def test_all_jobs_keep_schedule_and_native_catchup():
     assert 'RandomizedDelaySec=30m' in bootstrap.timer_text('refresh', catalog['ssh-beijing-refresh'])
     assert 'OnCalendar=Mon *-*-* 9:0:00 Asia/Shanghai' in bootstrap.timer_text('software-maintenance', catalog['software-maintenance'])
     assert 'OnCalendar=*-*-* 0/6:15:00 Asia/Shanghai' in bootstrap.timer_text('software-update-review', catalog['software-update-review'])
-    assert list(catalog)[-2] == 'software-update-review'
-    assert list(catalog)[-1] == 'marketplace-poll'
+    assert {'software-update-review', 'marketplace-poll', 'marketplace-review', 'marketplace-analyze'} <= catalog.keys()
     assert catalog['marketplace-poll'] == {
         'name': '三平台二手交易', 'profile': 'webops', 'schedule': '* * * * *',
         'deliver': False, 'failure_notify': False, 'timeout': 240,
         'module': 'pylon.tasks.marketplace.poll',
     }
     assert catalog['software-update-review']['profile'] == 'default'
+    for key, module, schedule in (
+        ('marketplace-review', 'novelty', '0 21 * * *'),
+        ('marketplace-analyze', 'enrich', '* * * * *'),
+    ):
+        assert catalog[key]['profile'] == 'webops'
+        assert catalog[key]['module'] == 'pylon.tasks.marketplace.' + module
+        assert catalog[key]['schedule'] == schedule
+        assert catalog[key]['deliver'] is False
     assert '--apply' in catalog['xianbao-retention-cleanup']['args']
     assert catalog['f3ec3ec24210']['lock'] == catalog['e961da51fe69']['lock']
 

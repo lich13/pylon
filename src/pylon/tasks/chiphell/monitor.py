@@ -207,7 +207,11 @@ def post_body_fields(page, limit: int = 180) -> dict[str, Any]:
     contact = format_contact_note(full)
     if contact and contact not in excerpt:
         excerpt = f"{excerpt} {contact}".strip()
-    return {'body_full': full[:MAX_BODY_CHARS], 'body_complete': bool(full) and len(full) <= MAX_BODY_CHARS,
+    try:
+        original_category = page.locator('#thread_subject').evaluate("el => [...el.parentElement.querySelectorAll('a[href*=typeid]')].map(n => n.innerText).join(' / ')") or ''
+    except Exception:
+        original_category = ''
+    return {'platform_category':original_category, 'body_full': full[:MAX_BODY_CHARS], 'body_complete': bool(full) and len(full) <= MAX_BODY_CHARS,
             'body_excerpt': excerpt}
 
 
@@ -231,12 +235,13 @@ def _candidate_from_link(args: argparse.Namespace, notified: set[str], link) -> 
         href = link.get_attribute("href") or ""
         abs_url = urljoin(args.url, href)
         tid = extract_thread_id(row_id, abs_url)
-        title_text = compact_excerpt(link.inner_text(timeout=3000), 120)
+        title_text = link.inner_text(timeout=3000).strip()
+        platform_category = link.evaluate("el => [...(el.closest('tr') || el.parentElement).querySelectorAll('a[href*=typeid]')].map(n => n.innerText).join(' / ')") or ""
     except Exception:
         return None
     if not tid or not title_text or tid in notified:
         return None
-    return {"id": tid, "title": title_text, "url": abs_url}
+    return {"id": tid, "title": title_text, "url": abs_url, "platform_category": platform_category}
 
 
 def _collect_thread_candidates_from_dom(page, args: argparse.Namespace, notified: set[str]) -> list[dict[str, Any]]:

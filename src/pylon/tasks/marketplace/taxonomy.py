@@ -5,7 +5,7 @@ VERSION = 2
 # Order is intentional: specific accessories precede the devices they fit.
 RULES = [
     ('accessory.phone_case', '配件/保护/手机壳', r'手机壳|保护壳|防摔壳|(?:iPhone|苹果|三星|小米).{0,16}(?:壳|边框套)'),
-    ('accessory.film', '配件/保护/贴膜', r'钢化膜|贴膜|屏幕膜'),
+    ('accessory.film', '配件/保护/贴膜', r'钢化膜|贴膜|屏幕膜|镜头膜'),
     ('accessory.stand', '配件/支撑/支架', r'支架|显示器臂|升降臂'),
     ('accessory.charger', '配件/供电/充电器', r'充电头|充电器|氮化镓|GaN\b'),
     ('accessory.powerbank', '配件/供电/充电宝', r'充电宝|移动电源'),
@@ -90,7 +90,7 @@ RULES = [
     ('audio.player', '音频/前端/播放器', r'播放器|Walkman|随身听'),
     ('audio.mic', '音频/录制/麦克风与声卡', r'麦克风|话筒|声卡|录音笔'),
     ('camera.body', '影像/摄影/相机机身', r'相机|微单|单反|(?<![A-Za-z0-9])[AZR]\d{1,2}(?:CR|[CRS](?:M\d|III|II|IV|V|\d)?|M\d|III|II|IV|V)?(?![A-Za-z0-9])'),
-    ('camera.lens', '影像/摄影/镜头', r'镜头|\d{2,3}-\d{2,3}\s*(?:mm|F)|定焦|变焦'),
+    ('camera.lens', '影像/摄影/镜头', r'镜头(?!膜|盖|保护)|\d{2,3}-\d{2,3}\s*(?:mm|F)|定焦|变焦'),
     ('camera.action', '影像/摄像/运动与全景相机', r'GoPro|Insta360|影石|运动相机|全景相机|Osmo\s*Action'),
     ('camera.pocket', '影像/摄像/口袋云台相机', r'Pocket|口袋相机'),
     ('camera.drone', '影像/航拍/无人机', r'无人机|御\s*\d|Mavic|DJI\s*(?:Mini|Air|Avata)'),
@@ -178,3 +178,43 @@ def hierarchy() -> dict:
         item=result[group]['types'].setdefault(kind,{'label':name,'categories':[]})
         item['categories'].append(key)
     return result
+
+
+BASE_CATEGORIES = dict(CATEGORIES)
+EXTENSIONS = {}
+
+
+def catalog(content=None):
+    result=dict(BASE_CATEGORIES)
+    for key,value in (content or {}).items():
+        if not value.get('target') and value.get('parent') in GROUPS:
+            result[key]=GROUPS[value['parent']]+'/'+value['name']+'/'+value['name']
+    return result
+
+
+def refresh_extensions(content=None):
+    if content is None:
+        from .control import current
+        active=current()
+        content=active[1].get('taxonomy',{}) if active else {}
+    EXTENSIONS.clear()
+    CATEGORIES.clear();CATEGORIES.update(BASE_CATEGORIES)
+    for key,value in content.items():
+        if value.get('parent') not in GROUPS or not key.startswith(value['parent']+'.ext_'):
+            continue
+        target=value.get('target') or key
+        if target!=key and target not in BASE_CATEGORIES:continue
+        EXTENSIONS[key]=value
+        if target==key:CATEGORIES[key]=GROUPS[value['parent']]+'/'+value['name']+'/'+value['name']
+
+
+def extension_category(text):
+    hits=[]
+    for key,value in EXTENSIONS.items():
+        for term in value.get('terms',[]):
+            if term in text:
+                hits.append((value.get('target') or key,term));break
+    return hits[0] if len({key for key,_ in hits})==1 else None
+
+
+refresh_extensions()

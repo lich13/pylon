@@ -13,8 +13,22 @@ from .store import Store
 from .sources import browser, list_page, detail, refill, HistoryUnavailable
 
 
+def history_posts(path: Path) -> list[dict]:
+    if not path.exists():return []
+    result=[]
+    with sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True) as db:
+        for (payload,) in db.execute('SELECT payload FROM delivery_queue ORDER BY created_at,dedupe_key'):
+            try:
+                value=json.loads(payload)
+                text=value.get('text','') if isinstance(value,dict) else str(value)
+            except (ValueError,TypeError):text=str(payload)
+            for line in text.splitlines():
+                m=re.match(r'^\s*\d+\.\s+\[(.+?)\]\((https?://[^)]+)\)(?:\s+摘要：)?(.*)$',line)
+                if m:result.append({'title':m[1],'url':m[2],'body_excerpt':m[3]})
+    return result
+
+
 def import_existing(store: Store, root: Path) -> dict:
-    from pylon.tasks.chiphell.categories import history_posts
     chh = history_posts(root/'profiles/webops/data/chiphell_fid26/delivery.sqlite3')
     for post in chh:
         match = re.search(r'(?:thread-|tid=)(\d+)',post['url'])

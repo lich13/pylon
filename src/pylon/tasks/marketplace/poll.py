@@ -75,13 +75,8 @@ def main() -> int:
     deadline=time.monotonic()+180
     with ThreadPoolExecutor(max_workers=4,thread_name_prefix='marketplace-source') as pool:
         futures={pool.submit(poll_source,store,source,deadline):source for source in ('v2ex','chiphell','nga')}
-        futures[pool.submit(enrich.run_pending,store)]='enrichment'
         for future in as_completed(futures):
             source=futures[future]
-            if source=='enrichment':
-                future.result()
-                count+=pipeline.process(store)
-                continue
             source_errors=future.result() or []
             errors.extend(source_errors)
             record_health(store,source,source_errors)
