@@ -342,7 +342,7 @@ def validate(value: dict, post: dict) -> list[dict]:
     # A shared link must not secretly be another product's individual link.
     # For a single item, a whole-post link and an item link have the same owner.
     for link in shared:
-        if len(output)>1 and any(urls[link] in lines[i] for i in claimed):
+        if len(output)>1 and any(urls[link] in links(lines[i]) for i in claimed):
             raise AnalysisError('item_link_marked_shared')
     for i,line in enumerate(lines):
         if i in claimed or i in common or i in ignored:

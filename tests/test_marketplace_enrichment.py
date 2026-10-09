@@ -198,6 +198,10 @@ def test_marketplace_link_prefix_does_not_prove_item_ownership():
     value=answer();value['shared_link_ids']=['L1'];value['items'][0]['link_ids']=['L1']
     with pytest.raises(enrich.AnalysisError,match='unbound_item_link'):
         enrich.validate(value,post)
+    value['items'][0]['link_ids']=[]
+    items=enrich.validate(value,post)
+    assert items[0]['attributes']['links']==['https://example.invalid/details-other']
+    assert all(item['attributes']['shared_links']==['https://example.invalid/details'] for item in items)
 
 
 def test_marketplace_analysis_restart_cache_and_delivery_once(tmp_path,monkeypatch):
