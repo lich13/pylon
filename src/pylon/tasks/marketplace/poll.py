@@ -47,22 +47,29 @@ def poll_source(store: Store, source: str, deadline: float) -> list[str]:
     return errors
 
 
-def record_health(store: Store, source: str, errors: list[str]) -> None:
+def collection_progress(store: Store, source: str) -> tuple:
+    with store.box.connect() as db:
+        return tuple(db.execute('''SELECT count(*),coalesce(sum(body_complete),0),coalesce(max(first_seen),0)
+            FROM marketplace_posts WHERE source=? AND history=0''',(source,)).fetchone())
+
+
+def record_health(store: Store, source: str, errors: list[str], *, before: tuple | None = None) -> None:
+    from pylon.tasks.intelligence.health import record
     now = time.time()
     name='live:health:'+source
     previous = store.checkpoint(name) or {}
-    if errors:
-        since = previous.get('since',now)
-        failures = int(previous.get('failures',0))+1
-        alerted = bool(previous.get('alerted'))
-        if not alerted and failures>=5 and now-since>=1800:
-            store.box.enqueue(profile='webops',job_id='marketplace-poll',kind='text',
-                payload={'text':'二手交易监控持续异常：'+','.join(errors)+'。其他来源和已入队通知继续处理。'},
-                key='marketplace-fault:'+source+':'+str(since))
-            alerted = True
-        store.checkpoint(name,{'since':since,'failures':failures,'alerted':alerted,'errors':errors,'at':now})
-    else:
-        store.checkpoint(name,{'failures':0,'at':now})
+    current=collection_progress(store,source)
+    baseline=before if before is not None else previous.get('collected',current)
+    progressed=any(new>old for new,old in zip(current,baseline))
+    with store.box.connect() as db:
+        pending=db.execute('''SELECT count(*) FROM marketplace_posts WHERE source=? AND history=0
+            AND status IN ('pending_body','refresh_required')''',(source,)).fetchone()[0]
+    # A failed poll itself is unfinished collection work. Successfully collected
+    # posts still count as progress when another page or body failed this round.
+    record(store.box,'marketplace:'+source+':collection',backlog=max(pending,int(bool(errors))),
+           progress=progressed or not errors,error=';'.join(errors),now=now)
+    store.checkpoint(name,{'failures':int(previous.get('failures',0))+1 if errors else 0,
+                          'errors':errors,'at':now,'collected':current})
 
 
 def main() -> int:
@@ -73,13 +80,14 @@ def main() -> int:
     errors=[]
     count=pipeline.process(store)
     deadline=time.monotonic()+180
+    before={source:collection_progress(store,source) for source in ('v2ex','chiphell','nga')}
     with ThreadPoolExecutor(max_workers=4,thread_name_prefix='marketplace-source') as pool:
         futures={pool.submit(poll_source,store,source,deadline):source for source in ('v2ex','chiphell','nga')}
         for future in as_completed(futures):
             source=futures[future]
             source_errors=future.result() or []
             errors.extend(source_errors)
-            record_health(store,source,source_errors)
+            record_health(store,source,source_errors,before=before[source])
             # Queue this source immediately, without waiting for NGA's browser.
             count+=pipeline.process(store,source=source)
     events.result('failed' if errors else 'ok' if count else 'no_change',
