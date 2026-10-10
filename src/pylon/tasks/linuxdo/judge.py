@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from . import policy
 from .common import URL_RE, availability_position, clean, digest, safe_url, timestamp
 
-PROMPT_VERSION = 'intelligence-value-v4-evidenced-purpose'
+PROMPT_VERSION = 'intelligence-value-v5-conditional-benefit'
 FACT_KINDS = ['resource', 'method', 'capability', 'price', 'billing_period', 'configuration',
               'region', 'eligibility', 'renewal', 'availability', 'condition', 'correction']
 CHANGE_KINDS = ['initial', 'new_resource', 'new_method', 'restocked', 'correction', 'none']
@@ -143,6 +143,10 @@ change_kind=restocked/correction 必须有 evidence 明确证明这次新变化�
         instructions=instructions.replace('个人 Linux.do 信息筛选器','个人情报筛选器')
         instructions=instructions.replace('标题、标签和热度不能证明价值。','Helper 摘要与标题可以证明其中明确写出的事实；标签和热度不能证明价值。')
         instructions=instructions.replace('证据充分、有具体收益或可复用行动','有原文依据的具体收益、资源、可复用方法或能力变化')
+        instructions=instructions.replace('G1/G2 福利必须收益明确且全国/北京可用，普通会员、账号、游戏、素材等仍按具体排除类别。',
+            'G1/G2 只接收有明确收益的北京本地福利或全国性平台线上活动。线上活动没有地区限定时可作为未核验线索；本地服务及依赖地区资格的活动仍须确认北京或全国可用。普通会员、账号、游戏、素材等仍按具体排除类别。')
+        instructions=instructions.replace('同样只关注北京/全国。',
+            '地域边界与G1/G2相同；一般线上活动不能仅因摘要省略适用地区而hold，明确外地限定仍排除。')
         instructions=instructions.replace('云主机需官方证据证明配置、地域、实付价格、周期和参与资格；正文只给广告或官方页缺关键事实则 hold。',
             '云主机仅接收明确为所选厂商官方活动的线索，个人转售仍排除。摘要明确写出具体配置、优惠或资源即可作为“原帖称”的线索；缺少周期、资格和官方验证须列入 missing_evidence，不编造或宣称已核验。')
         instructions=instructions.replace('action 是原文明示的下一步','action 优先使用原文明示的下一步；没有步骤时写“查看原帖确认参与条件”，不得仅因缺少教程步骤、入口或完整资格细则而 hold；只有收益本身不明确或可能影响已设置限制的条件不明才 hold。其他缺失写入 missing_evidence。action')
@@ -161,6 +165,8 @@ change_kind=restocked/correction 必须有 evidence 明确证明这次新变化�
 Opus/Sonnet/Haiku在明确模型、API、额度语境中是Claude模型系列；提取其中命中目标的资源，不把同帖非目标模型一起推荐。
 公益接入或额度未说明支持什么模型时，用A类hold并写明缺少模型身份，不能直接判成已明确的非目标模型。
 全国性平台的线上活动明确写面向该平台用户且未限定地区时，可以作为收益线索push；适用地区未明就列missing_evidence，不宣称已核实全国可用。明确外地限定活动仍排除；到店、本地服务及地区资格必需的活动未知地区仍hold。
+线上话费、银行支付等活动已说明可执行入口或支付方式，并明确有立减、返现、赠送等收益时，收益性质已经明确。未设置最低收益门槛时，不要求知道每个账号的具体减免额；“部分账号有”“以支付页为准”是需要提醒的适用条件，不是hold理由。未知减免额、命中账号和一般线上活动地区放入missing_evidence，仍可push；不得承诺本人一定能享受或全国均可用。
+例如“平台搜索10元话费，银行卡支付，部分账号有立减”是I2话费收益线索；10元是充值面额而非优惠金额。可按原帖称描述操作及部分账号立减，提醒支付前核对减免，不可因为缺少优惠金额、完整账号资格或未写全国而hold。只有“去看看有无优惠”而没有实际收益陈述时才hold。
 skip/hold前逐项检查：是否已有具体收益/资源/方法/能力变化，是否确实违反已选限制。只有会改变关注决定的缺项才hold；不能因为摘要省略完整操作流程而hold。'''
     return instructions + '\n不可信输入数据：\n' + json.dumps(data, ensure_ascii=False)
 
