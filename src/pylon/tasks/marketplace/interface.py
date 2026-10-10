@@ -271,6 +271,15 @@ def check_post(db,url):
            '内容：'+('Helper 摘要（不补抓原帖）' if __import__('pylon.tasks.marketplace.content_quality',fromlist=['evidence_scope']).evidence_scope(dict(row))=='helper_excerpt' else '完整正文' if row['body_complete'] else '正文缺失或不完整')]
     if row['platform_category']:lines.append('原站分类：'+row['platform_category'])
     decision=json.loads(row['decision'] or '{}')
+    if decision:
+        from .classifier import VERSION
+        stamp=decision.get('at')
+        if isinstance(stamp,(int,float)):
+            lines.append('上次判断：'+datetime.fromtimestamp(stamp,ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')+'（北京时间）')
+        recorded_version=decision.get('parser_version')
+        if recorded_version!=VERSION:
+            lines.append('规则更新前的历史判断；下列分类是当时的结果，不代表当前规则。保留投递记录，不会自动重发。')
+        if recorded_version is not None:lines.append(f'识别版本：{recorded_version}（当前 {VERSION}）')
     for item in decision.get('items',[]):lines.append(taxonomy.CATEGORIES.get(item['category'],'未归类')+'：'+('、'.join(item['reasons']) or '符合关注条件'))
     if row['error']:lines.append('处理原因：'+row['error'][:150])
     if row['event_id']:

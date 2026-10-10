@@ -16,7 +16,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from pylon.outbox import Outbox
-from pylon.tasks.marketplace import control, web, web_auth
+from pylon.tasks.marketplace import classifier, control, web, web_auth
 from pylon.tasks.marketplace.store import Store
 
 
@@ -387,3 +387,76 @@ def test_apply_is_idempotent_and_does_not_create_another_active_version(web_harn
     with web_harness.store.box.connect() as db:
         assert db.execute("SELECT COUNT(*) FROM market_versions").fetchone()[0] == 2
         assert db.execute("SELECT version FROM market_active WHERE id=1").fetchone()[0] == first_payload["version"]
+
+
+@pytest.mark.parametrize("audit", ["legacy", "current", "missing"])
+def test_check_post_displays_audit_metadata_without_mutating_posts_or_events(
+    web_harness: WebHarness, audit: str
+):
+    _seed_post(web_harness.store, "1203")
+    decision = {}
+    if audit != "missing":
+        recorded_version = classifier.VERSION - 1 if audit == "legacy" else classifier.VERSION
+        decision = {
+            "at": 1704067200,
+            "parser_version": recorded_version,
+            "items": [{"category": "phone.smartphone", "reasons": ["合成判断"]}],
+        }
+
+    with web_harness.store.box.connect() as db:
+        db.execute(
+            "UPDATE marketplace_posts SET decision=? WHERE source='v2ex' AND source_id='1203'",
+            (json.dumps(decision, ensure_ascii=False),),
+        )
+        event_id = web_harness.store.box.enqueue(
+            profile="webops",
+            job_id="marketplace-test",
+            kind="text",
+            payload={"text": "合成投递"},
+            key=f"marketplace-check:{audit}",
+            connection=db,
+        )
+        db.execute(
+            "UPDATE marketplace_posts SET event_id=? WHERE source='v2ex' AND source_id='1203'",
+            (event_id,),
+        )
+    web_harness.store.box.finish(event_id, "delivered", receipt=[{"message_id": 1203, "chat_id": 1}])
+
+    with web_harness.store.box.connect() as db:
+        before_post = dict(
+            db.execute(
+                "SELECT * FROM marketplace_posts WHERE source='v2ex' AND source_id='1203'"
+            ).fetchone()
+        )
+        before_events = [dict(row) for row in db.execute("SELECT * FROM events ORDER BY id")]
+
+    csrf = _login(web_harness)
+    assert csrf
+    response = web_harness.client.get(
+        f"{API}/check", params={"url": "https://www.v2ex.com/t/1203"}
+    )
+    assert response.status_code == 200, response.text
+    text = response.json()["text"]
+    assert "投递状态：Telegram 已回执" in text
+    if audit == "legacy":
+        assert "上次判断：2024-01-01 08:00:00（北京时间）" in text
+        assert "规则更新前的历史判断；下列分类是当时的结果，不代表当前规则。保留投递记录，不会自动重发。" in text
+        assert f"识别版本：{classifier.VERSION - 1}（当前 {classifier.VERSION}）" in text
+    elif audit == "current":
+        assert "上次判断：2024-01-01 08:00:00（北京时间）" in text
+        assert f"识别版本：{classifier.VERSION}（当前 {classifier.VERSION}）" in text
+        assert "规则更新前的历史判断" not in text
+    else:
+        assert "上次判断：" not in text
+        assert "识别版本：" not in text
+        assert "规则更新前的历史判断" not in text
+
+    with web_harness.store.box.connect() as db:
+        after_post = dict(
+            db.execute(
+                "SELECT * FROM marketplace_posts WHERE source='v2ex' AND source_id='1203'"
+            ).fetchone()
+        )
+        after_events = [dict(row) for row in db.execute("SELECT * FROM events ORDER BY id")]
+    assert after_post == before_post
+    assert after_events == before_events
