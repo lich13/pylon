@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from . import policy
 from .common import URL_RE, availability_position, clean, digest, safe_url, timestamp
 
-PROMPT_VERSION = 'linuxdo-value-v2-20261009-helper'
+PROMPT_VERSION = 'intelligence-value-v4-evidenced-purpose'
 FACT_KINDS = ['resource', 'method', 'capability', 'price', 'billing_period', 'configuration',
               'region', 'eligibility', 'renewal', 'availability', 'condition', 'correction']
 CHANGE_KINDS = ['initial', 'new_resource', 'new_method', 'restocked', 'correction', 'none']
@@ -122,6 +122,7 @@ A 类资源仅 GPT/Claude/Grok/Gemini。B1 Codex，B2 Claude Code，B3 仅 Grok 
 同一内容按具体类别优先，禁止把关闭的效率软件、数码交易、DNS/CDN证书、安全故障新闻套入 C1 开源项目、D1 或 G1 绕过排除。
 H1/H3-H8 是纯资源/促销排除倾向，提及相关产品的实用开发运维方法可按其具体技术类别判断。
 G1/G2 福利必须收益明确且全国/北京可用，普通会员、账号、游戏、素材等仍按具体排除类别。
+I1/I2/I3 是 G1/G2 中银行支付、缴费和出行福利的细分，同样只关注北京/全国。原文明确的适用地区以 region 事实保留，不把作者所在地当适用范围；未知地区只能写未知，不能宣称全国可用。
 H2 仅腾讯云/阿里云官方云服务器和轻量服务器促销，包含香港和海外。域名、代理转售、普通标价、只写“低至”都 skip。
 云主机需官方证据证明配置、地域、实付价格、周期和参与资格；正文只给广告或官方页缺关键事实则 hold。
 没有具体可用方法/资源/能力变化的工具介绍、版本号新闻和个人报错不能 push。关闭 E4，不推纯安全、兼容性或故障资讯。
@@ -138,6 +139,29 @@ source_published_at 是频道消息发布时间，observed_at 是采集时间；
 change_kind=restocked/correction 必须有 evidence 明确证明这次新变化。初次推送用 initial。
 更晚的原帖回复明确再次补货时，即使恢复的额度相同，也可作为 restocked；同一回复的跨频道转载仍是同一事件。
 所有 URL 必须来自 evidence 提供的链接。不要输出 token、密码、邮箱地址或账号凭据。只返回符合 Schema 的 JSON。'''
+    if snapshot.get('lead_mode'):
+        instructions=instructions.replace('个人 Linux.do 信息筛选器','个人情报筛选器')
+        instructions=instructions.replace('标题、标签和热度不能证明价值。','Helper 摘要与标题可以证明其中明确写出的事实；标签和热度不能证明价值。')
+        instructions=instructions.replace('证据充分、有具体收益或可复用行动','有原文依据的具体收益、资源、可复用方法或能力变化')
+        instructions=instructions.replace('云主机需官方证据证明配置、地域、实付价格、周期和参与资格；正文只给广告或官方页缺关键事实则 hold。',
+            '云主机仅接收明确为所选厂商官方活动的线索，个人转售仍排除。摘要明确写出具体配置、优惠或资源即可作为“原帖称”的线索；缺少周期、资格和官方验证须列入 missing_evidence，不编造或宣称已核验。')
+        instructions=instructions.replace('action 是原文明示的下一步','action 优先使用原文明示的下一步；没有步骤时写“查看原帖确认参与条件”，不得仅因缺少教程步骤、入口或完整资格细则而 hold；只有收益本身不明确或可能影响已设置限制的条件不明才 hold。其他缺失写入 missing_evidence。action')
+        data['source']=snapshot.get('source','linuxdo')
+        data['evidence_scope']=snapshot.get('evidence_scope','excerpt')
+        data['correction']=snapshot.get('analysis_correction','')
+        instructions+='\n这是独立的公共情报筛选；出售、求购、转让、代充、出租、拼车的报价不得作为福利情报再次推送。混合帖只摘独立于个人交易的资源或方法。'
+        instructions+='\n输入是有限摘要，禁止联网或补抓。只能复述已有依据；优惠、经验及未官方核验的能力必须写成“原帖称”，不能升级为事实保证。'
+        instructions+='''
+先按这段内容实际提供的用途分类，再判断关注范围；不要按标题中出现的软件名或设备名一票否决。
+纯桌面效率软件推荐仍属F1；但有具体步骤或机制的便携部署、服务注册、第三方接入和登录方法，按B2/D1/E3等实际方法分类。
+双网卡、代理出口绑定、包管理器分流等是E2/D3技术方法，不是F3硬件导购。无需公开源码才能说明可复用思路。
+开源开发工具的新登录方式、插件机制、多目录工作区等具体能力，按C1/B4等判断；B3只收Grok Build，不代表其他开源开发方法都被禁用。
+仅有名称、版本或宣传的介绍仍排除。已说明解决什么问题、具体如何实现或新增什么能力的摘要，即使项目地址、完整代码、安装步骤被截断，也可以push并附原帖；把缺少的信息写入missing_evidence，不能因缺少链接或项目专名改判hold。
+目标模型的可用额度、费用和历史资格变化属于A4能力/成本事实；标题是问句、讨论或政策新闻不决定content_type。正文给出明确额度、资格与日期差异时可push，按“原帖称”复述，禁止扩大为已官方核实。
+Opus/Sonnet/Haiku在明确模型、API、额度语境中是Claude模型系列；提取其中命中目标的资源，不把同帖非目标模型一起推荐。
+公益接入或额度未说明支持什么模型时，用A类hold并写明缺少模型身份，不能直接判成已明确的非目标模型。
+全国性平台的线上活动明确写面向该平台用户且未限定地区时，可以作为收益线索push；适用地区未明就列missing_evidence，不宣称已核实全国可用。明确外地限定活动仍排除；到店、本地服务及地区资格必需的活动未知地区仍hold。
+skip/hold前逐项检查：是否已有具体收益/资源/方法/能力变化，是否确实违反已选限制。只有会改变关注决定的缺项才hold；不能因为摘要省略完整操作流程而hold。'''
     return instructions + '\n不可信输入数据：\n' + json.dumps(data, ensure_ascii=False)
 
 
@@ -210,25 +234,32 @@ def validate_result(value: dict, snapshot: dict, config: dict) -> dict:
     if covered_by_personal(snapshot, result['facts']):
         result.update(decision='skip', reason='同一帖子已通过个人提醒通知')
         return result
-    if value['content_type'] in {'question', 'chatter', 'news', 'advertisement'}:
+    ignored_types={'question','chatter','advertisement'} | (set() if snapshot.get('lead_mode') else {'news'})
+    if value['content_type'] in ignored_types:
         result.update(decision='skip', reason='没有明确可用资源或方法')
-    elif not result['facts'] or not result['reason'] or not result['action'] or value['missing_evidence']:
+    elif not result['facts'] or not result['reason'] or (not snapshot.get('lead_mode') and (not result['action'] or value['missing_evidence'])):
         result.update(decision='hold', reason='推送所需证据不完整')
-    elif not any(f['kind'] in {'resource', 'method', 'capability', 'availability', 'correction', 'price'} for f in result['facts']):
+    elif not any(f['kind'] in {'resource', 'method', 'capability', 'availability', 'correction', 'price'} or
+                 snapshot.get('lead_mode') and f['category']=='A4' and f['kind'] in {'eligibility','condition'}
+                 for f in result['facts']):
         result.update(decision='hold', reason='没有具体价值事实')
     if result['decision'] != 'push':
         return result
     # A named product category cannot be justified by an unrelated product mention.
-    identities = {'B1': r'\bcodex\b', 'B2': r'claude\s*code|\bCC\b',
-                  'B3': r'\bgrok\s*build\b'}
+    identities = {'B1': r'(?<![A-Za-z])codex(?![A-Za-z])',
+                  'B2': r'claude\s*code|(?<![A-Za-z])CC(?![A-Za-z])',
+                  'B3': r'(?<![A-Za-z])grok\s*build(?![A-Za-z])'}
     for category, pattern in identities.items():
         core = [f for f in result['facts'] if f['category'] == category]
         if core and not any(re.search(pattern, refs[c['ref']]['title'] + '\n' + c['quote'], re.I)
                             for f in core for c in f['evidence']):
             result.update(decision='hold', reason='具体工具身份缺少原文依据')
     ai_resources = [f for f in result['facts'] if f['category'].startswith('A')]
-    if ai_resources and not any(re.search(r'\bgpt\b|chatgpt|claude|grok|gemini',
-                                         refs[c['ref']]['title'] + '\n' + c['quote'], re.I)
+    def target_model(text):
+        return bool(re.search(r'(?<![A-Za-z])gpt(?=\d|[^A-Za-z]|$)|chatgpt|claude|grok|gemini',text,re.I) or
+                    re.search(r'(?<![A-Za-z])(?:opus|sonnet|haiku)(?=\d|[^A-Za-z]|$)',text,re.I) and
+                    re.search(r'模型|额度|倍率|官渠|接入|\bapi\b|tokens?',text,re.I))
+    if ai_resources and not any(target_model(refs[c['ref']]['title']+'\n'+c['quote'])
                                for f in ai_resources for c in f['evidence']):
         result.update(decision='hold', reason='目标模型资源缺少原文依据')
     if 'H2' in result['categories']:
@@ -242,11 +273,11 @@ def validate_result(value: dict, snapshot: dict, config: dict) -> dict:
             result.update(decision='skip', reason='厂商不在主机促销关注范围')
         elif config['cloud_regions'] == 'mainland' and value['region_scope'] != 'mainland':
             result.update(decision='skip', reason='主机地域不匹配')
-        elif not required <= official_kinds:
+        elif not snapshot.get('lead_mode') and not required <= official_kinds:
             result.update(decision='hold', reason='缺少可核验的官方主机促销条件')
         else:
             official_quotes = ' '.join(c['quote'] for fact in cloud_facts for c in fact['evidence']
-                                       if refs[c['ref']]['origin'] == 'official')
+                                       if snapshot.get('lead_mode') or refs[c['ref']]['origin'] == 'official')
             if not re.search(r'活动|限时|优惠|特惠|促销|首年|新客|折扣|立减|返券|免费|discount|promotion|free trial', official_quotes, re.I):
                 result.update(decision='hold', reason='尚未证明实际促销权益')
     if snapshot['previously_notified']:

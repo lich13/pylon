@@ -63,9 +63,11 @@ class XianbaoClassificationTests(unittest.TestCase):
                     patch.object(worker, "fetch_json_cached", return_value=([post], {})),
                     patch.object(worker, "classify", return_value=decision),
                     patch.object(worker, "push") as push,
-                    patch.object(worker.sqlite3, "connect", side_effect=AssertionError("unexpected external database")),
                     patch.dict(sys.modules, {"xianbao_model_review": None, "openai": None}),
-                    patch.dict(os.environ, {"XIANBAO_MODEL_REVIEW_MAX_PER_POLL": "100"}),
+                    patch.dict(os.environ, {
+                        "XIANBAO_MODEL_REVIEW_MAX_PER_POLL": "100",
+                        "PYLON_OUTBOX": str(data_dir / "outbox.sqlite3"),
+                    }),
                 ):
                     sent = worker.process_once(rules, db, data_dir, True, False, False, 62)
                 self.assertEqual(sent, 0)

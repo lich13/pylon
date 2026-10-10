@@ -121,6 +121,8 @@ def status_text() -> str:
         lines.append('软件更新提炼状态暂不可读：' + redact(str(exc))[:160])
     from .tasks.quotes.health import status_text as quote_status
     lines.append(quote_status(box=box))
+    from .tasks.intelligence.pipeline import summary as intel_summary
+    lines.append(intel_summary(box))
     return "\n".join(lines)
 
 
@@ -303,6 +305,10 @@ def handle(profile: str, text: str) -> str:
             return help_text(name)
         if not item.argument and argument:
             raise ValueError('此操作不接受参数；用法：' + item.usage)
+        if item.route == 'intel':
+            from .tasks.marketplace.web_auth import login_card
+            result=login_card(profile,workspace='intel')
+            return encode_response(result['text'],result.get('reply_markup'))
         if item.route == 'market':
             from .tasks.marketplace import interface
             result=interface.command(profile,argument)

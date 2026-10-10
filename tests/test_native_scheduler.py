@@ -26,12 +26,20 @@ from pylon.admin import control as admin, ssh
 
 def test_all_jobs_keep_schedule_and_native_catchup():
     catalog = json.loads((ROOT / 'jobs.json').read_text())
-    for job_id, command in [('b7a84d1d9f21', 'collect'), ('linuxdo-review', 'review')]:
+    for job_id, args in [
+        ('b7a84d1d9f21', ['collect']),
+        ('linuxdo-review', ['review', '--limit', '100']),
+    ]:
         job = catalog[job_id]
         assert job['module'] == 'pylon.tasks.linuxdo'
-        assert job['args'] == [command]
+        assert job['args'] == args
         assert job['schedule'] == '* * * * *'
         assert job['deliver'] is False
+    assert catalog['linuxdo-review']['timeout'] == 360
+    assert catalog['intelligence-review']['module'] == 'pylon.tasks.intelligence'
+    assert catalog['intelligence-review']['args'] == ['review', '--limit', '2']
+    assert catalog['intelligence-review']['schedule'] == '* * * * *'
+    assert catalog['intelligence-review']['timeout'] == 600
     for key, job in catalog.items():
         unit = bootstrap.timer_text(key, job)
         assert f'Unit=pylon-task@{key}.service' in unit

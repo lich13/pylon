@@ -173,19 +173,8 @@ class Store:
                 db.execute('INSERT INTO linuxdo_sources(channel,checkpoint) VALUES(?,?)', (channel, '{}'))
                 row = db.execute('SELECT * FROM linuxdo_sources WHERE channel=?', (channel,)).fetchone()
             failures = row['failures'] + 1 if error else 0
-            opened = bool(row['alert_open'])
-            if error and failures >= 3 and not opened:
-                self.box.enqueue(profile='webops', job_id=JOB_ID, kind='text', connection=db,
-                                 payload={'text': f'Linux.do 来源 {channel} 连续采集失败，其他来源继续运行。'},
-                                 key=f'linuxdo:source:{channel}:failed:{int(now)}')
-                opened = True
-            elif not error and opened:
-                self.box.enqueue(profile='webops', job_id=JOB_ID, kind='text', connection=db,
-                                 payload={'text': f'Linux.do 来源 {channel} 已恢复。'},
-                                 key=f'linuxdo:source:{channel}:recovered:{int(now)}')
-                opened = False
             db.execute('UPDATE linuxdo_sources SET failures=?,error=?,alert_open=? WHERE channel=?',
-                       (failures, error[:100], int(opened), channel))
+                       (failures, error[:100], 0, channel))
 
     def claim(self, *, limit: int = 4, now: float | None = None, source: str = '') -> list[str]:
         now = time.time() if now is None else now
@@ -353,19 +342,11 @@ class Store:
                     WHERE n.topic_id=linuxdo_topics.topic_id AND e.status<>'suppressed')''')
 
     def health(self, component: str, failed: bool) -> None:
+        from pylon.tasks.intelligence.health import record
         with self.box.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            name = 'health:' + component
-            row = db.execute('SELECT value FROM linuxdo_meta WHERE key=?', (name,)).fetchone()
-            current = json.loads(row[0]) if row else {'failures': 0, 'open': False}
-            current['failures'] = current['failures'] + 1 if failed else 0
-            transition = 'failed' if failed and current['failures'] >= 3 and not current['open'] else 'recovered' if not failed and current['open'] else ''
-            if transition:
-                current['open'] = transition == 'failed'
-                text = 'Linux.do 价值判断连续失败，候选已保留，等待恢复。' if failed else 'Linux.do 价值判断已恢复，继续处理保留的候选。'
-                self.box.enqueue(profile='webops', job_id=JOB_ID, kind='text', payload={'text': text},
-                                 key=f'linuxdo:health:{component}:{transition}:{time.time_ns()}', connection=db)
-            db.execute('INSERT OR REPLACE INTO linuxdo_meta VALUES(?,?)', (name, json.dumps(current)))
+            backlog=db.execute("SELECT count(*) FROM linuxdo_topics WHERE historical=0 AND status IN ('pending','hold')").fetchone()[0]
+        record(self.box,'linuxdo:'+component,backlog=backlog,progress=not failed,
+               error='processing unavailable' if failed else '')
 
     def export_legacy(self, original: dict) -> dict:
         result = dict(original)

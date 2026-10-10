@@ -1,5 +1,29 @@
 """Known page furniture is not authored trading evidence."""
 import re
+import json
+
+
+def helper_revision(post):
+    """Bind asynchronous analysis to the exact Helper evidence revision."""
+    context=post.get('source_context') or {}
+    if isinstance(context,str):
+        try:context=json.loads(context)
+        except ValueError:context={}
+    return [context.get('snapshot',{}).get('fingerprint',''),bool(context.get('helper_stale'))]
+
+
+def evidence_scope(post):
+    if post.get('source') != 'linuxdo':
+        return 'forum_body' if post.get('body_complete') else 'title'
+    context = post.get('source_context') or {}
+    if isinstance(context,str):
+        try:context=json.loads(context)
+        except ValueError:context={}
+    return 'helper_excerpt' if context.get('evidence_scope')=='helper_excerpt' else 'forum_body' if post.get('body_complete') else 'title'
+
+
+def usable(post):
+    return bool(post.get('body')) and (bool(post.get('body_complete')) or evidence_scope(post)=='helper_excerpt')
 
 
 def contamination(source, title, body):

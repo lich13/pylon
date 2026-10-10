@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS market_web_sessions (
 CREATE TABLE IF NOT EXISTS market_web_applies (draft TEXT PRIMARY KEY, version INTEGER NOT NULL);
 '''
 COOKIE='pylon_market'
-COOKIE_PATH='/pylon/market/'
+COOKIE_PATH='/pylon/'
 
 
 def digest(token):
@@ -61,12 +61,18 @@ def public_url():
     return url.rstrip('/')+'/'
 
 
-def login_card(profile, *, store=None):
-    if profile!='webops':return {'text':'请在库库干使用 /market 打开交易筛选。'}
+def login_card(profile, *, store=None, workspace="market"):
+    if profile!='webops':return {'text':'请在库库干使用 /intel 打开情报筛选。' if workspace=='intel' else '请在库库干使用 /market 打开交易筛选。'}
     from .store import Store
     url=public_url();store=store or Store()
+    if workspace=='intel':
+        parsed=urlsplit(url);url=parsed.scheme+'://'+parsed.netloc+'/pylon/intel/'
+    elif workspace!='market':raise ValueError('工作区无效')
     with store.box.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         token=issue_login(db,profile)
+    if workspace=='intel':
+        return {'text':'情报关注\n展开分类，选择来源与排除词，预览后一次确认。\n登录链接 10 分钟内有效，仅可使用一次。',
+            'reply_markup':{'inline_keyboard':[[{'text':'打开情报筛选','url':url+'#login='+token}]]}}
     return {'text':'交易关注\n展开分类，批量筛选品牌、系列和型号，预览后一次确认。\n登录链接 10 分钟内有效，仅可使用一次。',
             'reply_markup':{'inline_keyboard':[[{'text':'打开交易筛选','url':url+'#login='+token}]]}}

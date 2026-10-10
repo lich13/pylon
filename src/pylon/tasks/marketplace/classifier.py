@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from .taxonomy import RULES, canonical
 
-VERSION = 13
+VERSION = 14
 from . import subjects
 
 PATTERNS = [(key, re.compile(pattern, re.I)) for key, _, pattern in RULES]
@@ -84,6 +84,9 @@ def _clean_subject(text: str) -> str:
 
 def category_for(text: str) -> tuple[str, str]:
     subject = _clean_subject(text)
+    service = subjects.service_subject(subject)
+    if service:
+        return 'virtual.service', service
     if '\n' in subject:
         heading = subject.split('\n',1)[0].strip()
         category, evidence = category_for(heading)
@@ -354,11 +357,15 @@ def _sale_parts(text: str, *, title: str = '') -> list[str]:
 
 
 def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete: bool = True,
-                     *, single_item: bool = False, platform_category: str = '') -> list[dict]:
+                     *, single_item: bool = False, platform_category: str = '',
+                     evidence_scope: str = '') -> list[dict]:
     result = []
     from .content_quality import contamination
-    if contamination(source,title,body):body_complete=False
-    if not body_complete:
+    if contamination(source,title,body):
+        body_complete=False
+        evidence_scope='invalid'
+    excerpt = source == 'linuxdo' and evidence_scope == 'helper_excerpt'
+    if not body_complete and not excerpt:
         body = ''
     # Normalise grouped amounts before segmentation, not after commas have
     # already split a table price into separate apparent products.
@@ -366,6 +373,10 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
                                           lambda m:m[0].replace(',', ''),text)
     title = normalise_amounts(title)
     body = normalise_amounts(_sale_body(body,source))
+    # A forwarded notice often starts with the complete title. It is one
+    # subject, not another priced sale separated by the title's city suffix.
+    if body.startswith(title) and title:
+        body = body[len(title):].lstrip(' \n，,。:：')
     blocks = ([(body or title, False)] if single_item else
               [(part, len(parts)>1 and bool(BUNDLE.search(block)))
                for block in _blocks(title, body) for parts in [_sale_parts(block,title=title)] for part in parts])
@@ -435,6 +446,11 @@ def classify_listing(title: str, body: str, source: str = 'v2ex', body_complete:
             'regional_service': 'regional_service' in locality.local_only_evidence,
             'excluded_device': is_excluded_device_deal(text),
             'body_complete': body_complete, 'bundle': bundle_only or shared_bundle or bool(BUNDLE.search(text)),
+            'evidence_scope': 'helper_excerpt' if excerpt else 'forum_body' if body_complete else 'title',
+            'subject_kind': 'service' if subjects.service_subject(identity_head) else 'entitlement' if category.startswith('virtual.') else 'goods',
+            'seller_regions': __import__('pylon.tasks.marketplace.locality',fromlist=['regions']).regions(' '.join(
+                c for c in context.splitlines() if re.search(r'卖家|所在地|发货地|本人在|人在',c))),
+            'usage_regions': __import__('pylon.tasks.marketplace.locality',fromlist=['service_regions']).service_regions(context) if canonical(category)=='virtual.service' else [],
             'bundle_only': bundle_only, 'bundle_price': bundle_price,
             'condition': '全新' if newness_evidence(text) else '二手/未注明',
             'brands': [brand for brand,pattern in (

@@ -15,7 +15,7 @@ from pylon.transport import DeliveryError
 
 
 def test_catalog_is_valid_chinese_and_has_detailed_help():
-    assert len(COMMANDS) == 20
+    assert len(COMMANDS) == 21
     assert len({row['command'] for row in menu_commands()}) == sum(item.menu for item in COMMANDS.values())
     assert [row['command'] for row in menu_commands()] == ['gmail', 'updates', 'monitors', 'add_monitor', 'remove_monitor', 'ssh_travel', 'agent_codex', 'agent_grok', 'update_codex', 'update_grok', 'help']
     assert 'gmail_feedback' not in {row['command'] for row in menu_commands()}
@@ -90,6 +90,8 @@ def test_every_menu_entry_reaches_its_existing_operation(name, monkeypatch):
         assert result == help_text('status')
     elif item.route == 'market':
         assert '库库干' in result and '/market' in result
+    elif item.route == 'intel':
+        assert '库库干' in result and '/intel' in result
     else:
         calls[item.route + '_text'].assert_called_once_with()
 
@@ -99,8 +101,12 @@ def test_market_command_and_menu_are_webops_only():
     default = menu_commands('default')
     assert 'market' in {row['command'] for row in webops}
     assert 'market' not in {row['command'] for row in default}
+    assert 'intel' in {row['command'] for row in webops}
+    assert 'intel' not in {row['command'] for row in default}
     assert 'market' in help_text(profile='webops')
     assert 'market' not in help_text(profile='default')
+    assert 'intel' in help_text(profile='webops')
+    assert 'intel' not in help_text(profile='default')
     assert '库库干' in commands.handle('default', '/market')
     assert '/market' in commands.handle('webops', '/help market')
 
@@ -274,7 +280,10 @@ def test_background_honors_retry_after_without_repeating_successful_bot(monkeypa
 
 @pytest.mark.parametrize('response', ['rate_limit', 'timeout'])
 def test_real_transport_metadata_failure_remains_retryable(response, monkeypatch):
-    monkeypatch.setattr(bot_menu, 'profile_env', lambda _: {'TELEGRAM_BOT_TOKEN': '123456789:SecretTokenWithEnoughCharacters123', 'TELEGRAM_HOME_CHANNEL': '123'})
+    monkeypatch.setattr(bot_menu, 'profile_env', lambda _: {
+        'TELEGRAM_BOT_TOKEN': '123456789:AA_fixture_token_for_transport_tests_000',
+        'TELEGRAM_HOME_CHANNEL': '123',
+    })
     def handler(request):
         if response == 'timeout':
             raise httpx.ReadTimeout('timeout', request=request)
@@ -284,7 +293,7 @@ def test_real_transport_metadata_failure_remains_retryable(response, monkeypatch
             bot_menu.synchronize('default', http=http)
     assert failure.value.status == 'pending'
     assert failure.value.delay == (55 if response == 'rate_limit' else 30)
-    assert 'SecretToken' not in str(failure.value)
+    assert 'fixture_token' not in str(failure.value)
 
 
 @pytest.mark.parametrize('value', ['/status', '/run 1', '/pause all', '/resume all', '/logs 1', '/outbox',

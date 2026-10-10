@@ -85,8 +85,8 @@ def decision(item: dict, policy: dict) -> tuple[str,list[str]]:
     if attrs.get('trade_intent_pending'):return 'review',['交易意图尚待确认']
     if item['status']!='available':return 'exclude',['不是在售商品']
     if attrs.get('excluded_device'):return 'exclude',['设备限制']
-    if attrs.get('transaction_scope') in {'non_beijing_local_only','unknown_region_local_only'}:
-        return 'exclude',['仅限非北京本地或地区未明']
+    if attrs.get('transaction_scope')=='unknown_region_local_only':return 'review',['region']
+    if attrs.get('transaction_scope')=='non_beijing_local_only':return 'exclude',['仅限非北京本地']
     if attrs.get('pickup_only') and not (attrs.get('beijing') and policy.get('allow_beijing_pickup',True)):
         return 'exclude',['自提地区不符合']
     state,reasons=attribute_decision(item,policy)

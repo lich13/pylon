@@ -3270,51 +3270,9 @@ def classify(post: dict[str, Any], rules: dict[str, Any], allow_terms: list[str]
 
 
 def push(post: dict[str, Any], decision: Decision, dry_run: bool) -> None:
-    title = str(post.get("title") or "线报酷")
-    content = str(post.get("body") or post.get("content") or "").strip()
-    if re.fullmatch(r"(rt|如题|如图|看图|图|1|一|无|空)", content, re.I):
-        content = ""
-    if len(content) > 420:
-        content = content[:420] + "..."
-    body = content or title
-    url = full_url(post)
-
-    if dry_run:
-        print(f"DRY-RUN push tier={decision.tier} score={decision.score} {title} {url}")
-        return
-
-    if os.getenv("XIANBAO_USE_WEBOPS_BARK") == "1":
-        from pylon.shared.bark import send_push
-
-        result = send_push(
-            title=title,
-            body=body,
-            url=url,
-            group=os.getenv("XIANBAO_BARK_GROUP", "xianbao"),
-            level=os.getenv("XIANBAO_BARK_LEVEL", "active"),
-            volume=env_int("XIANBAO_BARK_VOLUME", 5),
-            secret_name=os.getenv("XIANBAO_BARK_SECRET_NAME") or None,
-            timeout_seconds=env_int("XIANBAO_PUSH_TIMEOUT_SECONDS", 15),
-        )
-        if not result.ok:
-            raise RuntimeError(f"WebOps Bark push failed: status={result.http_status} code={result.code} message={result.message}")
-        return
-
-    bark_url = os.getenv("BARK_URL")
-    if bark_url:
-        target = bark_url.rstrip("/") + "/" + urllib.parse.quote(title) + "/" + urllib.parse.quote(body)
-        target += "?" + urllib.parse.urlencode({"url": url})
-        urllib.request.urlopen(target, timeout=15).read()
-        return
-
-    webhook = os.getenv("PUSH_WEBHOOK_URL")
-    if webhook:
-        payload = json.dumps({"title": title, "body": body, "url": url, "tier": decision.tier, "score": decision.score}).encode("utf-8")
-        req = urllib.request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=15).read()
-        return
-
-    raise RuntimeError("No push endpoint configured. Set BARK_URL or PUSH_WEBHOOK_URL, or run with XIANBAO_DRY_RUN=1.")
+    if dry_run:return
+    from pylon.tasks.intelligence.pipeline import ingest_xianbao,xianbao_bark
+    ingest_xianbao(post,decision,True,bark=xianbao_bark(post))
 
 
 def validate_runtime_config(dry_run: bool) -> tuple[list[str], list[str]]:
@@ -3442,42 +3400,9 @@ def log_push_error(data_dir: Path, post: dict[str, Any], decision: Decision, exc
 
 
 def alert_runtime_error(exc: Exception, consecutive_errors: int) -> None:
-    global LAST_ERROR_ALERT_AT
-    threshold = env_int("XIANBAO_ALERT_CONSECUTIVE_ERRORS", 3)
-    if threshold <= 0 or consecutive_errors < threshold:
-        return
-    cooldown = env_int("XIANBAO_ALERT_COOLDOWN_SECONDS", 900)
-    now = int(time.time())
-    if cooldown > 0 and now - LAST_ERROR_ALERT_AT < cooldown:
-        return
-    message = (
-        f"worker loop has {consecutive_errors} consecutive poll errors; "
-        f"latest error: {type(exc).__name__}: {exc}"
-    )
-    try:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m", "pylon.tasks.xianbao.alert",
-                "--kind",
-                "runtime-error",
-                "--message",
-                message,
-                "--cooldown-seconds",
-                str(cooldown),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()
-            print(f"alert send failed: {detail}", file=sys.stderr, flush=True)
-        LAST_ERROR_ALERT_AT = now
-    except Exception as alert_exc:
-        LAST_ERROR_ALERT_AT = now
-        print(f"alert send failed: {alert_exc}", file=sys.stderr, flush=True)
+    from pylon.outbox import Outbox
+    from pylon.tasks.intelligence.health import record
+    record(Outbox(),'xianbao:collection',backlog=1,error=type(exc).__name__)
 
 
 def source_unavailable_summary(summary: dict[str, Any]) -> bool:
@@ -3486,7 +3411,11 @@ def source_unavailable_summary(summary: dict[str, Any]) -> bool:
 
 def update_source_unavailable_state(data_dir: Path, summary: dict[str, Any]) -> None:
     state_path = data_dir / SOURCE_UNAVAILABLE_STATE_FILE
-    if not source_unavailable_summary(summary):
+    from pylon.outbox import Outbox
+    from pylon.tasks.intelligence.health import record
+    failed=source_unavailable_summary(summary)
+    record(Outbox(),'xianbao:collection',backlog=int(failed),progress=not failed,error='source unavailable' if failed else '')
+    if not failed:
         if state_path.exists():
             try:
                 state_path.unlink()
@@ -3647,6 +3576,9 @@ def process_once(
         review_candidates += int(decision.review_candidate)
         logged_decisions += int(log_decision(data_dir, post, decision))
         if not should_push:
+            if not dry_run:
+                from pylon.tasks.intelligence.pipeline import ingest_xianbao
+                ingest_xianbao(post,decision,False)
             mark_seen_post(db, post, decision, rules_key, seen_fp)
             record_activity_observation(db, post, decision, pushed=False)
         if should_push:

@@ -51,12 +51,15 @@ class ScriptOnlyMonitorTests(unittest.TestCase):
     def test_v2ex_queue_resumes_and_only_advances_cursor_after_draining(self):
         original = {"last_seen_id": 100}
         text, saved, _ = self.run_v2ex(original, [self.v2ex_post(103), self.v2ex_post(102)])
-        self.assertIn("/103)", text)
-        self.assertEqual(saved[-1]["last_seen_id"], 100)
+        self.assertEqual(json.loads(text), {"wakeAgent": False})
+        self.assertEqual(saved[-1]["last_seen_id"], 103)
         text2, saved2, _ = self.run_v2ex(saved[-1], [])
-        self.assertIn("/102)", text2)
-        self.assertEqual(saved2[-1]["last_seen_id"], 103)
-        self.assertNotIn(v2ex.AGENT_BATCH_STATE_KEY, saved2[-1])
+        self.assertEqual(json.loads(text2), {"wakeAgent": False})
+        # An empty poll does not rewrite the cursor. The prior persisted state
+        # remains authoritative, and no save_state call is needed.
+        self.assertEqual(saved2, [])
+        self.assertEqual(saved[-1]["last_seen_id"], 103)
+        self.assertNotIn(v2ex.AGENT_BATCH_STATE_KEY, saved[-1])
         self.assertEqual(original, {"last_seen_id": 100})
 
     def test_v2ex_revalidates_old_queue_and_skips_excluded_item(self):
@@ -73,7 +76,7 @@ class ScriptOnlyMonitorTests(unittest.TestCase):
     def test_v2ex_dry_run_does_not_persist_or_record_arbitrage(self):
         state = {"last_seen_id": 100}
         text, saved, arbitrage = self.run_v2ex(state, [self.v2ex_post(101)], dry_run=True)
-        self.assertIn("/101)", text)
+        self.assertEqual(json.loads(text), {"wakeAgent": False})
         self.assertEqual(saved, [])
         arbitrage.assert_not_called()
         self.assertEqual(state, {"last_seen_id": 100})

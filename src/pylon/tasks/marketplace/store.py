@@ -89,15 +89,24 @@ class Store:
                 body = str(post.get('body_full') or post.get('body_excerpt') or '')
                 complete = bool(post.get('body_complete')) and bool(body)
                 platform_category = str(post.get('platform_category') or '')[:200]
-                items = classify_listing(title, body, source, complete,platform_category=platform_category)
+                context=post.get('source_context') or {}
+                provenance=post.get('body_provenance') or {}
+                # A refill starts from a SQLite row; adapters may retain its
+                # serialized metadata while adding the newly fetched body.
+                if isinstance(context,str):context=json.loads(context)
+                if isinstance(provenance,str):provenance=json.loads(provenance)
+                if not isinstance(context,dict) or not isinstance(provenance,dict):
+                    raise ValueError('invalid capture metadata')
+                scope=context.get('evidence_scope','')
+                items = classify_listing(title, body, source, complete,platform_category=platform_category,evidence_scope=scope)
                 stamp = time.time()
-                status = 'historical' if history else 'ready' if complete else 'pending_body'
+                status = 'historical' if history else 'ready' if complete or source=='linuxdo' else 'pending_body'
                 cursor = db.execute('''INSERT OR IGNORE INTO marketplace_posts
                     (source,source_id,url,title,body,body_complete,posted_at,first_seen,updated_at,items,status,history,platform_category,source_context,body_provenance)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                     (source,source_id,url,title,body,int(complete),str(post.get('posted_at') or ''),stamp,stamp,
                      json.dumps(items, ensure_ascii=False),status,int(history),platform_category,
-                     json.dumps(post.get('source_context',{}),ensure_ascii=False),json.dumps(post.get('body_provenance',{}))))
+                     json.dumps(context,ensure_ascii=False),json.dumps(provenance)))
                 count += cursor.rowcount
                 # Never replace an enqueued message or promote historical data to live work.
                 if not cursor.rowcount and complete:
@@ -109,7 +118,7 @@ class Store:
                         WHERE source=? AND source_id=? AND status IN ('pending_body','historical','unavailable')''',
                         (title,body,json.dumps(items,ensure_ascii=False),stamp,str(post.get('posted_at') or ''),
                          str(post.get('posted_at') or ''),platform_category,platform_category,
-                         json.dumps(post.get('source_context',{}),ensure_ascii=False),json.dumps(post.get('body_provenance',{})),source,source_id))
+                         json.dumps(context,ensure_ascii=False),json.dumps(provenance),source,source_id))
                 elif not cursor.rowcount and post.get('posted_at'):
                     db.execute("UPDATE marketplace_posts SET posted_at=? WHERE source=? AND source_id=? AND posted_at=''",
                                (str(post['posted_at']),source,source_id))
@@ -122,12 +131,13 @@ class Store:
             rows = db.execute('''WITH ranked AS (
                 SELECT *,ROW_NUMBER() OVER (PARTITION BY source ORDER BY first_seen,source_id) AS source_rank
                 FROM marketplace_posts WHERE history=? AND body_complete=0 AND next_attempt<=?
-                AND status IN ('pending_body','historical') AND (? IS NULL OR source=?))
+                AND source<>'linuxdo' AND status IN ('pending_body','historical') AND (? IS NULL OR source=?))
                 SELECT * FROM ranked ORDER BY source_rank,first_seen,source LIMIT ?''',
                 (int(history),time.time(),source,source,limit)).fetchall()
             return [{k:r[k] for k in r.keys() if k!='source_rank'} for r in rows]
 
     def body_queue(self, source: str, *, history: bool = True) -> dict:
+        if source=='linuxdo':return {'pending':0,'next_attempt':0}
         with self.box.connect() as db:
             row = db.execute('''SELECT COUNT(*), MIN(next_attempt) FROM marketplace_posts
                 WHERE source=? AND history=? AND body_complete=0
@@ -169,7 +179,7 @@ class Store:
                 seen = set()
                 seen_sales = set()
                 seen_offers = set()
-                items = (classify_listing(row['title'],row['body'],source,bool(row['body_complete']),platform_category=row['platform_category'])
+                items = (classify_listing(row['title'],row['body'],source,bool(row['body_complete']),platform_category=row['platform_category'],evidence_scope=__import__('pylon.tasks.marketplace.content_quality',fromlist=['evidence_scope']).evidence_scope(dict(row)))
                          if fresh else json.loads(row['items']))
                 group_seen=set()
                 wanted_seen=set()
@@ -245,8 +255,8 @@ class Store:
     def reclassify_history(self) -> int:
         count = 0
         with self.box.connect() as db:
-            for row in db.execute('SELECT source,source_id,title,body,body_complete,platform_category FROM marketplace_posts WHERE history=1').fetchall():
-                items = classify_listing(row['title'],row['body'],row['source'],bool(row['body_complete']),platform_category=row['platform_category'])
+            for row in db.execute('SELECT source,source_id,title,body,body_complete,platform_category,source_context FROM marketplace_posts WHERE history=1').fetchall():
+                items = classify_listing(row['title'],row['body'],row['source'],bool(row['body_complete']),platform_category=row['platform_category'],evidence_scope=__import__('pylon.tasks.marketplace.content_quality',fromlist=['evidence_scope']).evidence_scope(dict(row)))
                 db.execute('UPDATE marketplace_posts SET items=? WHERE source=? AND source_id=? AND history=1',
                            (json.dumps(items,ensure_ascii=False),row['source'],row['source_id']))
                 count += 1

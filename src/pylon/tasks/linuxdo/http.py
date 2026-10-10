@@ -18,7 +18,7 @@ def permitted(url: str) -> bool:
         parsed = urlsplit(url)
         return (parsed.scheme == 'https' and parsed.port in {None, 443}
                 and not parsed.username and not parsed.password
-                and (parsed.hostname in {'t.me', 'linux.do'} or bool(provider_for_url(url))))
+                and parsed.hostname == 't.me')
     except ValueError:
         return False
 
@@ -50,59 +50,10 @@ def fetch(url: str, *, timeout: int = 8) -> str:
 
 
 def topic_evidence(topic_id: str, post_numbers: list[int], *, getter=fetch) -> list[dict]:
-    if not topic_id.isdigit():
-        raise ValueError('invalid topic id')
-    url = f'https://linux.do/t/topic/{topic_id}.json'
-    data = json.loads(getter(url))
-    if not isinstance(data, dict) or str(data.get('id')) != topic_id:
-        raise FetchError('topic identity mismatch')
-    rows = data.get('post_stream', {}).get('posts', [])
-    # A forwarded reply may be outside the initial topic stream page.
-    present = {p['post_number'] for p in rows if isinstance(p, dict) and type(p.get('post_number')) is int}
-    for number in sorted(set(post_numbers) - present - {1})[-2:]:
-        reply = json.loads(getter(f'https://linux.do/t/topic/{topic_id}/{number}.json'))
-        if str(reply.get('id')) != topic_id:
-            raise FetchError('reply topic identity mismatch')
-        rows.extend(reply.get('post_stream', {}).get('posts', []))
-    result, seen = [], set()
-    wanted = {1, *post_numbers}
-    for post in rows:
-        if not isinstance(post, dict) or not isinstance(post.get('post_number'), int):
-            continue
-        number = post['post_number']
-        # Include recent replies as potential answers, with bounded work per topic.
-        if number in seen or (number not in wanted and number < max(present or {1}) - 8):
-            continue
-        seen.add(number)
-        body, links = plain_html(str(post.get('cooked') or ''))
-        if not body:
-            continue
-        from pylon.shared.html_text import body_text
-        owned_body=body_text(str(post.get('cooked') or ''))
-        result.append({'ref': f'topic:{number}', 'origin': 'topic', 'post_number': number,
-                       'url': f'https://linux.do/t/topic/{topic_id}/{number}',
-                       'title': clean(str(data.get('title') or ''), 300),
-                       'body': body, 'links': links, 'complete': True,
-                       'owned_body':owned_body,
-                       'actor_hash':__import__('pylon.tasks.linuxdo.common',fromlist=['digest']).digest(str(post.get('username','')).casefold()) if post.get('username') else '',
-                       'source_published_at':str(post.get('created_at') or ''),
-                       'source_edited_at':str(post.get('updated_at') or '')})
-    if not result:
-        raise FetchError('topic body unavailable')
-    return result
+    """Compatibility boundary: Helper summaries must never cause site requests."""
+    return []
 
 
 def official_evidence(snapshot: dict, *, getter=fetch) -> list[dict]:
-    from .common import digest
-    urls = sorted({url for row in snapshot['evidence'] for url in row['links'] if provider_for_url(url)})
-    result = []
-    for url in urls[:2]:
-        try:
-            body, links = plain_html(getter(url))
-        except Exception:
-            continue
-        if len(body) < 80:
-            continue
-        result.append({'ref': 'official:' + digest(url)[:16], 'origin': 'official', 'post_number': 1,
-                       'url': url, 'title': '', 'body': body, 'links': links, 'complete': True})
-    return result
+    """Links are retained for the owner to open, never followed for enrichment."""
+    return []

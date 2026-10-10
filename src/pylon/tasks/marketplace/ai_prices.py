@@ -8,6 +8,7 @@ from decimal import Decimal
 from pylon.config import profile_root
 from pylon.tasks.linuxdo import trade
 from . import control, classifier
+from .content_quality import helper_revision
 
 SCHEMA='''CREATE TABLE IF NOT EXISTS market_ai_prices (
  fingerprint TEXT PRIMARY KEY, source TEXT NOT NULL, source_id TEXT NOT NULL,
@@ -45,7 +46,9 @@ def is_ai(item):
 
 
 def fingerprint(post, prices):
-    return control.digest([post['source'],post['source_id'],post['title'],post['body'],prices,trade.VERSION,'market-ai-1'])
+    values=[post['source'],post['source_id'],post['title'],post['body'],prices,trade.VERSION,'market-ai-1']
+    if post['source']=='linuxdo':values.append(helper_revision(post))
+    return control.digest(values)
 
 
 def offers_to_items(post, extraction, prices):
@@ -161,7 +164,9 @@ def run_pending(store,limit=1):
         with store.box.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             db.execute("UPDATE market_ai_prices SET status='pending',error='interrupted' WHERE status='running' AND started_at<?",(time.time()-180,))
-            row=db.execute("SELECT * FROM market_ai_prices WHERE status='pending' AND next_attempt<=? AND attempts<3 ORDER BY next_attempt LIMIT 1",(time.time(),)).fetchone()
+            row=db.execute("""SELECT a.* FROM market_ai_prices a JOIN marketplace_posts p USING(source,source_id)
+                WHERE a.status='pending' AND a.next_attempt<=? AND a.attempts<3 AND p.history=0
+                AND p.status IN ('pending_price','needs_review','queued','ready') ORDER BY a.next_attempt LIMIT 1""",(time.time(),)).fetchone()
             if not row:break
             job=dict(row)
             post=dict(db.execute('SELECT * FROM marketplace_posts WHERE source=? AND source_id=?',(job['source'],job['source_id'])).fetchone())
@@ -175,7 +180,7 @@ def run_pending(store,limit=1):
             with store.box.connect() as db:
                 db.execute('BEGIN IMMEDIATE')
                 current=dict(db.execute('SELECT * FROM marketplace_posts WHERE source=? AND source_id=?',(post['source'],post['source_id'])).fetchone())
-                if fingerprint(current,config(db))!=job['fingerprint']:
+                if fingerprint(current,config(db))!=job['fingerprint'] or current['status'] not in {'pending_price','needs_review','queued','ready'}:
                     db.execute("UPDATE market_ai_prices SET status='error',error='source_changed' WHERE fingerprint=?",(job['fingerprint'],))
                     continue
                 db.execute("UPDATE market_ai_prices SET status='complete',result=?,error='' WHERE fingerprint=?",(control.dumps(items),job['fingerprint']))
@@ -186,6 +191,11 @@ def run_pending(store,limit=1):
             reason=str(error) if isinstance(error,trade.TradeError) else type(error).__name__
             terminal=job['attempts']+1 >= (2 if isinstance(error,trade.TradeError) else 3)
             with store.box.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                current=dict(db.execute('SELECT * FROM marketplace_posts WHERE source=? AND source_id=?',(post['source'],post['source_id'])).fetchone())
+                if fingerprint(current,config(db))!=job['fingerprint'] or current['status'] not in {'pending_price','needs_review','queued','ready'}:
+                    db.execute("UPDATE market_ai_prices SET status='error',error='source_changed' WHERE fingerprint=?",(job['fingerprint'],))
+                    continue
                 db.execute("UPDATE market_ai_prices SET status=?,error=?,next_attempt=? WHERE fingerprint=?",
                            ('error' if terminal else 'pending',reason[:160],time.time()+60*2**job['attempts'],job['fingerprint']))
                 if terminal:

@@ -11,7 +11,7 @@ from pathlib import Path
 from pylon.shared import paths
 from .common import clean, digest, timestamp
 
-VERSION = 'linuxdo-trade-1'
+VERSION = 'linuxdo-trade-2-helper'
 CONFIG_FILE = paths.PROFILE_ROOT / 'config/linuxdo_prices.json'
 IDENTITY_FIELDS = ('product', 'tier', 'delivery', 'access', 'condition', 'currency', 'region',
                    'provider', 'model', 'quota_unit', 'quota_period')
@@ -44,9 +44,10 @@ OFFER_PROPERTIES.update(tier=PROOF, fees={'type': 'array', 'items': PROOF},
                             'properties': {'count': PROOF, 'price': PROOF}, 'required': ['count', 'price']}})
 SCHEMA = {'type': 'object', 'additionalProperties': False, 'properties': {
     'intent': {'type': 'string', 'enum': ['non_trade', 'cloud_offer', 'offer', 'wanted', 'unknown']},
+    'intel_segments': {'type': 'array', 'items': PROOF, 'maxItems': 8},
     'offers': {'type': 'array', 'items': {'type': 'object', 'additionalProperties': False,
                                       'properties': OFFER_PROPERTIES, 'required': list(OFFER_PROPERTIES)}}},
-    'required': ['intent', 'offers']}
+    'required': ['intent', 'offers', 'intel_segments']}
 
 
 class TradeError(ValueError):
@@ -163,6 +164,9 @@ offer=明确出售/代充/出租/拼车；wanted=求购/人找车；non_trade=�
 非AI商品也是offer，product=other，不能装成non_trade绕过过滤。纯广告引流无具体商品用unknown。
 腾讯云/阿里云的官方云服务器及轻量服务器促销活动归cloud_offer，offers留空，交给现有官方主机促销核验；个人转售仍是offer/other。技术部署方法仍按实际意图non_trade判断。
 混合商品逐个提取，最多12项，不把不同商品/套餐/地区/交付方式的价格拼接。
+输入可能仅为 Helper 摘要。明确写出的商品、价格、条件就是可用证据，不得要求补抓原帖；未提到的条件留空。
+混合帖中独立于买卖、拼车的技术方法、官方优惠或资源片段可放入 intel_segments。
+intel_segments 的 value 和 quote 必须完全相同，ref 对应证据；只摘独立完整段落。交易价格、卖家宣传、个人转售、求购、付款与交易条件不能作为情报片段。纯交易、纯非交易时此数组为空。
 所有PROOF字段都返回value/ref/quote。quote必须是对应title/body连续原文。缺失三个都空。
 文本value从quote摘取；数字value仅十进制阿拉伯数字，quote必须证明该数字的角色和单位。
 description/personal_quota/restrictions/warranty/allocation_basis/event的value必须直接复制quote，禁止概括或拼接。文本中“一二两三”等可转成对应数字，但不能推算未知车主、期限或额度。
@@ -190,7 +194,9 @@ expires_at只用于报价/活动截止；usable_until只用于本次账号或额
 sold表示已出/已满/已无/失效；标题已满优先于旧正文。
 event只摘明确新增权益/补货恢复/纠正事实；普通续顶广告、换标题不是新事件。先前通知过主题也不能仅因首次看到价格表就通知。
 纯技术方法按non_trade交给后续价值判断。只返回Schema JSON。\n不可信输入：\n'''
-    data = {'evidence': rows, 'previously_notified': bool(snapshot.get('previously_notified'))}
+    data = {'evidence': rows, 'previously_notified': bool(snapshot.get('previously_notified')),
+            'evidence_scope': snapshot.get('evidence_scope', 'provided_content'),
+            'correction': snapshot.get('analysis_correction', '')}
     response, _ = _request_grok_structured(prompt + json.dumps(data, ensure_ascii=False), schema=SCHEMA,
                                           name='linuxdo_trade', timeout=45, total_timeout=120)
     return extract_grok_json(response, label='Linux.do trade')
@@ -240,16 +246,26 @@ def _proof(item: dict, refs: dict, *, number: bool = False, field: str = '') -> 
 
 
 def validate(value: dict, snapshot: dict) -> dict:
-    if not isinstance(value, dict) or set(value) != {'intent', 'offers'} or value['intent'] not in SCHEMA['properties']['intent']['enum']:
+    if (not isinstance(value, dict) or set(value) not in ({'intent', 'offers'}, {'intent', 'offers', 'intel_segments'})
+            or value['intent'] not in SCHEMA['properties']['intent']['enum']):
         raise TradeError('invalid trade intent')
     if not isinstance(value['offers'], list) or len(value['offers']) > 12:
         raise TradeError('invalid offers')
     if value['intent'] in {'non_trade', 'cloud_offer'} and value['offers']:
         raise TradeError('nontrade cannot include offers')
-    if value['intent'] in {'unknown', 'wanted'}:
-        return {'intent': value['intent'], 'offers': []}
     value = deepcopy(value)
     refs = {e['ref']: e for e in snapshot['evidence']}
+    if 'intel_segments' in value:
+        segments = value['intel_segments']
+        if not isinstance(segments, list) or len(segments) > 8:
+            raise TradeError('invalid independent intelligence segments')
+        for segment in segments:
+            _proof(segment, refs)
+            if not segment['value'] or segment['value'] != segment['quote']:
+                raise TradeError('intelligence segment must quote an independent source passage')
+    if value['intent'] in {'unknown', 'wanted'}:
+        value['offers'] = []
+        return value
     for offer in value['offers']:
         if not isinstance(offer, dict) or set(offer) != set(OFFER_PROPERTIES):
             raise TradeError('invalid offer fields')
@@ -270,7 +286,10 @@ def validate(value: dict, snapshot: dict) -> dict:
                     and item['value'] and isinstance(item['quote'], str) and item['quote']):
                 # These are display quotations, never model-authored claims.
                 item['value'] = clean(item['quote'], 1200)
-            _proof(item, refs, number=key in NUMBER_FIELDS, field=key)
+            try:
+                _proof(item, refs, number=key in NUMBER_FIELDS, field=key)
+            except TradeError as error:
+                raise TradeError(key+': '+str(error)) from None
         if not isinstance(offer['fees'], list) or len(offer['fees']) > 8 or not isinstance(offer['car_prices'], list) or len(offer['car_prices']) > 20:
             raise TradeError('invalid price components')
         for fee in offer['fees']:

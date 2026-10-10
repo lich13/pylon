@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import asyncio
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -12,8 +13,13 @@ import pytest
 from pylon import transport
 from pylon.events import text_key
 from pylon.outbox import Outbox
-from pylon.tasks.linuxdo import http, judge, pipeline, policy, sources, trade
-from pylon.tasks.linuxdo.common import JOB_ID
+from pylon.tasks.intelligence import pipeline as intelligence_pipeline
+from pylon.tasks.intelligence import policy as intelligence_policy
+from pylon.tasks.intelligence.store import Store as IntelligenceStore
+from pylon.tasks.linuxdo import helper_collect, http, judge, pipeline, policy, sources, trade
+from pylon.tasks.linuxdo.common import JOB_ID, digest
+from pylon.tasks.linuxdo.helper import SOURCE as HELPER_SOURCE
+from pylon.tasks.linuxdo.helper_store import HelperStore
 from pylon.tasks.linuxdo.store import Store
 
 
@@ -305,26 +311,38 @@ def store(tmp_path, monkeypatch):
     return Store(Outbox(tmp_path / "outbox.sqlite3"))
 
 
-@pytest.fixture(autouse=True)
-def no_external_trade_requests(monkeypatch):
-    process = pipeline.process_topic
-    review = pipeline.review
-
-    def non_trade(_snapshot):
-        return {"intent": "non_trade", "offers": []}
-
-    def process_topic(*args, **kwargs):
-        kwargs.setdefault("trade_request", non_trade)
-        kwargs.setdefault("trade_config", trade.default_config())
-        return process(*args, **kwargs)
-
-    def pipeline_review(*args, **kwargs):
-        kwargs.setdefault("trade_request", non_trade)
-        kwargs.setdefault("trade_config", trade.default_config())
-        return review(*args, **kwargs)
-
-    monkeypatch.setattr(pipeline, "process_topic", process_topic)
-    monkeypatch.setattr(pipeline, "review", pipeline_review)
+@pytest.fixture
+def intelligence_store(store, monkeypatch):
+    monkeypatch.setattr(judge, "model_name", lambda: "fixture-model")
+    intelligence = IntelligenceStore(store.box)
+    with intelligence.box.connect() as db:
+        version, _ = intelligence_pipeline.active(db)
+        config = {
+            "version": 1,
+            "enabled": True,
+            "categories": ["C2"],
+            "blocked_groups": [],
+            "category_sources": {
+                key: (["linuxdo"] if key == "C2" else [])
+                for key in intelligence_policy.CATALOG
+            },
+            "exclude_terms": {},
+            "include_terms": {},
+            "linuxdo_focus": {
+                "version": 1,
+                "groups": [],
+                "categories": [],
+                "excluded_categories": [],
+                "cloud_providers": [],
+                "cloud_regions": "all",
+            },
+            "value_mode": "evidenced_lead",
+        }
+        db.execute(
+            "UPDATE intel_versions SET content=? WHERE id=?",
+            (json.dumps(config, ensure_ascii=False), version),
+        )
+    return intelligence
 
 
 def observation(*, channel="LinuxDoNew", message_id=61, topic_id="9201", post_number=1,
@@ -340,6 +358,19 @@ def observation(*, channel="LinuxDoNew", message_id=61, topic_id="9201", post_nu
         published_at=published_at,
         source_url=f"https://t.me/{channel}/{message_id}",
         links=["https://example.invalid/resource"],
+    )
+
+
+def helper_observation(*, message_id=71, topic_id="9201", post_number=1,
+                       body="合成脚本可按顺序执行三个操作。详情见资源页。",
+                       published_at=PUBLISHED_AT):
+    return observation(
+        channel=HELPER_SOURCE,
+        message_id=message_id,
+        topic_id=topic_id,
+        post_number=post_number,
+        body=body,
+        published_at=published_at,
     )
 
 
@@ -379,6 +410,47 @@ def complete_evidence(*, body="合成工具开放申请，说明包含完整操�
 
 def prompt_data(snapshot):
     return json.loads(judge.build_prompt(snapshot, policy.default_policy()).splitlines()[-1])
+
+
+def intelligence_item(store, source_id="9201"):
+    with store.box.connect() as db:
+        row = db.execute(
+            "SELECT * FROM intel_items WHERE source='linuxdo' AND source_id=?",
+            (source_id,),
+        ).fetchone()
+    assert row is not None
+    return dict(row)
+
+
+def capture_helper(legacy, intelligence, post):
+    save_observation(legacy, post)
+    return intelligence_pipeline.capture_linuxdo(intelligence, legacy.snapshot(post.topic_id))
+
+
+def intelligence_value(*, ref="tg:linux_do_helper_bot:71", decision="push",
+                       expires_at="", categories=None, facts=None,
+                       body_quote="合成脚本可按顺序执行三个操作。"):
+    categories = ["C2"] if categories is None and decision in {"push", "hold"} else (categories or [])
+    facts = facts if facts is not None else ([{
+        "category": "C2",
+        "kind": "method",
+        "subject": "合成脚本",
+        "value": "按顺序执行三个操作",
+        "evidence": [{"ref": ref, "quote": body_quote}],
+    }] if decision == "push" else [])
+    return {
+        "decision": decision,
+        "categories": categories,
+        "content_type": "tutorial",
+        "reason": "脚本提供可复用的顺序操作方法。" if decision == "push" else "缺少可复用步骤。",
+        "action": "阅读原帖中的操作步骤。",
+        "missing_evidence": [] if decision != "hold" else ["完整操作步骤"],
+        "expires_at": expires_at,
+        "change_kind": "initial",
+        "provider": "",
+        "region_scope": "unknown",
+        "facts": facts,
+    }
 
 
 def test_three_channel_publication_times_reach_snapshot_and_prompt_by_source_ref(store, monkeypatch):
@@ -1182,308 +1254,389 @@ def test_collection_page_budget_preserves_the_gap_for_the_next_run(store):
     assert reopened.snapshot("10100")["status"] == "historical"
 
 
-def test_one_failed_source_does_not_stop_the_other_two_sources(store):
-    def getter(url, **kwargs):
-        channel = url.rsplit("/", 1)[-1]
-        if channel == "linuxdo_tg":
-            raise http.FetchError("fixture source unavailable")
-        return channel_page(channel, 111)
+def test_helper_collection_uses_only_the_helper_source_and_never_calls_legacy_getter(
+        store, monkeypatch):
+    class FixtureHelperAccount:
+        identity = {"account_id": 90001, "bot_id": 90002}
 
-    result = pipeline.collect(store, config=collector_config(), getter=getter)
+        def __init__(self):
+            self.pages = [[{
+                "message_id": 111,
+                "incoming": True,
+                "text": "【watching_first_post】 合成主题\n合成脚本可按顺序执行三个操作。",
+                "published_at": PUBLISHED_AT,
+                "edited_at": "",
+                "links": [{
+                    "label": "合成主题",
+                    "url": "https://linux.do/t/topic/10111/1",
+                    "header": True,
+                }],
+                "buttons": [],
+            }], []]
+            self.calls = []
 
-    rows = {row["channel"]: row for row in result["sources"]}
-    assert result["changed"] == 2
-    assert rows["linuxdo_tg"]["error"] == "fixture source unavailable"
-    assert rows["LinuxDoNew"]["error"] == rows["linux_do_channel"]["error"] == ""
-    assert store.checkpoint("LinuxDoNew")["cursor"] == 111
-    assert store.checkpoint("linux_do_channel")["cursor"] == 111
-    assert store.stats()["observations"] == 2
+        async def __aenter__(self):
+            return self
 
+        async def __aexit__(self, *_):
+            return None
 
-def test_judge_failure_retains_collected_evidence_and_allows_later_collection(store, monkeypatch):
-    clock = [2_000_000_000.0]
-    monkeypatch.setattr(pipeline.time, "time", lambda: clock[0])
-    channel = "LinuxDoNew"
-    store.save_page(channel, sources.Page(), {
-        "cursor": 70, "baseline": True, "backfill_before": None, "backfill_until": None,
+        async def page(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.pages.pop(0)
+
+    account = FixtureHelperAccount()
+    identity = digest(account.identity)
+    HelperStore(store).save_page([], {
+        "identity": identity,
+        "baseline": True,
+        "baseline_id": 100,
+        "cursor": 100,
+        "retry_at": 0,
     })
-    config = collector_config(channels=[channel], max_pages=1)
-    first = pipeline.collect(store, config=config, getter=lambda url, **kwargs: channel_page(channel, 71))
-    assert first["changed"] == 1
-    clock[0] += 31
+    delegated = []
 
+    def collect_helper(actual_store, config):
+        delegated.append(config)
+        return asyncio.run(helper_collect.collect_async(
+            actual_store, config, account_factory=lambda: account,
+        ))
+
+    monkeypatch.setattr(helper_collect.following, "available", lambda: (None, ""))
+    monkeypatch.setattr(helper_collect, "collect", collect_helper)
+    legacy_getter = Mock(side_effect=AssertionError("legacy channel getter must not run"))
+
+    result = pipeline.collect(store, config=collector_config(), getter=legacy_getter)
+
+    assert result["source"] == HELPER_SOURCE
+    assert result["changed"] == 1
+    assert result["error"] == ""
+    assert delegated and delegated[0]["mode"] == "helper"
+    assert account.calls[0] == {"after": 100, "limit": 100}
+    legacy_getter.assert_not_called()
+    assert store.checkpoint(HELPER_SOURCE)["cursor"] == 111
+    assert store.stats()["observations"] == 1
+
+
+def test_judge_failure_retains_helper_evidence_and_allows_later_collection(
+        store, intelligence_store):
+    first_post = helper_observation(message_id=71, body="合成脚本可按顺序执行三个操作。")
+    assert capture_helper(store, intelligence_store, first_post) is True
     request = Mock(side_effect=judge.JudgeError("injected judgment failure"))
-    reviewed = pipeline.review(
-        store, config=policy.default_policy(), model="fixture-model", request=request,
-        topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [],
+
+    result = intelligence_pipeline.process_item(
+        intelligence_store,
+        intelligence_item(intelligence_store),
+        value_request=request,
+        trade_request=lambda snapshot: {"intent": "non_trade", "offers": []},
     )
 
-    assert reviewed == {"processed": 1, "errors": 1, "queued": 0}
+    assert result == {"progress": True, "error": "", "queued": 0}
     assert request.call_count == 1
-    reopened = Store(Outbox(store.box.path))
-    retained = reopened.snapshot("10071")
-    assert retained["status"] == "hold"
-    assert retained["evidence"]
-    assert reopened.checkpoint(channel)["cursor"] == 71
-    second = pipeline.collect(reopened, config=config, getter=lambda url, **kwargs: channel_page(channel, 72))
-    assert second["changed"] == 1
-    assert reopened.checkpoint(channel)["cursor"] == 72
-    assert reopened.stats()["observations"] == 2
-    assert reopened.box.counts() == {}
+    retained = intelligence_item(intelligence_store)
+    assert retained["status"] == "retry"
+    assert retained["attempts"] == 1
+    assert retained["error"].startswith("JudgeError:")
+    retained_snapshot = json.loads(retained["context"])["snapshot"]
+    assert retained_snapshot["evidence"]
+    assert retained_snapshot["evidence"][0]["ref"] == f"tg:{HELPER_SOURCE}:71"
+
+    second_post = helper_observation(message_id=72, body="新增申请入口仍可按三个步骤执行。")
+    assert capture_helper(store, intelligence_store, second_post) is True
+    recollected = intelligence_item(intelligence_store)
+    assert recollected["status"] == "pending"
+    assert "新增申请入口" in recollected["body"]
+    assert intelligence_store.box.counts() == {}
 
 
-def test_invented_expiration_cannot_close_a_held_candidate(store, monkeypatch):
+def test_invented_expiration_cannot_close_a_held_candidate(store, intelligence_store, monkeypatch):
+    post = helper_observation(message_id=71)
+    assert capture_helper(store, intelligence_store, post) is True
     now = datetime.fromisoformat("2026-01-03T00:00:00+00:00").timestamp()
-    monkeypatch.setattr(pipeline.time, "time", lambda: now)
-    save_observation(store, observation(message_id=71, body=judge_snapshot()["evidence"][0]["body"]))
-    held = judge_result()
-    held.update(decision="hold", missing_evidence=["完整操作步骤"], expires_at="2026-01-02T00:00:00+08:00")
+    monkeypatch.setattr(intelligence_pipeline.time, "time", lambda: now)
+    held = intelligence_value(
+        ref=f"tg:{HELPER_SOURCE}:71",
+        decision="hold",
+        expires_at="2026-01-02T00:00:00+08:00",
+        categories=["C2"],
+    )
     request = Mock(return_value=held)
 
-    result = pipeline.process_topic(
-        store, "9201", policy.default_policy(), model="fixture-model", request=request,
-        topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [],
+    result = intelligence_pipeline.process_item(
+        intelligence_store,
+        intelligence_item(intelligence_store),
+        value_request=request,
+        trade_request=lambda snapshot: {"intent": "non_trade", "offers": []},
     )
 
-    assert result["decision"] == "hold"
-    assert result["error"] == "JudgeError"
+    assert result == {"progress": True, "error": "", "queued": 0}
     request.assert_called_once()
-    reopened = Store(Outbox(store.box.path))
-    retained = reopened.snapshot("9201")
-    assert retained["status"] == "hold"
-    assert retained["expires_at"] is None
-    assert retained["notifications"] == []
-    assert reopened.claim(now=retained["next_attempt"]) == ["9201"]
-    assert reopened.box.counts() == {}
+    retained = intelligence_item(intelligence_store)
+    assert retained["status"] == "retry"
+    assert retained["attempts"] == 1
+    assert retained["result"] is None
+    assert retained["error"].startswith("JudgeError:")
+    assert intelligence_store.box.counts() == {}
 
 
-def test_grounded_future_expiration_is_preserved_for_a_held_candidate(store, monkeypatch):
+def test_grounded_future_expiration_is_preserved_for_a_held_candidate(
+        store, intelligence_store, monkeypatch):
     now = datetime.fromisoformat("2026-01-01T00:00:00+00:00").timestamp()
-    monkeypatch.setattr(pipeline.time, "time", lambda: now)
-    body = judge_snapshot()["evidence"][0]["body"] + "领取截止时间：2026-01-02 00:00（北京时间）。"
-    save_observation(store, observation(message_id=71, body=body))
-    held = judge_result()
-    held.update(decision="hold", missing_evidence=["完整操作步骤"], expires_at="2026-01-02T00:00:00+08:00")
-
-    result = pipeline.process_topic(
-        store, "9201", policy.default_policy(), model="fixture-model", request=Mock(return_value=held),
-        topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [],
+    body = "合成脚本可按顺序执行三个操作。领取截止时间：2026-01-02 00:00（北京时间）。"
+    post = helper_observation(message_id=71, body=body)
+    assert capture_helper(store, intelligence_store, post) is True
+    monkeypatch.setattr(intelligence_pipeline.time, "time", lambda: now)
+    held = intelligence_value(
+        ref=f"tg:{HELPER_SOURCE}:71",
+        decision="hold",
+        expires_at="2026-01-02T00:00:00+08:00",
+        categories=["C2"],
     )
 
-    assert result["decision"] == "hold"
-    assert result["error"] == ""
-    assert result["event_id"] is None
-    reopened = Store(Outbox(store.box.path))
-    retained = reopened.snapshot("9201")
-    assert retained["status"] == "hold"
-    assert retained["expires_at"] == datetime.fromisoformat(held["expires_at"]).timestamp()
-    assert reopened.claim(now=retained["next_attempt"]) == ["9201"]
-    assert reopened.box.counts() == {}
+    result = intelligence_pipeline.process_item(
+        intelligence_store,
+        intelligence_item(intelligence_store),
+        value_request=Mock(return_value=held),
+        trade_request=lambda snapshot: {"intent": "non_trade", "offers": []},
+    )
+
+    assert result == {"progress": True, "decision": "hold", "queued": 0}
+    retained = intelligence_item(intelligence_store)
+    assert retained["status"] == "needs_info"
+    assert json.loads(retained["result"])["expires_at"] == held["expires_at"]
+    assert retained["attempts"] == 0
+    assert intelligence_store.box.counts() == {}
 
 
-def test_grounded_expired_push_does_not_enqueue_a_notification(store, monkeypatch):
+def test_grounded_expired_push_does_not_enqueue_a_notification(
+        store, intelligence_store, monkeypatch):
     now = datetime.fromisoformat("2026-01-03T00:00:00+00:00").timestamp()
-    monkeypatch.setattr(pipeline.time, "time", lambda: now)
-    body = judge_snapshot()["evidence"][0]["body"] + "领取截止时间：2026-01-02 00:00（北京时间）。"
-    save_observation(store, observation(message_id=71, body=body))
-    value = judge_result()
-    value["expires_at"] = "2026-01-02T00:00:00+08:00"
-
-    result = pipeline.process_topic(
-        store, "9201", policy.default_policy(), model="fixture-model", request=Mock(return_value=value),
-        topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [],
+    body = "合成脚本可按顺序执行三个操作。领取截止时间：2026-01-02 00:00（北京时间）。"
+    post = helper_observation(message_id=71, body=body)
+    assert capture_helper(store, intelligence_store, post) is True
+    monkeypatch.setattr(intelligence_pipeline.time, "time", lambda: now)
+    value = intelligence_value(
+        ref=f"tg:{HELPER_SOURCE}:71",
+        expires_at="2026-01-02T00:00:00+08:00",
     )
 
-    assert result["decision"] == "skip"
-    assert result["error"] == ""
-    assert result["event_id"] is None
-    retained = store.snapshot("9201")
-    assert retained["status"] == "skip"
-    assert retained["notifications"] == []
-    assert store.box.counts() == {}
+    result = intelligence_pipeline.process_item(
+        intelligence_store,
+        intelligence_item(intelligence_store),
+        value_request=Mock(return_value=value),
+        trade_request=lambda snapshot: {"intent": "non_trade", "offers": []},
+    )
+
+    assert result == {"progress": True, "decision": "skip", "queued": 0}
+    retained = intelligence_item(intelligence_store)
+    stored = json.loads(retained["result"])
+    assert retained["status"] == "excluded"
+    assert stored["policy_decision"] == "skip"
+    assert retained["event_id"] is None
+    assert intelligence_store.box.counts() == {}
 
 
-def test_cached_hold_is_reused_until_new_evidence_requires_a_fresh_judgment(store):
-    save_observation(store, observation(message_id=71, body=judge_snapshot()["evidence"][0]["body"]))
-    held = judge_result()
-    held.update(decision="hold", missing_evidence=["完整操作步骤"])
-    ready = judge_result()
-    ready["facts"][0]["evidence"][0]["ref"] = "topic:9201:1"
+def test_cached_hold_is_reused_until_new_helper_evidence_requires_a_fresh_judgment(
+        store, intelligence_store):
+    post = helper_observation(message_id=71)
+    assert capture_helper(store, intelligence_store, post) is True
+    held = intelligence_value(
+        ref=f"tg:{HELPER_SOURCE}:71", decision="hold", categories=["C2"]
+    )
+    ready = intelligence_value(ref=f"tg:{HELPER_SOURCE}:71")
     request = Mock(side_effect=[held, ready])
-    topic_fetch = Mock(return_value=[])
-    official_fetch = Mock(return_value=[])
-    kwargs = {
-        "model": "fixture-model", "request": request,
-        "topic_fetch": topic_fetch, "official_fetch": official_fetch,
-    }
+    trade_request = lambda snapshot: {"intent": "non_trade", "offers": []}
 
-    first = pipeline.process_topic(store, "9201", policy.default_policy(), **kwargs)
-    second = pipeline.process_topic(Store(Outbox(store.box.path)), "9201", policy.default_policy(), **kwargs)
+    first = intelligence_pipeline.process_item(
+        intelligence_store,
+        intelligence_item(intelligence_store),
+        value_request=request,
+        trade_request=trade_request,
+    )
+    second = intelligence_pipeline.process_item(
+        intelligence_store,
+        intelligence_item(intelligence_store),
+        value_request=request,
+        trade_request=trade_request,
+    )
 
     assert first["decision"] == second["decision"] == "hold"
-    assert first["error"] == second["error"] == ""
     assert request.call_count == 1
-    assert topic_fetch.call_count == 1
-    assert store.box.counts() == {}
+    assert intelligence_store.box.counts() == {}
 
-    evidence = complete_evidence(body="合成脚本可按顺序执行三个操作。完整步骤：先创建目录，再写入配置，最后启动脚本。")
-    store.add_evidence("9201", [evidence])
-    third = pipeline.process_topic(store, "9201", policy.default_policy(), **kwargs)
+    updated = helper_observation(
+        message_id=71,
+        body="合成脚本可按顺序执行三个操作。完整步骤：先创建目录，再写入配置，最后启动脚本。",
+    )
+    assert capture_helper(store, intelligence_store, updated) is True
+    third = intelligence_pipeline.process_item(
+        intelligence_store,
+        intelligence_item(intelligence_store),
+        value_request=request,
+        trade_request=trade_request,
+    )
 
     assert third["decision"] == "push"
-    assert third["error"] == ""
-    assert third["event_id"]
+    assert third["queued"] == 1
     assert request.call_count == 2
-    assert store.box.counts() == {"pending": 1}
+    assert intelligence_store.box.counts() == {"pending": 1}
 
 
-def test_restart_and_recollection_preserve_original_deadline_context_and_cached_skip(store, monkeypatch):
+def test_restart_and_recollection_preserve_original_deadline_context_and_cached_skip(
+        store, intelligence_store, monkeypatch):
     now = datetime.fromisoformat("2026-10-09T04:00:00+00:00").timestamp()
-    monkeypatch.setattr(judge.time, "time", lambda: now)
-    monkeypatch.setattr("pylon.tasks.linuxdo.common.iso_now",
-                        lambda: datetime.fromtimestamp(now, timezone.utc).isoformat())
-    body = judge_snapshot()["evidence"][0]["body"] + "本次活动今天截止。"
-    post = observation(message_id=71, body=body)
-    save_observation(store, post)
-    original = store.snapshot("9201")
-    original_input = prompt_data(original)
-    expired = judge_result()
-    expired.update(decision="skip", reason="原始消息中的相对期限已经结束。")
+    body = "合成脚本可按顺序执行三个操作。领取截止时间：2026-10-09 09:00（北京时间）。"
+    post = helper_observation(message_id=71, body=body)
+    assert capture_helper(store, intelligence_store, post) is True
+    monkeypatch.setattr(intelligence_pipeline.time, "time", lambda: now)
+    expired = intelligence_value(
+        ref=f"tg:{HELPER_SOURCE}:71",
+        expires_at="2026-10-09T01:00:00+00:00",
+    )
     request = Mock(return_value=expired)
-    kwargs = {
-        "model": "fixture-model", "request": request,
-        "topic_fetch": lambda topic_id, numbers: [], "official_fetch": lambda snapshot: [],
-    }
-    config = policy.default_policy()
-    original_key = judge.cache_key(original, config, "fixture-model")
-    first = pipeline.process_topic(store, "9201", config, **kwargs)
+    trade_request = lambda snapshot: {"intent": "non_trade", "offers": []}
 
-    now += 86400
+    first = intelligence_pipeline.process_item(
+        intelligence_store,
+        intelligence_item(intelligence_store),
+        value_request=request,
+        trade_request=trade_request,
+    )
+    original = intelligence_item(intelligence_store)
+    original_context = json.loads(original["context"])["snapshot"]
+    assert first["decision"] == "skip"
+    assert original["status"] == "excluded"
+    assert original_context["evidence"][0]["source_published_at"] == PUBLISHED_AT
+
     reopened = Store(Outbox(store.box.path))
-    assert save_observation(reopened, post) == 0
-    replayed = reopened.snapshot("9201")
-    assert replayed["version"] == original["version"]
-    assert replayed["fingerprint"] == original["fingerprint"]
-    assert prompt_data(replayed)["evidence"] == original_input["evidence"]
-    second = pipeline.process_topic(reopened, "9201", config, **kwargs)
+    reopened_intelligence = IntelligenceStore(Outbox(store.box.path))
+    assert capture_helper(reopened, reopened_intelligence, post) is False
+    second = intelligence_pipeline.process_item(
+        reopened_intelligence,
+        intelligence_item(reopened_intelligence),
+        value_request=request,
+        trade_request=trade_request,
+    )
 
-    assert save_observation(reopened, observation(channel="linuxdo_tg", message_id=72, body=body)) == 1
-    recollected = reopened.snapshot("9201")
-    assert recollected["fingerprint"] == original["fingerprint"]
-    assert judge.cache_key(recollected, config, "fixture-model") == original_key
-    assert reopened.cached(original_key)["decision"] == "skip"
-    data = prompt_data(recollected)
-    assert data["now_utc"] == "2026-10-10T04:00:00+00:00"
-    assert {row["source_published_at"] for row in data["evidence"]} == {PUBLISHED_AT}
-    assert {row["observed_at"] for row in data["evidence"]} == {
-        "2026-10-09T04:00:00+00:00", "2026-10-10T04:00:00+00:00",
-    }
-    third = pipeline.process_topic(reopened, "9201", config, **kwargs)
-
-    assert [result["decision"] for result in (first, second, third)] == ["skip", "skip", "skip"]
-    assert [result["error"] for result in (first, second, third)] == ["", "", ""]
+    assert second["decision"] == "skip"
     assert request.call_count == 1
-    assert reopened.snapshot("9201")["notifications"] == []
-    assert reopened.box.counts() == {}
+    with reopened_intelligence.box.connect() as db:
+        # Linux.do runs separate trade and value phases; both cache entries
+        # are reused after reopening the same outbox.
+        assert db.execute("SELECT count(*) FROM intel_model_cache").fetchone()[0] == 2
+    replayed = intelligence_item(reopened_intelligence)
+    assert replayed["status"] == "excluded"
+    assert json.loads(replayed["context"])["snapshot"]["evidence"] == original_context["evidence"]
+    assert reopened_intelligence.box.counts() == {}
 
 
 @pytest.mark.parametrize("initial_published_at", [PUBLISHED_AT, ""], ids=["corrected-date", "newly-known-date"])
-def test_changed_publication_time_invalidates_cached_time_judgment(store, monkeypatch, initial_published_at):
-    now = datetime.fromisoformat("2026-10-09T04:00:00+00:00").timestamp()
-    monkeypatch.setattr(judge.time, "time", lambda: now)
+def test_changed_publication_time_invalidates_cached_time_judgment(
+        store, intelligence_store, initial_published_at):
     body = judge_snapshot()["evidence"][0]["body"] + "本次活动今天截止。"
-    save_observation(store, observation(message_id=71, body=body, published_at=initial_published_at))
-    before = store.snapshot("9201")
-    held = judge_result()
-    held.update(decision="hold", missing_evidence=["活动起算时间"])
+    initial = helper_observation(message_id=71, body=body, published_at=initial_published_at)
+    assert capture_helper(store, intelligence_store, initial) is True
+    held = intelligence_value(ref=f"tg:{HELPER_SOURCE}:71", decision="hold", categories=["C2"])
     request = Mock(return_value=held)
-    kwargs = {
-        "model": "fixture-model", "request": request,
-        "topic_fetch": lambda topic_id, numbers: [], "official_fetch": lambda snapshot: [],
-    }
-    config = policy.default_policy()
-    before_key = judge.cache_key(before, config, "fixture-model")
-    first = pipeline.process_topic(store, "9201", config, **kwargs)
-    assert store.cached(before_key)["decision"] == "hold"
+    trade_request = lambda snapshot: {"intent": "non_trade", "offers": []}
+    first = intelligence_pipeline.process_item(
+        intelligence_store,
+        intelligence_item(intelligence_store),
+        value_request=request,
+        trade_request=trade_request,
+    )
+    before = intelligence_item(intelligence_store)
 
-    now += 600
     corrected_date = "2026-01-03T03:04:05+00:00"
-    reopened = Store(Outbox(store.box.path))
-    save_observation(reopened, observation(message_id=71, body=body, published_at=corrected_date))
-    after = reopened.snapshot("9201")
-    assert after["evidence"][0]["body"] == before["evidence"][0]["body"]
-    assert after["evidence"][0]["title"] == before["evidence"][0]["title"]
-    assert after["evidence"][0]["source_published_at"] == corrected_date
-    assert prompt_data(after)["evidence"][0]["source_published_at"] == corrected_date
+    corrected = helper_observation(message_id=71, body=body, published_at=corrected_date)
+    assert capture_helper(store, intelligence_store, corrected) is True
+    after = intelligence_item(intelligence_store)
+    before_context = json.loads(before["context"])["snapshot"]
+    after_context = json.loads(after["context"])["snapshot"]
+    assert after_context["evidence"][0]["body"] == before_context["evidence"][0]["body"]
+    assert after_context["evidence"][0]["source_published_at"] == corrected_date
     assert after["fingerprint"] != before["fingerprint"]
-    after_key = judge.cache_key(after, config, "fixture-model")
-    assert after_key != before_key
-    assert reopened.cached(after_key) is None
 
-    second = pipeline.process_topic(reopened, "9201", config, **kwargs)
+    second = intelligence_pipeline.process_item(
+        intelligence_store,
+        after,
+        value_request=request,
+        trade_request=trade_request,
+    )
 
     assert first["decision"] == second["decision"] == "hold"
-    assert first["error"] == second["error"] == ""
     assert request.call_count == 2
-    judged_dates = [call.args[0]["evidence"][0]["source_published_at"] for call in request.call_args_list]
+    judged_dates = [
+        call.args[0]["evidence"][0]["source_published_at"]
+        for call in request.call_args_list
+    ]
     assert judged_dates == [initial_published_at, corrected_date]
-    assert reopened.cached(after_key)["decision"] == "hold"
-    assert reopened.box.counts() == {}
+    with intelligence_store.box.connect() as db:
+        # Each Helper revision has an independent trade and value cache key.
+        assert db.execute("SELECT count(*) FROM intel_model_cache").fetchone()[0] == 4
+    assert intelligence_store.box.counts() == {}
 
 
-def test_old_publication_date_does_not_automatically_expire_a_reusable_tutorial(store, monkeypatch):
-    now = datetime.fromisoformat("2026-10-09T04:00:00+00:00").timestamp()
-    monkeypatch.setattr(judge.time, "time", lambda: now)
+def test_old_publication_date_does_not_automatically_expire_a_reusable_tutorial(
+        store, intelligence_store):
     published_at = "2020-01-02T03:04:05+00:00"
-    save_observation(store, observation(
-        message_id=71, body=judge_snapshot()["evidence"][0]["body"], published_at=published_at,
-    ))
-    request = Mock(return_value=judge_result())
+    post = helper_observation(message_id=71, body="合成脚本可按顺序执行三个操作。", published_at=published_at)
+    assert capture_helper(store, intelligence_store, post) is True
+    request = Mock(return_value=intelligence_value(ref=f"tg:{HELPER_SOURCE}:71"))
 
-    result = pipeline.process_topic(
-        store, "9201", policy.default_policy(), model="fixture-model", request=request,
-        topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [],
+    result = intelligence_pipeline.process_item(
+        intelligence_store,
+        intelligence_item(intelligence_store),
+        value_request=request,
+        trade_request=lambda snapshot: {"intent": "non_trade", "offers": []},
     )
 
     assert result["decision"] == "push"
-    assert result["error"] == ""
-    assert result["event_id"]
+    assert result["queued"] == 1
     request.assert_called_once()
-    assert prompt_data(request.call_args.args[0])["evidence"][0]["source_published_at"] == published_at
-    assert store.box.counts() == {"pending": 1}
+    assert request.call_args.args[0]["evidence"][0]["source_published_at"] == published_at
+    retained = intelligence_item(intelligence_store)
+    assert retained["status"] == "queued"
+    assert retained["event_id"]
+    assert intelligence_store.box.counts() == {"pending": 1}
 
 
-def test_expired_notification_is_terminal_and_a_new_deadline_can_notify_the_same_facts(store, monkeypatch):
-    now = datetime.fromisoformat("2026-10-09T00:00:00+00:00").timestamp()
-    monkeypatch.setattr(judge.time, "time", lambda: now)
+def test_expired_notification_is_terminal_and_a_new_deadline_can_notify_the_same_facts(
+        store, intelligence_store, monkeypatch):
+    clock = [datetime.fromisoformat("2026-10-09T00:00:00+00:00").timestamp()]
     monkeypatch.setattr(transport, "profile_env", lambda profile: {
         "TELEGRAM_BOT_TOKEN": "fixture-token", "TELEGRAM_HOME_CHANNEL": "123",
     })
-    original_body = judge_snapshot()["evidence"][0]["body"]
-    save_observation(store, observation(
-        message_id=71, body=original_body + "领取截止时间：2026-10-09 09:00（北京时间）。",
-    ))
-    first_decision = judge_result()
-    first_decision["expires_at"] = "2026-10-09T01:00:00+00:00"
-    next_decision = judge_result()
-    next_decision["expires_at"] = "2026-10-10T01:00:00+00:00"
+    original_body = "合成脚本可按顺序执行三个操作。领取截止时间：2026-10-09 09:00（北京时间）。"
+    post = helper_observation(message_id=71, body=original_body)
+    assert capture_helper(store, intelligence_store, post) is True
+    monkeypatch.setattr(intelligence_pipeline.time, "time", lambda: clock[0])
+    first_decision = intelligence_value(
+        ref=f"tg:{HELPER_SOURCE}:71", expires_at="2026-10-09T01:00:00+00:00"
+    )
+    next_decision = intelligence_value(
+        ref=f"tg:{HELPER_SOURCE}:71", expires_at="2026-10-10T01:00:00+00:00"
+    )
     request = Mock(side_effect=[first_decision, next_decision])
-    kwargs = {
-        "model": "fixture-model", "request": request,
-        "topic_fetch": lambda topic_id, numbers: [], "official_fetch": lambda snapshot: [],
-    }
-    first = pipeline.process_topic(store, "9201", policy.default_policy(), **kwargs)
+    trade_request = lambda snapshot: {"intent": "non_trade", "offers": []}
+    first = intelligence_pipeline.process_item(
+        intelligence_store,
+        intelligence_item(intelligence_store),
+        value_request=request,
+        trade_request=trade_request,
+    )
     assert first["decision"] == "push"
-    first_id = first["event_id"]
+    first_id = intelligence_item(intelligence_store)["event_id"]
     assert first_id
-    with store.box.connect() as db:
+    with intelligence_store.box.connect() as db:
         payload = json.loads(db.execute("SELECT payload FROM events WHERE id=?", (first_id,)).fetchone()[0])
     first_expiry = datetime.fromisoformat(first_decision["expires_at"]).timestamp()
     assert payload["expires_at"] == first_expiry
     assert isinstance(payload["expires_at"], float)
 
-    now = first_expiry
+    clock[0] = first_expiry
     reopened = Store(Outbox(store.box.path))
+    reopened_intelligence = IntelligenceStore(Outbox(store.box.path))
     requests = []
 
     def handler(http_request):
@@ -1491,43 +1644,49 @@ def test_expired_notification_is_terminal_and_a_new_deadline_can_notify_the_same
         return httpx.Response(200, json={"ok": True, "result": {"message_id": 81, "chat": {"id": 123}}})
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
-        transport.deliver_event(reopened.box, reopened.box.claim(), http_client)
-        reopened.sync_deliveries()
-        expired = reopened.snapshot("9201")
+        first_event = reopened_intelligence.box.claim()
+        assert first_event["id"] == first_id
+        transport.deliver_event(reopened_intelligence.box, first_event, http_client)
+        with reopened_intelligence.box.connect() as db:
+            assert db.execute("SELECT status FROM events WHERE id=?", (first_id,)).fetchone()[0] == "suppressed"
         assert requests == []
-        assert expired["status"] == "skip"
-        assert expired["previously_notified"] is False
-        assert expired["notifications"][0]["delivery_status"] == "suppressed"
-        assert prompt_data(expired)["previous_facts"] == []
-        assert reopened.box.claim() is None
+        assert reopened_intelligence.box.claim() is None
 
-        save_observation(reopened, observation(
-            message_id=71, body=original_body + "领取截止时间：2026-10-10 09:00（北京时间）。",
-        ))
-        second = pipeline.process_topic(reopened, "9201", policy.default_policy(), **kwargs)
+        changed = helper_observation(
+            message_id=71,
+            body="合成脚本可按顺序执行三个操作。领取截止时间：2026-10-10 09:00（北京时间）。",
+        )
+        assert capture_helper(reopened, reopened_intelligence, changed) is True
+        second = intelligence_pipeline.process_item(
+            reopened_intelligence,
+            intelligence_item(reopened_intelligence),
+            value_request=request,
+            trade_request=trade_request,
+        )
         assert second["decision"] == "push"
-        assert first["error"] == second["error"] == ""
-        second_id = second["event_id"]
+        second_id = intelligence_item(reopened_intelligence)["event_id"]
         assert second_id and second_id != first_id
         assert request.call_count == 2
-        assert request.call_args.args[0]["previously_notified"] is False
-        reopened.sync_deliveries()
-        assert reopened.snapshot("9201")["status"] == "queued"
-        transport.deliver_event(reopened.box, reopened.box.claim(), http_client)
+        assert request.call_args_list[1].args[0]["previously_notified"] is False
+        second_event = reopened_intelligence.box.claim()
+        assert second_event["id"] == second_id
+        transport.deliver_event(reopened_intelligence.box, second_event, http_client)
 
-    reopened.sync_deliveries()
-    current = reopened.snapshot("9201")
+    intelligence_pipeline.review(reopened_intelligence, limit=1)
+    current = intelligence_item(reopened_intelligence)
     assert len(requests) == 1
     assert current["status"] == "delivered"
-    assert {row["event_id"]: row["delivery_status"] for row in current["notifications"]} == {
-        first_id: "suppressed", second_id: "delivered",
-    }
-    assert current["previously_notified"] is True
-    assert prompt_data(current)["previous_facts"] == [next_decision["facts"]]
-    with reopened.box.connect() as db:
+    with reopened_intelligence.box.connect() as db:
+        statuses = {
+            row["id"]: row["status"]
+            for row in db.execute(
+                "SELECT id,status FROM events WHERE id IN (?,?)", (first_id, second_id)
+            )
+        }
+        assert statuses == {first_id: "suppressed", second_id: "delivered"}
         payload = json.loads(db.execute("SELECT payload FROM events WHERE id=?", (second_id,)).fetchone()[0])
     assert payload["expires_at"] == datetime.fromisoformat(next_decision["expires_at"]).timestamp()
-    assert reopened.box.claim() is None
+    assert reopened_intelligence.box.claim() is None
 
 
 def test_suppressed_facts_do_not_block_new_information_when_other_facts_were_delivered():

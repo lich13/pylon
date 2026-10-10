@@ -104,6 +104,23 @@ def event_rows(store):
     return rows(store, 'SELECT * FROM events ORDER BY created_at,id')
 
 
+def seed_intel_notification(store, *, status='pending'):
+    """Attach a synthetic analyzed intelligence event to the Helper topic."""
+    facts = [{'category': 'C2', 'kind': 'method', 'subject': '合成脚本',
+              'value': '按顺序执行三个操作',
+              'evidence': [{'ref': f'tg:{SOURCE}:101', 'quote': '合成脚本可按顺序执行三个操作。'}]}]
+    event_id = store.box.enqueue(
+        profile='webops', job_id='intelligence-review', kind='text',
+        payload={'text': '合成情报通知'}, key='fixture:intelligence:9101',
+    )
+    with store.box.connect() as db:
+        db.execute("UPDATE intel_items SET result=?,event_id=?,status='queued' "
+                   "WHERE source='linuxdo' AND source_id='9101'",
+                   (json.dumps({'facts': facts}, ensure_ascii=False), event_id))
+        db.execute('UPDATE events SET status=? WHERE id=?', (status, event_id))
+    return event_id
+
+
 def collection_config(**overrides):
     return {'mode': 'helper', 'max_pages': 2, 'page_size': 2, 'recheck_limit': 0,
             'fetch_timeout_seconds': 5, 'source_budget_seconds': 40} | overrides
@@ -418,7 +435,7 @@ def test_private_message_ignores_following_configuration_and_never_reaches_grok(
     assert rows(store, 'SELECT * FROM linuxdo_evidence') == []
     assert len(rows(store, 'SELECT * FROM linuxdo_helper_events')) == 1
     assert len(event_rows(store)) == 1
-    assert reviewed == {'processed': 0, 'errors': 0, 'queued': 0}
+    assert reviewed == {'processed': 0, 'errors': 0, 'queued': 0, 'captured': 0}
     request.assert_not_called()
     trade_request.assert_not_called()
     price_load.assert_not_called()
@@ -441,100 +458,96 @@ def test_following_posts_wait_for_intent_and_only_nontrade_is_direct(store, cloc
     assert rows(store, 'SELECT * FROM linuxdo_evidence') == []
     assert event_rows(store) == []
 
-    trade_request = Mock(side_effect=[
-        {'intent': 'non_trade', 'offers': []},
-        {'intent': 'wanted', 'offers': []},
-        {'intent': 'offer', 'offers': []},
-    ])
+    trade_request = Mock(side_effect=AssertionError('following posts use the shared intelligence queue'))
     result = public_review.review(store, limit=3, request=trade_request, config=trade.default_config(),
                                   model='fixture-model')
 
-    assert result == {'processed': 3, 'errors': 0, 'queued': 1}
-    assert trade_request.call_count == 3
+    assert result == {'processed': 3, 'errors': 0, 'queued': 0}
+    trade_request.assert_not_called()
     assert rows(store, 'SELECT message_id,status FROM linuxdo_public_reviews ORDER BY message_id') == [
-        {'message_id': 301, 'status': 'direct'},
-        {'message_id': 302, 'status': 'skip'},
-        {'message_id': 303, 'status': 'trade'},
+        {'message_id': 301, 'status': 'intelligence'},
+        {'message_id': 302, 'status': 'intelligence'},
+        {'message_id': 303, 'status': 'intelligence'},
     ]
     assert rows(store, 'SELECT channel,message_id,topic_id FROM linuxdo_observations') == [
+        {'channel': helper.SOURCE, 'message_id': 301, 'topic_id': '9150'},
+        {'channel': helper.SOURCE, 'message_id': 302, 'topic_id': '9150'},
         {'channel': helper.SOURCE, 'message_id': 303, 'topic_id': '9163'},
     ]
-    assert rows(store, 'SELECT message_id,kind FROM linuxdo_helper_events') == [
-        {'message_id': 301, 'kind': 'following_posted'},
-    ]
-    assert len(event_rows(store)) == 1
+    assert rows(store, 'SELECT message_id,kind FROM linuxdo_helper_events') == []
+    assert event_rows(store) == []
 
 
 def test_following_cloud_offer_joins_board_judgment_and_reuses_public_extraction_cache(store, clock):
     body = '合成脚本可按顺序执行三个操作。api_key=fixture_secret 联系 user@example.invalid。'
     save(store, short_link_message(301, topic_id='9163', body=body),
          followed=frozenset({'fixture_actor'}))
-    intent = Mock(return_value={'intent': 'cloud_offer', 'offers': []})
+    intent = Mock(side_effect=AssertionError('following posts use the shared intelligence queue'))
 
     result = public_review.review(store, request=intent, config=trade.default_config(), model='fixture-model',
                                   focus=policy.default_policy())
 
     assert result == {'processed': 1, 'errors': 0, 'queued': 0}
-    assert rows(store, 'SELECT status FROM linuxdo_public_reviews') == [{'status': 'trade'}]
+    assert rows(store, 'SELECT status FROM linuxdo_public_reviews') == [{'status': 'intelligence'}]
     assert rows(store, 'SELECT topic_id FROM linuxdo_observations') == [{'topic_id': '9163'}]
-    reviewed = intent.call_args.args[0]
-    assert 'api_key=[REDACTED]' in reviewed['evidence'][0]['body']
-    assert '[EMAIL]' in reviewed['evidence'][0]['body']
-
-    board_review = Mock(side_effect=lambda snapshot, _config: judgment(snapshot))
-    repeated_intent = Mock(side_effect=AssertionError('the cached public intent must be reused for its topic'))
+    intent.assert_not_called()
+    board_review = Mock(side_effect=AssertionError('following posts do not call the value judge'))
+    repeated_intent = Mock(side_effect=AssertionError('following posts do not call trade intent'))
     processed = pipeline.process_topic(
         store, '9163', policy.default_policy(), model='fixture-model', request=board_review,
         topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [],
         trade_request=repeated_intent, trade_config=trade.default_config(),
     )
 
-    assert processed['decision'] == 'push'
-    assert board_review.call_count == 1
+    assert processed['decision'] == 'intelligence'
+    assert processed['captured'] is True
+    board_review.assert_not_called()
     repeated_intent.assert_not_called()
-    assert store.snapshot('9163')['previously_notified'] is True
+    assert rows(store, 'SELECT source_id,evidence_scope FROM intel_items') == [
+        {'source_id': '9163', 'evidence_scope': 'helper_excerpt'},
+    ]
 
 
-def test_public_and_board_model_calls_run_concurrently_without_holding_the_collection_database(store, clock):
-    save(store, message(message_id=301, kind='watching_first_post', topic_id='9161'))
-    save(store, short_link_message(302, topic_id='9162'), followed=frozenset({'fixture_actor'}))
+def test_following_posts_enter_the_shared_intelligence_queue_without_model_calls(store, clock):
+    save(
+        store,
+        short_link_message(301, topic_id='9161'),
+        short_link_message(302, topic_id='9162'),
+        followed=frozenset({'fixture_actor'}),
+    )
     clock[0] += 31
-    started = Barrier(2)
-    release = Event()
-    both_waiting = Event()
-    call_lock = Lock()
-    calls = []
+    # Public review stages Helper notices first. Make the resulting topic
+    # claims due so this test reaches the independent intelligence capture
+    # boundary without waiting on wall-clock time.
+    assert public_review.stage(store, limit=100) == 2
+    with store.box.connect() as db:
+        db.execute("UPDATE linuxdo_topics SET next_attempt=0 WHERE topic_id IN ('9161','9162')")
+    value_request = Mock(side_effect=AssertionError('following posts do not call the value judge'))
+    trade_request = Mock(side_effect=AssertionError('following posts do not call trade intent'))
 
-    def intent(snapshot):
-        with call_lock:
-            calls.append(snapshot['topic_id'])
-            if len(calls) == 2:
-                both_waiting.set()
-        started.wait(timeout=4)
-        if not release.wait(timeout=4):
-            raise TimeoutError('model gate was not released')
-        return {'intent': 'non_trade', 'offers': []}
+    result = pipeline.review(
+        store,
+        sources={'mode': 'helper'},
+        config=policy.default_policy(),
+        model='fixture-model',
+        request=value_request,
+        trade_request=trade_request,
+        trade_config=trade.default_config(),
+        topic_fetch=Mock(side_effect=AssertionError('following posts do not fetch topics')),
+        official_fetch=Mock(side_effect=AssertionError('following posts do not fetch official pages')),
+    )
 
-    with ThreadPoolExecutor(max_workers=1) as caller:
-        future = caller.submit(
-            pipeline.review, store, sources={'mode': 'helper'}, config=policy.default_policy(),
-            model='fixture-model', request=lambda snapshot, _config: judgment(snapshot),
-            trade_request=intent, trade_config=trade.default_config(),
-            topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [],
-        )
-        try:
-            assert both_waiting.wait(timeout=4)
-            with store.box.connect() as db:
-                db.execute('BEGIN IMMEDIATE')
-                db.execute("INSERT OR REPLACE INTO linuxdo_meta(key,value) VALUES('fixture_concurrent_write','ok')")
-                db.commit()
-        finally:
-            release.set()
-        result = future.result(timeout=6)
-
-    assert len(calls) == 2 and set(calls) == {'9161', '9162'}
-    assert result == {'processed': 2, 'errors': 0, 'queued': 2}
-    assert rows(store, "SELECT value FROM linuxdo_meta WHERE key='fixture_concurrent_write'") == [{'value': 'ok'}]
+    assert result == {'processed': 2, 'errors': 0, 'queued': 0, 'captured': 2}
+    value_request.assert_not_called()
+    trade_request.assert_not_called()
+    assert rows(store, 'SELECT status FROM linuxdo_public_reviews ORDER BY message_id') == [
+        {'status': 'intelligence'},
+        {'status': 'intelligence'},
+    ]
+    assert rows(store, 'SELECT source_id,evidence_scope FROM intel_items ORDER BY source_id') == [
+        {'source_id': '9161', 'evidence_scope': 'helper_excerpt'},
+        {'source_id': '9162', 'evidence_scope': 'helper_excerpt'},
+    ]
 
 
 def test_following_posts_older_than_seven_days_never_call_model_even_after_edit(store, clock):
@@ -546,8 +559,15 @@ def test_following_posts_older_than_seven_days_never_call_model_even_after_edit(
 
     assert result == {'processed': 1, 'queued': 0, 'errors': 0}
     request.assert_not_called()
-    assert rows(store, 'SELECT status,lease_until FROM linuxdo_public_reviews') == [{'status': 'skip', 'lease_until': 0}]
-    assert rows(store, 'SELECT * FROM linuxdo_evidence') == []
+    assert rows(store, 'SELECT status,lease_until FROM linuxdo_public_reviews') == [
+        {'status': 'intelligence', 'lease_until': 0.0}
+    ]
+    # Public review is now a capture stage. Old evidence remains available to
+    # the independent intelligence worker, while no model or notification is
+    # created here.
+    evidence = rows(store, 'SELECT * FROM linuxdo_evidence')
+    assert len(evidence) == 1
+    assert '合成脚本可按顺序执行三个操作。' in evidence[0]['body']
     assert event_rows(store) == []
 
 
@@ -793,7 +813,7 @@ def test_personal_notice_has_no_model_evidence_or_value_judgment(store, kind, mo
     assert len(events) == 1
     assert '合成个人正文只应保留于独立消息表。' in json.loads(events[0]['payload'])['text']
     assert events[0]['status'] == 'pending'
-    assert reviewed == {'processed': 0, 'errors': 0, 'queued': 0}
+    assert reviewed == {'processed': 0, 'errors': 0, 'queued': 0, 'captured': 0}
     request.assert_not_called()
     trade_request.assert_not_called()
     price_load.assert_not_called()
@@ -874,18 +894,15 @@ def test_short_link_following_replies_keep_independent_events_after_nontrade_con
     result = save(store, *messages, followed=frozenset({'fixture_actor'}))
 
     assert result['following'] == 2 and result['personal'] == result['queued'] == 0
-    trade_request = Mock(return_value={'intent': 'non_trade', 'offers': []})
+    trade_request = Mock(side_effect=AssertionError('following posts use the shared intelligence queue'))
     assert public_review.review(store, limit=2, request=trade_request, config=trade.default_config(),
-                                model='fixture-model') == {'processed': 2, 'queued': 2, 'errors': 0}
-    assert trade_request.call_count == 2
-    events = rows(store, '''SELECT topic_id,post_number,event_key,event_id
-        FROM linuxdo_helper_events ORDER BY post_number''')
-    assert [(row['topic_id'], row['post_number']) for row in events] == [('9160', 3), ('9160', 4)]
-    assert len({row['event_key'] for row in events}) == len({row['event_id'] for row in events}) == 2
-    assert rows(store, 'SELECT * FROM linuxdo_observations') == []
-    assert rows(store, 'SELECT * FROM linuxdo_evidence') == []
+                                model='fixture-model') == {'processed': 2, 'queued': 0, 'errors': 0}
+    trade_request.assert_not_called()
+    evidence = store.snapshot('9160')['evidence']
+    assert sorted(row['post_number'] for row in evidence) == [3, 4]
+    assert rows(store, 'SELECT * FROM linuxdo_helper_events') == []
     assert save(store, *messages, followed=frozenset({'fixture_actor'}))['queued'] == 0
-    assert len(event_rows(store)) == 2
+    assert len(event_rows(store)) == 0
 
 
 def test_personal_message_cannot_become_model_input_after_a_board_shaped_edit(store):
@@ -905,13 +922,13 @@ def test_board_notice_enters_existing_value_pipeline(store, clock):
     result = process(store, request=request)
 
     assert saved['board'] == 1 and saved['queued'] == 0
-    request.assert_called_once()
-    snapshot = request.call_args.args[0]
-    assert snapshot['evidence'][0]['ref'] == f'tg:{SOURCE}:101'
-    assert BODY in snapshot['evidence'][0]['body']
-    assert result['decision'] == 'push' and not result['error']
-    assert result['event_id'] is not None
-    assert store.box.counts() == {'pending': 1}
+    assert result['decision'] == 'intelligence' and not result['error']
+    assert result['captured'] is True
+    request.assert_not_called()
+    assert store.box.counts() == {}
+    assert rows(store, 'SELECT source,source_id FROM intel_items') == [
+        {'source': 'linuxdo', 'source_id': '9101'}
+    ]
 
 
 def test_short_link_first_posts_keep_different_topics_and_titles_separate(store):
@@ -956,7 +973,9 @@ def test_board_edit_moves_the_message_and_evidence_to_its_new_topic(store, clock
     assert store.finish(old_snapshot, judgment(old_snapshot), message='合成过时判断') is None
     clock[0] += 31
     assert store.claim(source=SOURCE) == ['9102']
-    assert process(store, '9102')['decision'] == 'push'
+    processed = process(store, '9102')
+    assert processed['decision'] == 'intelligence'
+    assert processed['captured'] is True
     assert rows(store, 'SELECT * FROM linuxdo_notifications WHERE topic_id=?', ('9101',)) == []
 
 
@@ -967,7 +986,8 @@ def test_personal_before_board_suppresses_duplicate_without_calling_model(store,
 
     result = process(store, request=request)
 
-    assert result['decision'] == 'skip' and result['event_id'] is None
+    assert result['decision'] == 'skip'
+    assert 'event_id' not in result
     request.assert_not_called()
     assert len(event_rows(store)) == 1
     assert rows(store, 'SELECT * FROM linuxdo_notifications') == []
@@ -981,7 +1001,8 @@ def test_later_board_publication_of_the_same_post_preview_stays_silent(store, cl
 
     result = process(store, request=request)
 
-    assert result['decision'] == 'skip' and result['event_id'] is None
+    assert result['decision'] == 'skip'
+    assert 'event_id' not in result
     request.assert_not_called()
     assert len(event_rows(store)) == 1
     assert rows(store, 'SELECT * FROM linuxdo_notifications') == []
@@ -998,7 +1019,8 @@ def test_two_line_personal_header_does_not_make_the_same_board_preview_look_new(
 
     result = process(store, '9150', request=request)
 
-    assert result['decision'] == 'skip' and result['event_id'] is None
+    assert result['decision'] == 'skip'
+    assert 'event_id' not in result
     request.assert_not_called()
     assert len(event_rows(store)) == 1
     assert rows(store, 'SELECT * FROM linuxdo_notifications') == []
@@ -1020,61 +1042,73 @@ def test_new_board_preview_after_personal_notice_can_be_judged_without_private_b
 
     result = process(store, request=request)
 
-    request.assert_called_once()
-    assert result['decision'] == 'push' and result['event_id'] is not None
+    request.assert_not_called()
+    assert result['decision'] == 'intelligence'
+    assert result['captured'] is True
+    assert 'event_id' not in result
     assert not result['error']
-    snapshot = request.call_args.args[0]
-    assert private_body not in json.dumps(snapshot, ensure_ascii=False)
-    assert private_body not in judge.build_prompt(snapshot, policy.default_policy())
-    assert len(snapshot['personal_posts']) == 1
-    metadata = snapshot['personal_posts'][0]
-    assert set(metadata) == {'post_number', 'source_time', 'post_fingerprint'}
-    assert len(metadata['post_fingerprint']) == 64
-    assert len(event_rows(store)) == 2
+    assert len(event_rows(store)) == 1
+    assert rows(store, 'SELECT body FROM intel_items WHERE source=? AND source_id=?',
+                ('linuxdo', '9101'))[0]['body'].find(private_body) == -1
 
 
 def test_personal_notice_supersedes_an_unsent_board_notification(store, clock):
     save(store, message(kind='watching_category_or_tag'))
-    board_event = process(store)['event_id']
-    assert board_event is not None
+    board = process(store)
+    assert board['decision'] == 'intelligence'
+    intelligence_event = seed_intel_notification(store)
 
     result = save(store, message(102))
 
     assert result['queued'] == 1
     events = {row['id']: row for row in event_rows(store)}
-    assert events[board_event]['status'] == 'suppressed'
     personal_event = rows(store, 'SELECT event_id FROM linuxdo_helper_events')[0]['event_id']
-    assert personal_event != board_event
+    assert intelligence_event in events
+    assert events[intelligence_event]['status'] == 'suppressed'
     assert events[personal_event]['status'] == 'pending'
+    assert personal_event != intelligence_event
+    assert len(events) == 2
+    assert rows(store, "SELECT event_id,status FROM intel_items WHERE source='linuxdo'") == [
+        {'event_id': None, 'status': 'pending'},
+    ]
 
 
 @pytest.mark.parametrize('delivery_status', ['delivered', 'sending', 'uncertain'])
-def test_personal_notice_does_not_duplicate_board_already_sent_or_sending(store, clock, delivery_status):
+@pytest.mark.parametrize('edited_before_personal', [False, True], ids=['live-evidence', 'edited-away'])
+def test_personal_notice_does_not_duplicate_board_already_sent_or_sending(
+        store, clock, delivery_status, edited_before_personal):
     save(store, message(kind='watching_category_or_tag'))
-    board_event = process(store)['event_id']
-    store.box.finish(board_event, delivery_status, receipt={'message_id': 501} if delivery_status == 'delivered' else None)
-
+    process(store)
+    intelligence_event = seed_intel_notification(store, status=delivery_status)
+    if edited_before_personal:
+        edited = message(kind='new_fixture_notice') | {'edited_at': EDITED_AT}
+        assert save(store, edited)['unknown'] == 1
+        assert store.snapshot('9101')['evidence'] == []
     assert save(store, message(102))['queued'] == 0
-
     assert len(event_rows(store)) == 1
-    assert rows(store, 'SELECT event_id FROM linuxdo_helper_events') == [{'event_id': board_event}]
+    assert event_rows(store)[0]['id'] == intelligence_event
     assert event_rows(store)[0]['status'] == delivery_status
+    assert rows(store, 'SELECT event_id FROM linuxdo_helper_events') == [
+        {'event_id': intelligence_event},
+    ]
 
 
 def test_personal_arriving_during_board_judgment_invalidates_the_stale_push(store, clock):
     save(store, message(kind='watching_category_or_tag'))
 
-    def request(snapshot, config):
-        decision = judgment(snapshot)
-        save(store, message(102))
-        return decision
-
+    request = Mock(side_effect=AssertionError('capture must not call the value model'))
     result = process(store, request=request)
-
-    assert result['event_id'] is None
+    assert result['decision'] == 'intelligence'
+    assert result['captured'] is True
+    request.assert_not_called()
+    intelligence_event = seed_intel_notification(store)
+    save(store, message(102))
     assert rows(store, 'SELECT * FROM linuxdo_notifications') == []
     assert len(rows(store, 'SELECT * FROM linuxdo_helper_events')) == 1
-    assert len(event_rows(store)) == 1
+    events = event_rows(store)
+    assert len(events) == 2
+    assert {row['id'] for row in events} >= {intelligence_event}
+    assert next(row for row in events if row['id'] == intelligence_event)['status'] == 'suppressed'
 
 
 def test_personal_coverage_only_blocks_facts_from_the_same_reply(store, clock):
@@ -1089,14 +1123,14 @@ def test_personal_coverage_only_blocks_facts_from_the_same_reply(store, clock):
 
 def test_unknown_edit_is_reparsed_once_and_closes_the_format_alert(store):
     save(store, message(kind='new_fixture_notice'))
-    assert len(event_rows(store)) == 1
+    assert len(event_rows(store)) == 0
     assert rows(store, 'SELECT * FROM linuxdo_observations') == []
     assert save(store, message(kind='mentioned') | {'edited_at': EDITED_AT})['queued'] == 1
     assert rows(store, 'SELECT route FROM linuxdo_helper_messages') == [{'route': 'personal'}]
     assert len(rows(store, 'SELECT * FROM linuxdo_helper_events')) == 1
     assert json.loads(rows(store, "SELECT value FROM linuxdo_meta WHERE key='helper:format_alert'")[0]['value']) is False
     assert save(store, message(kind='mentioned') | {'edited_at': EDITED_AT})['queued'] == 0
-    assert len(event_rows(store)) == 2
+    assert len(event_rows(store)) == 1
 
 
 @pytest.mark.parametrize(('recognized_kind', 'route', 'queued', 'observations'), [
@@ -1121,7 +1155,7 @@ def test_repeated_unknown_notices_raise_one_alert_until_the_condition_clears(sto
     save(store, message(kind='unknown_fixture'))
     save(store, message(102, kind='unknown_fixture'))
     save(store, message(102, kind='unknown_fixture'))
-    assert len(event_rows(store)) == 1
+    assert len(event_rows(store)) == 0
     assert rows(store, 'SELECT * FROM linuxdo_helper_events') == []
 
 
@@ -1235,10 +1269,11 @@ def test_following_snapshot_change_reparses_unresolved_public_notices(store, fol
 def test_following_snapshot_change_does_not_replay_already_direct_notice(store, clock, following_root):
     raw = published_message(301, body='合成关注者公开的非交易内容。')
     assert save(store, raw, followed=frozenset({'fixture_actor'}))['following'] == 1
-    request = Mock(return_value={'intent': 'non_trade', 'offers': []})
+    request = Mock(side_effect=AssertionError('following posts use the intelligence queue'))
     assert public_review.review(store, request=request, config=trade.default_config(),
-                                model='fixture-model')['queued'] == 1
-    assert rows(store, 'SELECT status FROM linuxdo_public_reviews') == [{'status': 'direct'}]
+                                model='fixture-model')['queued'] == 0
+    request.assert_not_called()
+    assert rows(store, 'SELECT status FROM linuxdo_public_reviews') == [{'status': 'intelligence'}]
     before = len(event_rows(store))
     write_following(following_root, [])
 
@@ -1246,13 +1281,13 @@ def test_following_snapshot_change_does_not_replay_already_direct_notice(store, 
 
     assert changed == {'collected': 0, 'queued': 0}
     assert rows(store, 'SELECT route,status FROM linuxdo_helper_messages WHERE message_id=301') == [
-        {'route': 'following', 'status': 'queued'},
+        {'route': 'following', 'status': 'accepted'},
     ]
-    assert rows(store, 'SELECT status FROM linuxdo_public_reviews') == [{'status': 'direct'}]
+    assert rows(store, 'SELECT status FROM linuxdo_public_reviews') == [{'status': 'intelligence'}]
     assert public_review.review(store, request=Mock(side_effect=AssertionError('direct notices are terminal')),
                                 config=trade.default_config(), model='fixture-model') == {
                                     'processed': 0, 'errors': 0, 'queued': 0}
-    assert len(event_rows(store)) == before == 1
+    assert len(event_rows(store)) == before == 0
 
 
 def test_corrupt_following_snapshot_does_not_interrupt_personal_collection(store, clock, following_root):
@@ -1393,7 +1428,7 @@ def test_parser_upgrade_revisits_old_unknown_messages_outside_the_recent_window(
     assert replay['error'] == '' and replay['queued'] == 0
     assert replay['changed'] == 0
     assert len(rows(store, 'SELECT * FROM linuxdo_helper_events')) == queued
-    assert len(event_rows(store)) == 1 + queued
+    assert len(event_rows(store)) == queued
 
 
 @pytest.mark.parametrize('revision_marker', ['missing', 'stale'])
@@ -1445,9 +1480,12 @@ def test_parser_upgrade_moves_old_short_link_boards_from_raw_without_replaying_h
     reviewed = pipeline.review(store, sources={'mode': 'helper'}, config=policy.default_policy(),
                                model='fixture-model', request=request,
                                topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [])
-    assert reviewed == {'processed': 2, 'errors': 0, 'queued': 2}
-    assert {call.args[0]['topic_id'] for call in request.call_args_list} == {'9161', '9162'}
-    assert all(call.args[0]['evidence'] for call in request.call_args_list)
+    assert reviewed == {'processed': 2, 'errors': 0, 'queued': 0, 'captured': 2}
+    request.assert_not_called()
+    assert rows(store, 'SELECT source_id,evidence_scope FROM intel_items ORDER BY source_id') == [
+        {'source_id': '9161', 'evidence_scope': 'helper_excerpt'},
+        {'source_id': '9162', 'evidence_scope': 'helper_excerpt'},
+    ]
     messages_after = rows(store, 'SELECT * FROM linuxdo_helper_messages ORDER BY message_id')
     evidence_after = rows(store, 'SELECT * FROM linuxdo_evidence ORDER BY topic_id,ref')
     events_after = event_rows(store)
@@ -1465,7 +1503,7 @@ def test_parser_upgrade_moves_old_short_link_boards_from_raw_without_replaying_h
     assert store.claim(source=SOURCE) == []
 
 
-@pytest.mark.parametrize('previous_status', ['skip', 'delivered'])
+@pytest.mark.parametrize('previous_status', ['skip', 'intelligence'])
 def test_following_change_reparses_unknown_without_replaying_judged_short_link_boards(
         store, clock, following_root, previous_status):
     boards = [
@@ -1475,10 +1513,8 @@ def test_following_change_reparses_unknown_without_replaying_judged_short_link_b
     unknown = short_link_message(303, actor='fixture_reply', topic_id='9163', post_number=4)
     assert save(store, *boards, unknown, followed=frozenset())['unknown'] == 1
     for topic_id in ('9161', '9162'):
-        if previous_status == 'delivered':
-            event_id = process(store, topic_id)['event_id']
-            assert event_id is not None
-            store.box.finish(event_id, 'delivered', receipt={'message_id': 601})
+        if previous_status == 'intelligence':
+            assert process(store, topic_id)['decision'] == 'intelligence'
         else:
             store.finish(store.snapshot(topic_id), {'decision': 'skip', 'expires_at': ''})
     store.sync_deliveries()
@@ -1507,14 +1543,12 @@ def test_following_change_reparses_unknown_without_replaying_judged_short_link_b
                                model='fixture-model', request=request, trade_request=trade_request,
                                topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [])
 
-    assert reviewed == {'processed': 1, 'errors': 0, 'queued': 1}
+    assert reviewed == {'processed': 1, 'errors': 0, 'queued': 0, 'captured': 0}
     request.assert_not_called()
-    trade_request.assert_called_once()
-    assert rows(store, 'SELECT message_id,kind,topic_id,post_number FROM linuxdo_helper_events') == [
-        {'message_id': 303, 'kind': 'following_replied', 'topic_id': '9163', 'post_number': 4},
-    ]
-    assert len(event_rows(store)) == event_count + 1
-    assert rows(store, 'SELECT status FROM linuxdo_public_reviews WHERE message_id=303') == [{'status': 'direct'}]
+    trade_request.assert_not_called()
+    assert rows(store, 'SELECT * FROM linuxdo_helper_events') == []
+    assert len(event_rows(store)) == event_count
+    assert rows(store, 'SELECT status FROM linuxdo_public_reviews WHERE message_id=303') == [{'status': 'intelligence'}]
     assert HelperStore(store, followed=frozenset({'fixture_alpha', 'fixture_reply'})).reparse_pending() == {
         'collected': 0, 'queued': 0,
     }
@@ -1539,7 +1573,7 @@ def test_reparse_limit_does_not_let_an_unsupported_old_notice_starve_the_next_no
     ]
     assert store.checkpoint(SOURCE)['cursor'] == 102
     assert len(rows(store, 'SELECT * FROM linuxdo_helper_events')) == 1
-    assert len(event_rows(store)) == 2
+    assert len(event_rows(store)) == 1
 
 
 @pytest.mark.parametrize('history', [[message(110)], []])
@@ -1661,7 +1695,7 @@ def test_network_failures_back_off_open_one_alert_and_recover_from_the_same_curs
         blocked = FakeAccount([])
         assert collect(store, blocked)['deferred'] is True
         assert blocked.entered == 0
-        assert len(event_rows(store)) == (1 if index >= 2 else 0)
+        assert len(event_rows(store)) == 0
         clock[0] = store.checkpoint(SOURCE)['retry_at']
     assert delays == [60, 120, 240, 480]
 
@@ -1669,9 +1703,9 @@ def test_network_failures_back_off_open_one_alert_and_recover_from_the_same_curs
     assert restored['error'] == '' and restored['caught_up'] is True
     assert store.checkpoint(SOURCE)['retry_at'] == 0
     assert rows(store, 'SELECT failures,alert_open FROM linuxdo_sources WHERE channel=?', (SOURCE,)) == [{'failures': 0, 'alert_open': 0}]
-    assert len(event_rows(store)) == 2
+    assert len(event_rows(store)) == 0
     collect(store, FakeAccount([[]]))
-    assert len(event_rows(store)) == 2
+    assert len(event_rows(store)) == 0
 
 
 def test_rate_limit_respects_server_delay_without_sleeping_or_advancing_cursor(store, clock, monkeypatch):
@@ -1698,10 +1732,10 @@ def test_expired_authorization_alerts_once_and_preserves_source_identity_and_cur
         assert result['error'] == 'AuthorizationRequired'
         assert store.checkpoint(SOURCE)['cursor'] == 100
         assert store.checkpoint(SOURCE)['identity'] == digest(IDENTITY)
-        assert len(event_rows(store)) == 1
+        assert len(event_rows(store)) == 0
         clock[0] = store.checkpoint(SOURCE)['retry_at']
     assert collect(store, FakeAccount([[]]))['error'] == ''
-    assert len(event_rows(store)) == 2
+    assert len(event_rows(store)) == 0
 
 
 @pytest.mark.parametrize('field', ['account_id', 'bot_id'])
@@ -1718,7 +1752,7 @@ def test_changed_source_identity_is_rejected_before_reading_any_messages(store, 
     assert store.checkpoint(SOURCE)['identity'] == digest(IDENTITY)
     assert store.checkpoint(SOURCE)['cursor'] == 100
     assert rows(store, 'SELECT * FROM linuxdo_helper_messages') == []
-    assert len(event_rows(store)) == 1
+    assert len(event_rows(store)) == 0
 
 
 def test_helper_store_rejects_changed_identity_and_backward_cursor_before_writing(store):
@@ -1745,9 +1779,8 @@ def test_helper_review_claims_only_topics_with_helper_board_input(store, clock):
                              model='fixture-model', request=request,
                              topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [])
 
-    assert result == {'processed': 1, 'errors': 0, 'queued': 1}
-    request.assert_called_once()
-    assert request.call_args.args[0]['topic_id'] == '9101'
+    assert result == {'processed': 1, 'errors': 0, 'queued': 0, 'captured': 1}
+    request.assert_not_called()
     retained = store.snapshot('9201')
     assert retained['status'] == 'pending'
     assert retained['lease_until'] == old['lease_until'] == 0
@@ -1768,7 +1801,7 @@ def test_helper_review_leaves_old_source_only_pending_when_there_are_no_board_no
                              model='fixture-model', request=request,
                              topic_fetch=lambda topic_id, numbers: [], official_fetch=lambda snapshot: [])
 
-    assert result == {'processed': 0, 'errors': 0, 'queued': 0}
+    assert result == {'processed': 0, 'errors': 0, 'queued': 0, 'captured': 0}
     request.assert_not_called()
     assert store.snapshot('9201')['status'] == 'pending'
     assert store.snapshot('9201')['lease_until'] == 0

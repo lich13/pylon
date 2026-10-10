@@ -8,7 +8,7 @@ from .common import digest
 
 GROUPS = {'A': '顶级 AI 资源', 'B': 'AI 编程工具', 'C': '开发与自动化',
           'D': '运维与自托管', 'E': '网络与可靠性', 'F': '效率软件与设备',
-          'G': '生活权益', 'H': '资源偏好'}
+          'G': '生活权益', 'H': '资源偏好','I':'银行支付与日常缴费'}
 CATEGORIES = dict(zip(
     ['A1', 'A2', 'A3', 'A4', 'B1', 'B2', 'B3', 'B4', 'B5',
      'C1', 'C2', 'C3', 'C4', 'D1', 'D2', 'D3', 'D4', 'D5',
@@ -23,6 +23,7 @@ CATEGORIES = dict(zip(
      '全国实用福利', '北京本地福利', '普通软件会员优惠',
      '非目标模型纯福利', '云主机促销', '影音会员与 PT', '游戏与设计素材', '论文与学术资料',
      '邮箱账号赠送', '非北京限定福利', 'WPS 福利'], strict=True))
+CATEGORIES.update({'I1':'银行与支付权益','I2':'话费与水电缴费','I3':'交通与日常消费福利'})
 CONFIG_FILE = paths.PROFILE_ROOT / 'config/linuxdo_policy.json'
 
 

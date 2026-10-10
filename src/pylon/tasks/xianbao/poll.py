@@ -18,6 +18,12 @@ def main() -> int:
     state.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run([sys.executable, "-m", "pylon.tasks.xianbao.worker", "--once"],
                             env=env, capture_output=True, text=True)
+    from pylon.tasks.intelligence.health import record
+    from pylon.outbox import Outbox
+    # The worker records real source progress. A cached fallback can exit zero
+    # without a fresh response, so the wrapper must not clear that incident.
+    if result.returncode:
+        record(Outbox(),'xianbao:collection',backlog=1,error='worker failed')
     if result.returncode == 0:
         state.unlink(missing_ok=True)
         return 0
@@ -26,14 +32,6 @@ def main() -> int:
     count = int(previous or 0) + 1
     state.write_text(f"{count}\n")
     state.chmod(0o600)
-    threshold = env.get("XIANBAO_ALERT_CONSECUTIVE_ERRORS", "3")
-    threshold = int(threshold) if threshold.isdigit() else 3
-    if threshold > 0 and count >= threshold:
-        detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
-        message = f"worker loop has {count} consecutive poll errors; latest error: {detail[-1][:600] if detail else ''}"
-        subprocess.run([sys.executable, "-m", "pylon.tasks.xianbao.alert", "--kind", "runtime-error",
-                        "--unit", "xianbao-poll", "--journal-lines", "0", "--message", message],
-                       env=env, capture_output=True, text=True, timeout=25)
     return result.returncode
 
 

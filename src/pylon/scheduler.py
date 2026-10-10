@@ -75,6 +75,9 @@ def logs(job_id: str) -> str:
     unit(job_id)
     result = redact(admin("logs", job_id)) or "暂无日志"
     from .tasks.quotes.health import JOB_IDS, status_text
+    if job_id=='intelligence-review':
+        from .tasks.intelligence.pipeline import summary
+        return result+'\n'+summary()
     return result + '\n' + status_text() if job_id in JOB_IDS else result
 
 

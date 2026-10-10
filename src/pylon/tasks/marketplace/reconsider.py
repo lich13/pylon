@@ -12,31 +12,31 @@ from .collection import client, INTERVALS
 from .store import Store
 
 CHECKPOINT='migration:market-v12:recent'
+INTELLIGENCE_CHECKPOINT='migration:intelligence-v1:market-recent'
 
 
-def stage(store, *, now=None):
+def stage(store, *, now=None, checkpoint=CHECKPOINT, include_linuxdo=True):
     now=time.time() if now is None else now
     with store.box.connect() as db:
         db.execute('BEGIN IMMEDIATE')
-        old=db.execute('SELECT value FROM marketplace_checkpoints WHERE name=?',(CHECKPOINT,)).fetchone()
+        old=db.execute('SELECT value FROM marketplace_checkpoints WHERE name=?',(checkpoint,)).fetchone()
         if old:return json.loads(old[0])
         changed=db.execute("""UPDATE marketplace_posts SET status='refresh_required'
             WHERE history=0 AND event_id IS NULL AND first_seen>=? AND first_seen<=?
               AND source IN ('chiphell','v2ex','nga')
               AND status IN ('ready','skipped','needs_review','pending_analysis','pending_price','pending_body','unavailable')""",(now-86400,now)).rowcount
         linuxdo=0
-        if db.execute("SELECT 1 FROM sqlite_master WHERE name='linuxdo_topics'").fetchone():
+        if include_linuxdo and db.execute("SELECT 1 FROM sqlite_master WHERE name='linuxdo_topics'").fetchone():
             for row in db.execute('''SELECT t.topic_id FROM linuxdo_topics t WHERE historical=0
                 AND first_seen>=? AND status IN ('skip','hold','marketplace') AND NOT EXISTS
                 (SELECT 1 FROM linuxdo_notifications n JOIN events e ON e.id=n.event_id
                  WHERE n.topic_id=t.topic_id AND e.status<>'suppressed') AND EXISTS
                 (SELECT 1 FROM linuxdo_decisions d WHERE d.topic_id=t.topic_id
                  AND json_extract(d.result,'$.intent') IN ('offer','wanted','unknown'))''',(now-86400,)).fetchall():
-                db.execute('INSERT OR REPLACE INTO linuxdo_meta VALUES(?,?)',('market_recheck:'+row[0],'pending'))
                 db.execute("UPDATE linuxdo_topics SET status='pending',next_attempt=0,body_attempted_at=0 WHERE topic_id=?",(row[0],))
                 linuxdo+=1
         result={'started_at':now,'cutoff':now-86400,'staged':changed,'linuxdo':linuxdo}
-        db.execute('INSERT INTO marketplace_checkpoints VALUES(?,?,?)',(CHECKPOINT,control.dumps(result),now))
+        db.execute('INSERT INTO marketplace_checkpoints VALUES(?,?,?)',(checkpoint,control.dumps(result),now))
     return result
 
 
@@ -85,9 +85,11 @@ def drain_source(store,source):
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--stage',action='store_true')
+    parser.add_argument('--intelligence-cutover',action='store_true')
     args=parser.parse_args();store=Store()
-    if args.stage:print(json.dumps(stage(store)));return
-    if not store.checkpoint(CHECKPOINT):raise ValueError('stage the authorized 24-hour migration first')
+    checkpoint=INTELLIGENCE_CHECKPOINT if args.intelligence_cutover else CHECKPOINT
+    if args.stage:print(json.dumps(stage(store,checkpoint=checkpoint,include_linuxdo=not args.intelligence_cutover)));return
+    if not store.checkpoint(checkpoint):raise ValueError('stage the authorized 24-hour migration first')
     with ThreadPoolExecutor(max_workers=3) as pool:
         for result in pool.map(lambda source:drain_source(store,source),INTERVALS):
             print(json.dumps(result),flush=True)

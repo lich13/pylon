@@ -3184,27 +3184,38 @@ def run_once(*, dry_run: bool = False) -> int:
         if not dry_run:
             save_state(value)
 
-    pending_alert = pop_pending_instant_alert(state)
-    if pending_alert:
-        if not dry_run:
-            events.publish(pending_alert)
-        persist(state)
-        print(pending_alert)
-        return 0
-
+    from pylon.tasks.intelligence.pipeline import ingest_v2ex
+    # Persist legacy unsent candidates into the sole intelligence queue before
+    # advancing the old cursor. Already emitted events remain immutable.
     batch = normalize_agent_delivery_batch(state.get(AGENT_BATCH_STATE_KEY))
-    if batch:
-        final_response = _agent_batch_process_current(state, batch, now_iso)
-        if not dry_run:
-            events.publish(final_response)
+    if batch and not dry_run:
+        rows=([batch['active']] if batch.get('active') else [])+batch['queue']
+        posts=[post_from_agent_payload(r['post']) for r in rows if r['kind']=='post']
+        posts=[p for p in posts if p]
+        ingest_v2ex(posts,route_decisions_by_message_id(posts))
+        from pylon.tasks.intelligence.pipeline import preserve_legacy_notice
+        for index,row in enumerate(rows):
+            if row['kind']=='arbitrage':preserve_legacy_notice(batch['batch_id']+':'+str(index),row['message'])
+        state.pop(AGENT_BATCH_STATE_KEY,None)
+        if batch.get('target_last_seen_id') is not None:state['last_seen_id']=batch['target_last_seen_id']
         persist(state)
-        print(final_response)
-        return 0
+    if not dry_run:
+        pending_alert = pop_pending_instant_alert(state)
+        if pending_alert:
+            from pylon.tasks.intelligence.pipeline import preserve_legacy_notice
+            preserve_legacy_notice('pending:'+__import__('hashlib').sha256(pending_alert.encode()).hexdigest(),pending_alert)
+            persist(state)
 
     last_seen_id = state.get("last_seen_id")
     is_bootstrap = last_seen_id is None
 
     recent_posts, meta = collect_recent_pages(last_seen_id if not is_bootstrap else None, deadline=deadline)
+    if not dry_run:
+        from pylon.tasks.intelligence.health import record
+        from pylon.outbox import Outbox
+        blocked=bool(meta.get('fetch_error') and (not recent_posts or not meta.get('hit_last_seen')))
+        record(Outbox(),'v2ex:collection',backlog=int(blocked),progress=not blocked,
+               error='source unavailable' if blocked else '')
     if not recent_posts:
         # No candidates means the cron agent does not need any structured context.
         # Keep the injected prompt tiny for the 1-minute monitoring loop.
@@ -3272,49 +3283,10 @@ def run_once(*, dry_run: bool = False) -> int:
                 'source_context':p.source_context} for p in extra_trades])
         candidate_posts=[p for p in candidate_posts if not marketplace.is_v2ex_trade(p)]
     route_decisions = route_decisions_by_message_id(candidate_posts)
-    arbitrage_posts = arbitrage_scan_posts(candidate_posts, route_decisions)
-
-    arbitrage_messages = sanitize_for_prompt(([] if dry_run else collect_arbitrage_messages(
-        "v2ex",
-        [
-            {
-                "id": p.message_id,
-                "title": strip_invisible_prompt_chars(p.title),
-                "url": strip_invisible_prompt_chars(p.v2ex_url),
-                "body_excerpt": strip_invisible_prompt_chars(p.body_excerpt),
-                "body_full": p.body_full,
-                "body_complete": p.body_complete,
-            }
-            for p in arbitrage_posts
-        ],
-    ) or []))
-
-    filtered_posts = [p for p in candidate_posts if route_decisions[p.message_id].route == "candidate"]
-    if not filtered_posts and not arbitrage_messages:
-        next_state["last_seen_id"] = target_last_seen_id
-        persist(next_state)
-        print(output.wake_agent_false())
-        return 0
-
-    agent_items = build_agent_delivery_queue(filtered_posts, arbitrage_messages)
-    if not agent_items:
-        next_state["last_seen_id"] = target_last_seen_id
-        persist(next_state)
-        print(output.wake_agent_false())
-        return 0
-
-    batch = _agent_batch_initialize(
-        next_state,
-        source_last_seen_id=source_last_seen_id,
-        target_last_seen_id=target_last_seen_id,
-        items=agent_items,
-        now_iso=now_iso,
-    )
-    final_response = _agent_batch_process_current(next_state, batch, now_iso)
-    if not dry_run:
-        events.publish(final_response)
+    if not dry_run:ingest_v2ex(candidate_posts,route_decisions)
+    next_state['last_seen_id']=target_last_seen_id
     persist(next_state)
-    print(final_response)
+    print(output.wake_agent_false())
     return 0
 
 

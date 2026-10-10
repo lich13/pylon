@@ -53,6 +53,7 @@ class HelperStore:
                                   and json.loads(old['payload']).get('_raw') != raw)
                 if changed_public:
                     ref = f'tg:{SOURCE}:{notice.message_id}'
+                    _invalidate_market(db, old['topic_id'], ref, status='awaiting_helper' if route in {'board','following'} else 'skipped')
                     # A sold-out edit must invalidate a price decision and any
                     # unsent preview before asynchronous reclassification.
                     pending = db.execute('''SELECT n.facts,e.id FROM linuxdo_notifications n
@@ -61,6 +62,10 @@ class HelperStore:
                     for item in pending:
                         if any(c.get('ref') == ref for fact in json.loads(item['facts']) for c in fact.get('evidence', [])):
                             db.execute("UPDATE events SET status='suppressed',error='source edited before delivery' WHERE id=?", (item['id'],))
+                    for item in _intel_notifications(db, old['topic_id']):
+                        if (item['status']=='pending' and item['attempts']==0 and
+                            any(c.get('ref')==ref for fact in json.loads(item['facts']) for c in fact.get('evidence',[]))):
+                            _suppress_intel(db,item['id'],'source edited before delivery')
                     db.execute('DELETE FROM linuxdo_observations WHERE channel=? AND message_id=?', (SOURCE, notice.message_id))
                     db.execute('DELETE FROM linuxdo_evidence WHERE topic_id=? AND ref=?', (old['topic_id'], ref))
                     db.execute("""UPDATE linuxdo_topics SET version=version+1,
@@ -76,7 +81,11 @@ class HelperStore:
                 counts['collected'] += 1
                 if route in counts:
                     counts[route] += 1
-                if old and not changed_public and old['route'] == 'board' and (route != 'board' or old['topic_id'] != notice.topic_id):
+                if old and not changed_public and old['route'] in {'board','following'} and (route not in {'board','following'} or old['topic_id'] != notice.topic_id):
+                    _invalidate_market(db, old['topic_id'], f'tg:{SOURCE}:{notice.message_id}',status='skipped')
+                    for item in _intel_notifications(db,old['topic_id']):
+                        if item['status']=='pending' and item['attempts']==0:
+                            _suppress_intel(db,item['id'],'source no longer public')
                     db.execute('DELETE FROM linuxdo_observations WHERE channel=? AND message_id=?', (SOURCE, notice.message_id))
                     db.execute('DELETE FROM linuxdo_evidence WHERE topic_id=? AND ref=?',
                                (old['topic_id'], f'tg:{SOURCE}:{notice.message_id}'))
@@ -102,12 +111,8 @@ class HelperStore:
             self.store.save_page(SOURCE, Page(), checkpoint, connection=db)
             unresolved = db.execute("SELECT count(*) FROM linuxdo_helper_messages WHERE route='unknown'").fetchone()[0]
             key = 'helper:format_alert'
-            row = db.execute('SELECT value FROM linuxdo_meta WHERE key=?', (key,)).fetchone()
-            opened = bool(json.loads(row[0])) if row else False
-            if unresolved and not opened:
-                self.box.enqueue(profile='webops', job_id=JOB_ID, kind='text', connection=db,
-                                 payload={'text': 'Linux.do Helper 出现未识别通知，已保留等待解析，请在 Helper 原对话查看。'},
-                                 key=f'linuxdo:helper:format:{time.time_ns()}')
+            # An unrecognized individual notice is diagnostic data, not a
+            # stalled component. It must not generate an immediate alert.
             db.execute('INSERT OR REPLACE INTO linuxdo_meta VALUES(?,?)', (key, json.dumps(bool(unresolved))))
         return counts
 
@@ -138,14 +143,18 @@ class HelperStore:
                 'SELECT ref,post_number FROM linuxdo_evidence WHERE topic_id=?', (notice.topic_id,))}
             rows = db.execute('''SELECT n.facts,e.id,e.status,e.attempts FROM linuxdo_notifications n
                 JOIN events e ON e.id=n.event_id WHERE n.topic_id=? ORDER BY n.created_at DESC''', (notice.topic_id,)).fetchall()
+            rows=[*rows,*_intel_notifications(db,notice.topic_id),*_market_notifications(db,notice.topic_id)]
             for row in rows:
                 facts = json.loads(row['facts'])
-                positions = {refs.get(c['ref'], 0) for fact in facts for c in fact.get('evidence', [])}
+                positions = {c.get('post_number', refs.get(c['ref'], 0))
+                             for fact in facts for c in fact.get('evidence', [])}
                 if positions != {notice.post_number}:
                     continue
                 if row['status'] == 'pending' and row['attempts'] == 0:
                     db.execute("UPDATE events SET status='suppressed',error='covered by personal notification' WHERE id=?",
                                (row['id'],))
+                    _suppress_intel(db,row['id'],'covered by personal notification')
+                    _suppress_market(db,row['id'],'covered by personal notification',status='skipped')
                 elif row['status'] in {'delivered', 'sending', 'uncertain'}:
                     event_id = row['id']
                     break
@@ -171,24 +180,82 @@ class HelperStore:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM linuxdo_sources WHERE channel=?', (SOURCE,)).fetchone()
             failures = (row['failures'] if row else 0) + 1 if error else 0
-            opened = bool(row['alert_open']) if row else False
-            if error and (authorization or failures >= 3) and not opened:
-                text = ('Linux.do Helper 登录已失效，请通过终端重新授权。采集起点已保留。' if authorization else
-                        'Linux.do Helper 连续采集失败，消息起点已保留，等待恢复。')
-                self.box.enqueue(profile='webops', job_id=JOB_ID, kind='text', payload={'text': text},
-                                 key=f'linuxdo:helper:failed:{time.time_ns()}', connection=db)
-                opened = True
-            elif not error and opened:
-                self.box.enqueue(profile='webops', job_id=JOB_ID, kind='text',
-                                 payload={'text': 'Linux.do Helper 采集已恢复，继续补采未处理消息。'},
-                                 key=f'linuxdo:helper:recovered:{time.time_ns()}', connection=db)
-                opened = False
+            opened = False
             checkpoint = dict(checkpoint, retry_at=retry_at)
             db.execute('''INSERT INTO linuxdo_sources(channel,checkpoint,last_success,failures,error,alert_open)
                 VALUES(?,?,?,?,?,?) ON CONFLICT(channel) DO UPDATE SET checkpoint=excluded.checkpoint,
                 last_success=CASE WHEN excluded.error='' THEN excluded.last_success ELSE linuxdo_sources.last_success END,
                 failures=excluded.failures,error=excluded.error,alert_open=excluded.alert_open''',
                        (SOURCE, json.dumps(checkpoint), now if not error else 0, failures, error[:100], int(opened)))
+        from pylon.tasks.intelligence.health import record
+        record(self.box,'linuxdo:collection',backlog=int(bool(error)),progress=not error,error=error)
+
+
+def _intel_notifications(db,topic_id):
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='intel_items'").fetchone():return []
+    rows=db.execute("""SELECT json_extract(i.result,'$.facts') facts,i.context,e.id,e.status,e.attempts
+        FROM intel_items i JOIN events e ON e.id=i.event_id
+        WHERE i.source='linuxdo' AND i.source_id=? AND json_type(i.result,'$.facts')='array'""",(topic_id,)).fetchall()
+    notifications=[]
+    for row in rows:
+        context=json.loads(row['context'] or '{}')
+        positions={r['ref']:r.get('post_number',0) for r in context.get('snapshot',{}).get('evidence',[])}
+        facts=json.loads(row['facts'])
+        for fact in facts:
+            for citation in fact.get('evidence',[]):
+                if citation['ref'] in positions:citation['post_number']=positions[citation['ref']]
+        notifications.append({**dict(row),'facts':json.dumps(facts)})
+    return notifications
+
+
+def _market_notifications(db,topic_id):
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='marketplace_posts'").fetchone():return []
+    row=db.execute("""SELECT p.source_context,e.id,e.status,e.attempts
+        FROM marketplace_posts p JOIN events e ON e.id=p.event_id
+        WHERE p.source='linuxdo' AND p.source_id=?""",(topic_id,)).fetchone()
+    if not row:return []
+    context=json.loads(row['source_context'] or '{}')
+    evidence=context.get('snapshot',{}).get('evidence',[])
+    # An edit removes the live evidence before the new snapshot is captured.
+    # Delivery identity must continue to use the original, persisted positions.
+    return [{**dict(row),'facts':json.dumps([{'evidence':[
+        {'ref':r['ref'],'post_number':r.get('post_number',0)} for r in evidence]}])}]
+
+
+def _suppress_market(db,event_id,reason,*,status='awaiting_helper'):
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='marketplace_posts'").fetchone():return
+    row=db.execute("SELECT url FROM marketplace_posts WHERE source='linuxdo' AND event_id=?",(event_id,)).fetchone()
+    if not row:return
+    db.execute("UPDATE events SET status='suppressed',error=? WHERE id=? AND status='pending' AND attempts=0",(reason,event_id))
+    if not db.execute("SELECT 1 FROM events WHERE id=? AND status='suppressed' AND attempts=0",(event_id,)).fetchone():return
+    db.execute("DELETE FROM market_ai_receipts WHERE event_id=?",(event_id,))
+    db.execute("UPDATE marketplace_posts SET event_id=NULL,status=? WHERE source='linuxdo' AND event_id=?",(status,event_id))
+    db.execute("""UPDATE events SET status='suppressed',error=? WHERE profile='webops'
+        AND job_id='marketplace-poll' AND kind='bark' AND status='pending' AND attempts=0
+        AND json_extract(payload,'$.body.url')=?""",(reason,row['url']))
+
+
+def _invalidate_market(db,topic_id,ref,*,status='awaiting_helper'):
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='marketplace_posts'").fetchone():return
+    row=db.execute("SELECT * FROM marketplace_posts WHERE source='linuxdo' AND source_id=? AND history=0",(topic_id,)).fetchone()
+    if not row:return
+    context=json.loads(row['source_context'] or '{}')
+    evidence=context.get('snapshot',{}).get('evidence',[])
+    if evidence and ref not in {r['ref'] for r in evidence}:return
+    if row['event_id']:_suppress_market(db,row['event_id'],'source edited before delivery')
+    # A result from an old in-flight analysis cannot make this row ready again.
+    # Keep its evidence for inspection until the new Helper revision is judged.
+    context['helper_stale']=True
+    db.execute("UPDATE marketplace_posts SET status=?,source_context=?,updated_at=? WHERE source='linuxdo' AND source_id=?",(status,json.dumps(context,ensure_ascii=False),time.time(),topic_id))
+    db.execute("UPDATE market_reviews SET status='resolved',updated_at=? WHERE source='linuxdo' AND source_id=? AND status='pending'",(time.time(),topic_id))
+
+
+def _suppress_intel(db,event_id,reason):
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='intel_items'").fetchone():return
+    db.execute("UPDATE events SET status='suppressed',error=? WHERE id=? AND status='pending' AND attempts=0",(reason,event_id))
+    db.execute("DELETE FROM intel_receipts WHERE event_id=? AND EXISTS(SELECT 1 FROM events WHERE id=? AND status='suppressed' AND attempts=0)",(event_id,event_id))
+    db.execute("""UPDATE intel_items SET event_id=NULL,status='pending',lease_until=0,next_attempt=0
+        WHERE event_id=? AND EXISTS(SELECT 1 FROM events WHERE id=? AND status='suppressed' AND attempts=0)""",(event_id,event_id))
 
 
 def covered_by_personal(snapshot: dict, facts: list[dict] | None = None) -> bool:

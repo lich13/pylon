@@ -15,4 +15,5 @@ pylon = "pylon.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
+"pylon.tasks.intelligence" = ["static/*.html", "static/*.js"]
 "pylon.tasks.marketplace" = ["static/*.html", "static/*.css", "static/*.js"]

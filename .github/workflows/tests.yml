@@ -18,3 +18,18 @@ jobs:
       - run: python -m pytest -q tests
       - run: node --test tools/linuxdo/linuxdo-following.test.mjs
       - run: npm test --prefix tools/chiphell
+  intelligence-web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --require-hashes -r requirements.lock
+      - run: python -m pip install --no-deps -e .
+      - name: Install isolated browser runtime
+        run: |
+          echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/playwright" >> "$GITHUB_ENV"
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright" python -m playwright install --with-deps --only-shell chromium
+      - run: python scripts/ci/intelligence-web.py

@@ -27,12 +27,26 @@ EXCLUSIVE = re.compile(
     r'|(?:不出|不发|不接|谢绝)(?:外地|异地)'
     r'|(?:外地|异地).{0,6}(?:不出|不发|勿扰)')
 SHIPPING = re.compile(r'邮寄|快递|包邮|发货|到付|顺丰')
-OFFLINE_SERVICE = re.compile(r'家政|保洁|钟点工|到店|上门|核销|洗车|洗衣|餐饮|健身|酒店|门票')
-NATIONWIDE = re.compile(r'全国(?:通用|可用|可使用|都可用)|不限(?:城市|地区|地域)|各地通用')
+OFFLINE_SERVICE = re.compile(r'家政|保洁|钟点工|到店|上门|核销|洗车|洗衣|洗鞋|寄洗|维修|护理|餐饮|健身|酒店|门票')
+NATIONWIDE = re.compile(r'全国(?:通用|可用|可使用|都可用|服务|上门)|不限(?:城市|地区|地域)|各地通用')
+REMOTE_SERVICE = re.compile(r'全国[^，,。；;\n]{0,10}(?:寄洗|寄修|取件|收件)|(?:寄洗|寄修)[^，,。；;\n]{0,8}全国')
 
 
 def regions(text: str) -> list[str]:
     return list(dict.fromkeys(ALIASES.get(x, x) for x in REGIONS.findall(text)))
+
+
+def service_regions(text: str, title: str = '') -> list[str]:
+    """Usage areas outrank the seller's mailing address or current location."""
+    clauses=[c for c in re.split(r'[\n，,。；;！!]',text) if c.strip()]
+    explicit=[c for c in clauses if regions(c) and re.search(
+        r'可用|使用|适用|核销|服务范围|服务地区|仅限|只限|限于|限定|全国',c)]
+    if explicit:return regions('\n'.join(explicit))
+    business=[c for c in clauses if regions(c) and OFFLINE_SERVICE.search(c)
+              and not re.search(r'卖家|本人在|人在|所在地|发货地',c)]
+    if business:return regions('\n'.join(business))
+    remaining=[c for c in clauses if not re.search(r'卖家|本人在|人在|所在地|发货地',c)]
+    return regions('\n'.join(remaining)) or regions(title)
 
 
 def _beijing(names: list[str]) -> bool:
@@ -75,12 +89,13 @@ def build_locality_facts(text: str, *, title: str = '', category: str = '',
 
     # A city-specific service has an intrinsic usage area even when the seller
     # omits words such as "only". Mailing a coupon does not change its validity.
-    service = category == 'virtual.service' and bool(OFFLINE_SERVICE.search(text + '\n' + title))
-    service_names = own_names or fallback_names
+    from .subjects import service_subject
+    service = bool(service_subject(text) or (category == 'virtual.service' and OFFLINE_SERVICE.search(text + '\n' + title)))
+    service_names = service_regions(text,title if title_constraints else '')
     if service and re.search(r'(?:北京|帝都).{0,4}(?:除外|不可用|不能用|不适用)'
                              r'|(?:不支持|不适用|不含).{0,4}(?:北京|帝都)', context):
         return LocalityFacts('non_beijing_local_only', service_names, ['regional_service'], preference, [])
-    if service and not NATIONWIDE.search(context):
+    if service and not (NATIONWIDE.search(context) or REMOTE_SERVICE.search(context)):
         scope = ('beijing_local_ok' if _beijing(service_names) else
                  'non_beijing_local_only' if service_names else 'unknown_region_local_only')
         return LocalityFacts(scope, service_names, ['regional_service'], preference, [])

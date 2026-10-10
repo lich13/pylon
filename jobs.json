@@ -39,7 +39,8 @@
     "schedule": "* * * * *",
     "deliver": true,
     "timeout": 1800,
-    "module": "pylon.tasks.forums.v2ex"
+    "module": "pylon.tasks.forums.v2ex",
+    "failure_notify": false
   },
   "7096dc039b73": {
     "name": "日港 iTunes 报告",
@@ -121,19 +122,27 @@
     "schedule": "* * * * *",
     "deliver": false,
     "wait_for_delivery": false,
+    "failure_notify": false,
     "timeout": 180,
     "module": "pylon.tasks.linuxdo",
-    "args": ["collect"]
+    "args": [
+      "collect"
+    ]
   },
   "linuxdo-review": {
-    "name": "Linux.do 价值判断",
+    "name": "Helper 情报与交易分流",
     "profile": "webops",
     "schedule": "* * * * *",
     "deliver": false,
     "wait_for_delivery": false,
     "timeout": 360,
     "module": "pylon.tasks.linuxdo",
-    "args": ["review"]
+    "args": [
+      "review",
+      "--limit",
+      "100"
+    ],
+    "failure_notify": false
   },
   "de91ae783a36": {
     "name": "通知补发核对",
@@ -207,5 +216,20 @@
     "failure_notify": false,
     "timeout": 300,
     "module": "pylon.tasks.marketplace.enrich"
+  },
+  "intelligence-review": {
+    "name": "情报判断与投递",
+    "profile": "webops",
+    "schedule": "* * * * *",
+    "deliver": false,
+    "failure_notify": false,
+    "wait_for_delivery": false,
+    "timeout": 600,
+    "module": "pylon.tasks.intelligence",
+    "args": [
+      "review",
+      "--limit",
+      "2"
+    ]
   }
 }

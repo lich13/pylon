@@ -102,141 +102,41 @@ def collect_source(store: Store, channel: str, config: dict, *, getter=http.fetc
 
 
 def collect(store: Store | None = None, *, config: dict | None = None, getter=http.fetch) -> dict:
+    # Only the authenticated Helper feed is an acquisition source. Old channel
+    # configurations remain readable, but cannot reactivate a second collector.
     store = store or Store()
     store.import_legacy(state_json.load(LEGACY_STATE, default={}))
-    config = config or source_config()
-    if config.get('mode') == 'helper':
-        from .helper_collect import collect as collect_helper
-        return collect_helper(store, config)
-    result = []
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = [pool.submit(collect_source, store, channel, config, getter=getter) for channel in config['channels']]
-        for future in as_completed(futures):
-            result.append(future.result())
-    store.sync_deliveries()
-    return {'sources': sorted(result, key=lambda row: row['channel']), 'changed': sum(r['changed'] for r in result)}
+    config = {'page_size':100,'recheck_limit':100,**(config or source_config()), 'mode': 'helper'}
+    from .helper_collect import collect as collect_helper
+    return collect_helper(store, config)
 
 
-def process_topic(store: Store, topic_id: str, config: dict, *, model: str,
-                  request=judge.request, topic_fetch=http.topic_evidence,
-                  official_fetch=http.official_evidence, trade_request=trade.request,
-                  trade_config: dict | None = None) -> dict:
-    try:
-        snapshot = store.snapshot(topic_id)
+def process_topic(store: Store, topic_id: str, config: dict | None = None, **unused) -> dict:
+    from pylon.tasks.intelligence.pipeline import capture_linuxdo
+    from .helper_store import covered_by_personal
+    snapshot = store.snapshot(topic_id)
+    captured = capture_linuxdo(store, snapshot)
+    if covered_by_personal(snapshot):
+        store.finish(snapshot, {'decision':'skip','expires_at':''})
         with store.box.connect() as db:
-            fresh_required=bool(db.execute('SELECT 1 FROM linuxdo_meta WHERE key=?',('market_recheck:'+topic_id,)).fetchone())
-        from .helper_store import covered_by_personal
-        if covered_by_personal(snapshot):
-            store.finish(snapshot, {'decision': 'skip', 'expires_at': ''})
-            return {'topic_id': topic_id, 'decision': 'skip', 'event_id': None, 'error': ''}
-        from pylon.tasks.marketplace.ai_prices import config as shared_prices
-        trade_config = shared_prices() if trade_config is None else trade.validate_config(trade_config)
-        if ((snapshot['expires_at'] and snapshot['expires_at'] <= time.time())
-                or time.time() - snapshot['updated_at'] > 7 * 86400):
-            store.finish(snapshot, {'decision': 'skip', 'expires_at': ''})
-            return {'topic_id': topic_id, 'decision': 'expired'}
-        # Expensive reads are retried separately from collection and never hold a write transaction.
-        if fresh_required or time.time() - snapshot['body_attempted_at'] >= min(21600, 300 * 2 ** min(snapshot['attempts'], 6)):
-            try:
-                numbers = [e['post_number'] for e in snapshot['evidence'] if e['origin'] == 'telegram']
-                evidence = topic_fetch(topic_id, numbers)
-            except Exception:
-                evidence = []
-            if fresh_required:
-                if not any(r.get('complete') and r.get('post_number')==1 for r in evidence):
-                    store.defer(topic_id,'fresh_body_unavailable')
-                    return {'topic_id':topic_id,'decision':'hold','error':'fresh_body_unavailable'}
-                with store.box.connect() as db:db.execute('DELETE FROM linuxdo_meta WHERE key=?',('market_recheck:'+topic_id,))
-            store.add_evidence(topic_id, evidence)
-            snapshot = store.snapshot(topic_id)
-            store.add_evidence(topic_id, official_fetch(snapshot), attempted=False)
-            snapshot = store.snapshot(topic_id)
-        from pylon.tasks.marketplace import pipeline as market
-        from pylon.tasks.marketplace.linuxdo_bridge import owned_snapshot,transfer
-        trade_snapshot=owned_snapshot(snapshot) if market.enabled() else snapshot
-        trade_key = trade.cache_key(trade_snapshot, trade_config, model, focus=config)
-        extracted = store.cached(trade_key)
-        if extracted is None:
-            extracted = trade.validate(trade_request(trade_snapshot), trade_snapshot)
-            store.save_decision(trade_key, topic_id, extracted)
-        else:
-            extracted = trade.validate(extracted, trade_snapshot)
-        if extracted['intent'] not in {'non_trade', 'cloud_offer'}:
-            if market.enabled():
-                return {'topic_id':topic_id} | transfer(store,snapshot,extracted)
-            allowed = policy.allowed_categories(config)
-            filtered = [offer for offer in extracted['offers']
-                if ('B1' if offer['access'] == 'codex' else 'B2' if offer['access'] == 'claude_code' else 'A2') in allowed]
-            if extracted['offers'] and not filtered:
-                store.finish(snapshot, {'decision': 'skip', 'expires_at': ''})
-                return {'topic_id': topic_id, 'decision': 'skip', 'event_id': None, 'error': ''}
-            extracted = dict(extracted, offers=filtered)
-            return {'topic_id': topic_id} | trade_store.finish(store, snapshot, extracted, trade_config,
-                                                             run_id=os.environ.get('PYLON_RUN_ID', ''))
-        key = judge.cache_key(snapshot, config, model)
-        result = store.cached(key)
-        if result is None:
-            result = judge.validate_result(request(snapshot, config), snapshot, config)
-            store.save_decision(key, topic_id, result)
-        else:
-            # Delivery may have completed since the first decision. Reapply all local gates.
-            result = judge.validate_result(result, snapshot, config)
-        message = judge.format_message(snapshot, result) if result['decision'] == 'push' else ''
-        event_id = store.finish(snapshot, result, message=message, run_id=os.environ.get('PYLON_RUN_ID', ''))
-        return {'topic_id': topic_id, 'decision': result['decision'], 'event_id': event_id, 'error': ''}
-    except Exception as exc:
-        store.defer(topic_id, type(exc).__name__)
-        return {'topic_id': topic_id, 'decision': 'hold', 'error': type(exc).__name__}
-
-
-def review(store: Store | None = None, *, config: dict | None = None, limit: int = 2,
-           model: str | None = None, request=judge.request,
-           topic_fetch=http.topic_evidence, official_fetch=http.official_evidence,
-           sources: dict | None = None, trade_request=trade.request,
-           trade_config: dict | None = None) -> dict:
-    store = store or Store()
-    sources = sources if sources is not None else source_config()
-    from .helper import SOURCE
+            db.execute("""UPDATE intel_items SET status='excluded',lease_until=0,error='',phase='personal',result=?
+                WHERE source='linuxdo' AND source_id=?""",
+                (json.dumps({'decision':'skip','categories':[],'facts':[],'reason':'同一帖子已通过个人提醒通知'},ensure_ascii=False),topic_id))
+        return {'topic_id':topic_id,'decision':'skip','error':''}
     with store.box.connect() as db:
-        has_public = sources.get('mode') == 'helper' and db.execute('''SELECT 1
-            FROM linuxdo_public_reviews r JOIN linuxdo_helper_messages m USING(message_id)
-            WHERE m.route='following' AND r.status IN ('pending','hold') LIMIT 1''').fetchone()
-        has_topics = db.execute('''SELECT 1 FROM linuxdo_topics t
-            WHERE historical=0 AND status IN ('pending','hold') AND (?='' OR EXISTS(
-                SELECT 1 FROM linuxdo_observations o WHERE o.topic_id=t.topic_id AND o.channel=?)) LIMIT 1''',
-            (SOURCE if sources.get('mode') == 'helper' else '', SOURCE)).fetchone()
-    if not has_public and not has_topics:
-        store.sync_deliveries()
-        return {'processed': 0, 'errors': 0, 'queued': 0}
-    config = config or policy.load()
-    from pylon.tasks.marketplace.ai_prices import config as shared_prices
-    trade_config = shared_prices() if trade_config is None else trade.validate_config(trade_config)
-    model = model or judge.model_name()
-    trade_store.refresh_policy(store, trade_config, config, model)
-    # Public-author intent and board value reviews share two model slots. Neither
-    # queue must wait for the other queue's model request to finish before starting.
-    topic_ids = store.claim(limit=1 if has_public else max(1, min(limit, 2)),
-                            source=SOURCE if sources.get('mode') == 'helper' else '')
-    if not topic_ids and not has_public:
-        store.sync_deliveries()
-        return {'processed': 0, 'errors': 0, 'queued': 0}
-    summary = {'processed': 0, 'errors': 0, 'queued': 0}
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {pool.submit(process_topic, store, topic_id, config, model=model, request=request,
-                               topic_fetch=topic_fetch, official_fetch=official_fetch,
-                               trade_request=trade_request, trade_config=trade_config): 'topic' for topic_id in topic_ids}
-        if has_public:
-            from . import public_review
-            for _ in range(2 - len(topic_ids)):
-                futures[pool.submit(public_review.review, store, limit=1, request=trade_request,
-                                    config=trade_config, model=model, focus=config)] = 'public'
-        for future in as_completed(futures):
-            result = future.result()
-            if futures[future] == 'topic':
-                result = {'processed': 1, 'errors': int(bool(result.get('error'))),
-                          'queued': int(bool(result.get('event_id')))}
-            for key in summary:
-                summary[key] += result[key]
-    store.health('judge', bool(summary['errors']))
+        db.execute("DELETE FROM linuxdo_meta WHERE key=?", ('market_recheck:'+topic_id,))
+        db.execute("UPDATE linuxdo_topics SET status='intelligence',lease_until=0,error='',next_attempt=0 WHERE topic_id=? AND version=?",
+                   (topic_id,snapshot['version']))
+    return {'topic_id':topic_id,'decision':'intelligence','captured':captured,'error':''}
+
+
+def review(store: Store | None = None, *, limit: int = 100, **unused) -> dict:
+    store = store or Store()
+    from .helper import SOURCE
+    from .public_review import stage
+    public = stage(store, limit=100)
+    topic_ids = store.claim(limit=max(1,min(100,limit)),source=SOURCE)
+    results = [process_topic(store,topic_id) for topic_id in topic_ids]
     store.sync_deliveries()
-    return summary
+    return {'processed':len(results)+public,'errors':0,'queued':0,
+            'captured':sum(bool(r.get('captured')) for r in results)}

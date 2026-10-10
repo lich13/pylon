@@ -10,6 +10,20 @@ SEPARATE = re.compile(r'(?<!不)(?:另出|另售|单出|单卖|另外出售|同�
 COMPATIBLE = re.compile(r'^(?:也|还|仅|只|可|且)?(?:适配|兼容|支持|适用|用于|搭配|不含|不包括|不包含|不带)')
 OPTIONAL = re.compile(r'(?:如果|假如|若).{0,32}(?:同意|需要|愿意|想要)|(?:以后|后续|将来).{0,12}(?:可以|可能|考虑)|(?:可以|考虑|打算)(?:再|另外)?(?:订阅|升级|加购)')
 
+# The object of a service is not a physical item offered for sale. Match the
+# action together with an entitlement noun; appliances and supplies stay goods.
+SERVICE_SUBJECT = re.compile(
+    r'(?:洗鞋|洗衣|洗车|修鞋|修表|清洗|清洁|维修|保养|安装|护理)(?!机|器|液|剂|刷|设备|工具)'
+    r'[^，,。；;\n]{0,8}(?:服务|权益|券|次数|套餐|次卡)'
+    r'|(?:家政|保洁|钟点工)(?!机|器|液|剂|工具)'
+    r'|(?:上门|到店)(?:清洗|清洁|维修|安装|护理)')
+
+
+def service_subject(text: str) -> str:
+    head = subject_text(text).split('\n', 1)[0]
+    match = SERVICE_SUBJECT.search(head)
+    return match[0] if match else ''
+
 
 def incidental(clause: str) -> bool:
     return bool(not SEPARATE.search(clause) and (BACKGROUND.search(clause) or COMPATIBLE.search(clause.strip()) or OPTIONAL.search(clause)))

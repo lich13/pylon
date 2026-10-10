@@ -99,7 +99,7 @@ def item_rows(db):
     # complete archive when both contain the same post.
     rows={}
     def add(connection,where=''):
-        for value in connection.execute('SELECT source,source_id,url,title,items,updated_at,body_complete FROM marketplace_posts '+where):
+        for value in connection.execute('SELECT source,source_id,url,title,items,updated_at,body_complete,source_context FROM marketplace_posts '+where):
             row=dict(value);identity=(row['source'],row['source_id']);previous=rows.get(identity)
             if previous is None or (bool(row['body_complete']),row['updated_at'])>(bool(previous['body_complete']),previous['updated_at']):
                 rows[identity]=row
@@ -168,10 +168,12 @@ def field_card(db,d,category,field,scope='sale'):
 
 
 def preview(db,d):
-    counts={'match':0,'exclude':0,'review':0};examples={k:[] for k in counts};details={k:[] for k in counts};seen=set();fingerprints=[];complete=0;coverage={}
+    counts={'match':0,'exclude':0,'review':0};examples={k:[] for k in counts};details={k:[] for k in counts};seen=set();fingerprints=[];complete=0;helper=0;coverage={}
     for row in item_rows(db):
         identity=(row['source'],row['source_id'])
         if identity in seen:continue
+        from .content_quality import evidence_scope
+        helper+=int(evidence_scope(row)=='helper_excerpt')
         seen.add(identity);complete+=int(bool(row['body_complete']));fingerprints.append([*identity,row['updated_at'],control.digest(row['items'])])
         source=coverage.setdefault(row['source'],{'posts':0,'complete':0});source['posts']+=1;source['complete']+=int(bool(row['body_complete']))
         for item in json.loads(row['items']):
@@ -191,8 +193,11 @@ def preview(db,d):
             if len(examples[state])<3:
                 examples[state].append(row['url'])
                 details[state].append({'url':row['url'],'title':item.get('name') or item['text'].split('\n')[0],
-                                      'price':item.get('price'),'reasons':reasons or ['符合关注条件']})
-    return {'counts':counts,'examples':examples,'posts':len(seen),'complete':complete,'missing':len(seen)-complete,
+                                      'price':item.get('price'),'reasons':reasons or ['符合关注条件'],
+                                      'price_evidence':item['attributes'].get('price_evidence',''),
+                                      'region_scope':item['attributes'].get('transaction_scope','not_local'),
+                                      'usage_regions':item['attributes'].get('usage_regions',[])})
+    return {'counts':counts,'examples':examples,'posts':len(seen),'complete':complete,'helper':helper,'missing':len(seen)-complete-helper,
             'details':details,'coverage':coverage,
             'hash':control.digest([d['content'],fingerprints]),'draft_hash':control.digest(d['content']),'at':time.time()}
 
@@ -260,9 +265,10 @@ def check_post(db,url):
     row=db.execute('SELECT * FROM marketplace_posts WHERE source=? AND source_id=?',(source,match[1])).fetchone()
     if not row:return card('尚未采集到此帖。检查不会补发历史内容。')
     labels={'queued':'已入通知队列','skipped':'已筛选排除','needs_review':'待核对','pending_analysis':'等待 Grok 分析',
-            'pending_body':'等待补抓正文','pending_price':'等待 AI 报价条件分析','ready':'等待筛选','historical':'历史记录（不推送）','refresh_required':'补发前重新读取原帖'}
+            'pending_body':'等待补抓正文','pending_price':'等待 AI 报价条件分析','ready':'等待筛选','historical':'历史记录（不推送）','refresh_required':'补发前重新读取原帖',
+            'awaiting_helper':'Helper 内容已更新，等待重新判断'}
     lines=[row['title'],row['url'],'处理状态：'+labels.get(row['status'],row['status']),
-           '正文：'+('完整' if row['body_complete'] else '缺失或不完整')]
+           '内容：'+('Helper 摘要（不补抓原帖）' if __import__('pylon.tasks.marketplace.content_quality',fromlist=['evidence_scope']).evidence_scope(dict(row))=='helper_excerpt' else '完整正文' if row['body_complete'] else '正文缺失或不完整')]
     if row['platform_category']:lines.append('原站分类：'+row['platform_category'])
     decision=json.loads(row['decision'] or '{}')
     for item in decision.get('items',[]):lines.append(taxonomy.CATEGORIES.get(item['category'],'未归类')+'：'+('、'.join(item['reasons']) or '符合关注条件'))

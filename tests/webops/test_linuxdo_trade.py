@@ -15,6 +15,8 @@ from pylon.tasks.linuxdo import __main__ as linuxdo_main
 from pylon.tasks.linuxdo import helper_account, public_review, trade, trade_store
 from pylon.tasks.linuxdo.helper import SOURCE
 from pylon.tasks.linuxdo.helper_store import HelperStore
+from pylon.tasks.marketplace import linuxdo_bridge, pipeline as marketplace_pipeline
+from pylon.tasks.marketplace.store import Store as MarketplaceStore
 from pylon.tasks.linuxdo.store import Store
 
 
@@ -895,16 +897,14 @@ def test_sold_edit_suppresses_unsent_trade_and_withdraws_old_public_evidence_bef
         assert db.execute("SELECT status FROM events WHERE id=?", (queued["event_id"],)).fetchone()[0] == "suppressed"
         assert db.execute("SELECT count(*) FROM linuxdo_helper_events").fetchone()[0] == 0
 
-    captured = []
-
-    def inspect_edited(snapshot):
-        captured.append(snapshot)
-        return {"intent": "wanted", "offers": []}
-
-    public_review.review(store, request=inspect_edited, config=price_config(value), model="fixture-model")
-    assert len(captured) == 1
-    assert all("售价90元" not in row["body"] for row in captured[0]["evidence"])
-    assert all("已售出" in row["body"] for row in captured[0]["evidence"])
+    inspect_edited = Mock(side_effect=AssertionError("public review only captures Helper evidence"))
+    reviewed = public_review.review(store, request=inspect_edited, config=price_config(value), model="fixture-model")
+    assert reviewed == {"processed": 1, "errors": 0, "queued": 0}
+    inspect_edited.assert_not_called()
+    sold_snapshot = store.snapshot("9201")
+    assert len(sold_snapshot["evidence"]) == 1
+    assert "售价90元" not in sold_snapshot["evidence"][0]["body"]
+    assert "已售出" in sold_snapshot["evidence"][0]["body"]
 
     corrected = raw | {"text": "【following_posted】 @fixture_seller Codex Pro\n" +
                        initial["evidence"][0]["body"] + "；已恢复出售。",
@@ -921,6 +921,135 @@ def test_sold_edit_suppresses_unsent_trade_and_withdraws_old_public_evidence_bef
         assert db.execute("SELECT status FROM events WHERE id=?", (queued["event_id"],)).fetchone()[0] == "suppressed"
         assert db.execute("SELECT count(*) FROM linuxdo_trade_notifications").fetchone()[0] == 2
         assert db.execute("SELECT count(*) FROM events WHERE status='pending'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ('delivery_status', 'expected_personal_queue'),
+    [('pending', 1), ('sending', 0), ('uncertain', 0), ('delivered', 0)],
+)
+def test_marketplace_helper_edit_withdraws_pending_event_and_dedupes_personal_notice(
+        tmp_path, monkeypatch, delivery_status, expected_personal_queue):
+    """Helper revisions own the lifecycle of Linux.do marketplace evidence."""
+    monkeypatch.setattr(
+        marketplace_pipeline.policy,
+        'load',
+        lambda: {
+            'version': 1, 'enabled': True, 'categories': ['phone.smartphone'],
+            'groups': [], 'blocked_groups': [], 'blocked_categories': [],
+            'blocked_types': [], 'types': [], 'partial_types': [], 'filters': {},
+            'allow_beijing_pickup': True,
+        },
+    )
+    monkeypatch.setattr(
+        marketplace_pipeline.wanted,
+        'load',
+        lambda: {'version': 1, 'enabled': False, 'targets': [], 'blocked_groups': [], 'filters': {}},
+    )
+    monkeypatch.setattr('pylon.tasks.quotes.health.inspect', lambda *_: {'available': False})
+
+    store = Store(Outbox(tmp_path / f'market-helper-{delivery_status}.sqlite3'))
+    helper = HelperStore(store)
+    body = 'iPhone 15 Pro 256G，售价2999元，可邮寄。'
+    raw = {
+        'message_id': 101, 'incoming': True,
+        'text': '【following_posted】 @fixture_seller 出 iPhone 15 Pro\n' + body,
+        'published_at': '2026-01-02T03:04:05Z', 'edited_at': '',
+        'links': [{'label': '出 iPhone 15 Pro', 'url': 'https://linux.do/t/topic/9201/1', 'header': True}],
+        'buttons': [{'label': '查看原帖', 'url': 'https://linux.do/t/topic/9201/1'}],
+    }
+    checkpoint = {'identity': 'fixture-owner', 'baseline': True, 'baseline_id': 100, 'cursor': 101}
+    assert helper.save_page([raw], checkpoint)['following'] == 1
+    assert public_review.review(store) == {'processed': 1, 'errors': 0, 'queued': 0}
+    snapshot = store.snapshot('9201')
+    market = MarketplaceStore(store.box)
+    assert market.ingest('linuxdo', [{
+        'id': '9201', 'url': 'https://linux.do/t/topic/9201', 'title': '出 iPhone 15 Pro',
+        'body_full': body, 'body_complete': True, 'posted_at': raw['published_at'],
+        'source_context': {'snapshot': snapshot, 'evidence_scope': 'helper_excerpt'},
+        'body_provenance': {'source': 'helper-fixture'},
+    }]) == 1
+    assert marketplace_pipeline.process(
+        market,
+        current_policy=marketplace_pipeline.policy.load(),
+        wanted_policy=marketplace_pipeline.wanted.load(),
+        source='linuxdo',
+    ) == 1
+    with store.box.connect() as db:
+        old_row = db.execute(
+            'SELECT event_id FROM marketplace_posts WHERE source=? AND source_id=?', ('linuxdo', '9201')
+        ).fetchone()
+        old_event = old_row['event_id']
+        db.execute('UPDATE events SET status=? WHERE id=?', (delivery_status, old_event))
+
+    sold = raw | {
+        'text': '【following_posted】 @fixture_seller 出 iPhone 15 Pro\n已售出，停止出售。',
+        'edited_at': '2026-01-02T04:00:00Z',
+    }
+    assert helper.save_page([sold], checkpoint)['queued'] == 0
+    with store.box.connect() as db:
+        sold_row = db.execute(
+            'SELECT status,event_id FROM marketplace_posts WHERE source=? AND source_id=?', ('linuxdo', '9201')
+        ).fetchone()
+        assert db.execute('SELECT status FROM events WHERE id=?', (old_event,)).fetchone()[0] == (
+            'suppressed' if delivery_status == 'pending' else delivery_status
+        )
+    if delivery_status != 'pending':
+        assert sold_row['event_id'] == old_event
+        assert sold_row['status'] == 'awaiting_helper'
+        personal = sold | {
+            'message_id': 102,
+            'text': '【replied】 @fixture_seller 出 iPhone 15 Pro\n私人提醒',
+            'edited_at': '',
+        }
+        with store.box.connect() as db:
+            # The sold edit can clear live Helper evidence before the private
+            # reminder arrives; dedupe must use the persisted market snapshot.
+            db.execute("DELETE FROM linuxdo_evidence WHERE topic_id='9201'")
+        assert helper.save_page([personal], dict(checkpoint, cursor=102))['queued'] == 0
+        with store.box.connect() as db:
+            final_row = db.execute(
+                'SELECT status,event_id FROM marketplace_posts WHERE source=? AND source_id=?',
+                ('linuxdo', '9201'),
+            ).fetchone()
+            assert final_row['event_id'] == old_event and final_row['status'] == 'awaiting_helper'
+            assert db.execute('SELECT count(*) FROM events').fetchone()[0] == 1
+        return
+    assert sold_row['event_id'] is None and sold_row['status'] == 'awaiting_helper'
+
+    corrected = raw | {
+        'text': '【following_posted】 @fixture_seller 出 iPhone 15 Pro\n' + body + '；已恢复出售。',
+        'edited_at': '2026-01-02T04:05:00Z',
+    }
+    assert helper.save_page([corrected], checkpoint)['queued'] == 0
+    assert public_review.review(store) == {'processed': 1, 'errors': 0, 'queued': 0}
+    transfer = linuxdo_bridge.transfer(store, store.snapshot('9201'), {'intent': 'offer', 'offers': []})
+    assert transfer['decision'] == 'marketplace'
+    with store.box.connect() as db:
+        new_row = db.execute(
+            'SELECT status,event_id FROM marketplace_posts WHERE source=? AND source_id=?', ('linuxdo', '9201')
+        ).fetchone()
+        new_event = new_row['event_id']
+        assert new_row['status'] == 'queued' and new_event and new_event != old_event
+        assert db.execute('SELECT status FROM events WHERE id=?', (new_event,)).fetchone()[0] == 'pending'
+
+    personal = corrected | {
+        'message_id': 102,
+        'text': '【replied】 @fixture_seller 出 iPhone 15 Pro\n私人提醒',
+        'edited_at': '',
+    }
+    personal_result = helper.save_page([personal], dict(checkpoint, cursor=102))
+    assert personal_result['queued'] == expected_personal_queue
+    with store.box.connect() as db:
+        final_row = db.execute(
+            'SELECT status,event_id FROM marketplace_posts WHERE source=? AND source_id=?', ('linuxdo', '9201')
+        ).fetchone()
+        assert db.execute('SELECT status FROM events WHERE id=?', (old_event,)).fetchone()[0] == 'suppressed'
+        if expected_personal_queue:
+            assert db.execute('SELECT status FROM events WHERE id=?', (new_event,)).fetchone()[0] == 'suppressed'
+            assert final_row['event_id'] is None and final_row['status'] == 'skipped'
+            assert db.execute('SELECT count(*) FROM events WHERE status="pending"').fetchone()[0] == 1
+        else:
+            assert final_row['event_id'] == new_event
 
 
 def test_trade_config_cli_atomically_installs_confirmed_private_configuration(tmp_path, monkeypatch, capsys):

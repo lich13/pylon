@@ -26,7 +26,8 @@ def replay(source: Path,target: Path):
         if db.execute('SELECT COUNT(*) FROM events').fetchone()[0]:raise ValueError('archive contains notifications')
         for row in db.execute('SELECT * FROM marketplace_posts').fetchall():
             old=json.loads(row['items']);old_match=bool(policy.evaluate(old,sale)+wanted.evaluate(old,buy))
-            new=classifier.classify_listing(row['title'],row['body'],row['source'],bool(row['body_complete']),platform_category=row['platform_category'])
+            from .content_quality import evidence_scope
+            new=classifier.classify_listing(row['title'],row['body'],row['source'],bool(row['body_complete']),platform_category=row['platform_category'],evidence_scope=evidence_scope(dict(row)))
             new_match=bool(policy.evaluate(new,sale)+wanted.evaluate(new,buy))
             analysis=enrich.needs_analysis(dict(row),new)
             counts['needs_analysis']+=analysis

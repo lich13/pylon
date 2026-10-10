@@ -314,6 +314,10 @@ def _refill_live_source(store, source: str, *, limit: int, deadline: float, ctx=
                             store.body_error(row,'body_missing_or_incomplete',permanent=row['attempts']>=4)
                         else:
                             store.ingest(source,[post])
+                            if source=='v2ex':
+                                from pylon.tasks.intelligence.pipeline import capture_v2ex_trade
+                                from pylon.tasks.intelligence.store import Store as IntelStore
+                                capture_v2ex_trade(post,store=IntelStore(store.box))
                     except SourceRateLimited:
                         store.body_error(row,'source_rate_limited')
                         store.checkpoint(source+':cooldown',{'until':time.time()+60})
@@ -388,6 +392,10 @@ def _refill_history_compat(store, *, limit: int = 12):
                             store.body_error(row,'body_missing_or_incomplete',permanent=history or row['attempts']>=4)
                         else:
                             store.ingest(source,[post],history=history)
+                            if source=='v2ex' and not history:
+                                from pylon.tasks.intelligence.pipeline import capture_v2ex_trade
+                                from pylon.tasks.intelligence.store import Store as IntelStore
+                                capture_v2ex_trade(post,store=IntelStore(store.box))
                     except SourceRateLimited:
                         store.body_error(row,'source_rate_limited')
                         store.checkpoint('nga:cooldown',{'until':time.time()+60})

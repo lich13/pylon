@@ -28,7 +28,11 @@ def is_v2ex_trade(post) -> bool:
 
 
 def ingest(source: str, posts: list[dict]) -> int:
-    return Store().ingest(source, posts)
+    count=Store().ingest(source, posts)
+    if source=='v2ex':
+        from pylon.tasks.intelligence.pipeline import capture_v2ex_trade
+        for post in posts:capture_v2ex_trade(post)
+    return count
 
 
 def _quote_matches(items: list[dict], complete: bool, quotes: list) -> list[dict]:
@@ -57,7 +61,8 @@ def format_message(post: dict, items: list[dict], matches: list[dict]) -> str:
     title = re.sub(r'[\[\]\r\n]', ' ', post['title']).strip()
     lines = [f'## {label} 二手交易' + (' · 重点比价' if matches else ''), f'[{title}]({post["url"]})']
     if not post.get('body_complete'):
-        lines.append('正文暂不可读，仅依据标题；价格与交易条件请查看原帖。')
+        from .content_quality import evidence_scope
+        lines.append('依据 Helper 摘要；未说明的条件请查看原帖。' if evidence_scope(post)=='helper_excerpt' else '正文暂不可读，仅依据标题；价格与交易条件请查看原帖。')
     if any(item['attributes'].get('bundle_only') for item in items):
         totals = {item['attributes'].get('bundle_price') for item in items if item['attributes'].get('bundle_price') is not None}
         lines.append(f'仅打包出售，合计 {next(iter(totals))} 元。' if len(totals)==1 else '仅打包出售，合计价格未标。')
@@ -149,7 +154,8 @@ def process(store: Store | None = None, *, current_policy: dict | None = None,
             parsed_items = json.loads(post['items'])
             if bad_body or any(item['attributes'].get('classifier_version', CLASSIFIER_VERSION) != CLASSIFIER_VERSION
                    for item in parsed_items):
-                parsed_items = classify_listing(post['title'], post['body'], post['source'], bool(post['body_complete']),platform_category=post.get('platform_category',''))
+                from .content_quality import evidence_scope
+                parsed_items = classify_listing(post['title'], post['body'], post['source'], bool(post['body_complete']),platform_category=post.get('platform_category',''),evidence_scope=evidence_scope(post))
                 db.execute('UPDATE marketplace_posts SET items=? WHERE source=? AND source_id=?',
                            (json.dumps(parsed_items, ensure_ascii=False), post['source'], post['source_id']))
             from . import ai_prices
@@ -225,6 +231,9 @@ def process(store: Store | None = None, *, current_policy: dict | None = None,
             if text:
                 event_key=key(post['source'],post['source_id'])
                 if price_claims:event_key+=':'+control.digest([c[1] for c in price_claims])[:24]
+                if post['source']=='linuxdo':
+                    context=json.loads(post.get('source_context') or '{}')
+                    event_key+=':helper:'+control.digest([post['title'],post['body'],context.get('snapshot',{}).get('fingerprint','')])[:24]
                 payload={'text':text}
                 deadlines=[i['attributes']['ai_price_result'].get('expires_at') for i in items if i['attributes'].get('ai_price_result')]
                 deadlines=[v for v in deadlines if v]

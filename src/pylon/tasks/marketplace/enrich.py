@@ -10,8 +10,9 @@ from urllib.parse import urlsplit
 from . import classifier
 from .taxonomy import CATEGORIES, type_for
 from .subjects import FIELDS
+from .content_quality import evidence_scope, usable, helper_revision
 
-VERSION = 'marketplace-items-v9'
+VERSION = 'marketplace-items-v10'
 CONSTRAINT = re.compile(r'已售|已出|预[订定]|求购|求收|不出售|赠送|赠品|不含|不带|打包|不拆|不单卖|'
                         r'本地|同城|自提|面交|地区|邮寄|快递|包邮|顺丰|外地|全国|'
                         r'电池|循环|维修|拆修|使用|划痕|磕碰|成新|全新|未拆|未激活')
@@ -77,11 +78,12 @@ def model_name() -> str:
 
 def fingerprint(post: dict, model: str) -> str:
     values=[post['source'],post['source_id'],post['title'],post['body'],post.get('platform_category',''),post.get('_required_fields',[]),VERSION,model]
+    if post['source']=='linuxdo':values.append(helper_revision(post))
     return hashlib.sha256(json.dumps(values,ensure_ascii=False).encode()).hexdigest()
 
 
 def needs_analysis(post: dict, items: list[dict]) -> bool:
-    if not post.get('body_complete') or not post.get('body'):
+    if not usable(post):
         return False
     items=[item for item in items if not item['attributes'].get('ai_price_result')]
     if not items:return False
@@ -106,7 +108,7 @@ def needs_analysis(post: dict, items: list[dict]) -> bool:
 
 def subject_conflict(post,items):
     """Conflict evidence prevents a title or a component from becoming a sale."""
-    if not post.get('body_complete'):return ''
+    if not usable(post):return ''
     for item in items:
         evidence=item.get('evidence','')
         if (item['category']=='component.gpu' and evidence.isdigit()
@@ -144,6 +146,7 @@ def build_prompt(post: dict) -> str:
         line=CONTACT.sub('[联系方式已省略]',line)
         clean.append(line)
     instruction=(
+        ('输入仅为 Helper 摘要，并非完整原帖。摘要明确的商品、售价和条件可提取，未出现的事实必须留空；不能把没有说明的条件当作不存在，不得联网补全。' if evidence_scope(post)=='helper_excerpt' else '')+
         '先确定真正交易的商品主体；镜头膜等保护用品、赠品、换机背景及对比设备不是主体。'
         'attributes 每项包含字段 field、原文值 value、同件商品的逐字原文 evidence。没有依据则不填。'
         'field 必须使用下方 attribute_fields 的英文键，不能自创字段；价格只放 price，不能放 attributes。'
@@ -273,7 +276,7 @@ def validate(value: dict, post: dict, *, partial: bool = False) -> list[dict]:
             if not supported_category(category,name,evidence):
                 raise AnalysisError('unsupported_category:item='+str(len(output))+':'+str(category))
             context=name+'\n'+evidence+'\n'+'\n'.join(lines[i] for i in common)
-            parsed=classifier.classify_listing(name,context,post['source'],bool(post['body_complete']),single_item=True)
+            parsed=classifier.classify_listing(name,context,post['source'],bool(post['body_complete']),single_item=True,evidence_scope=evidence_scope(post))
             possible=parsed
             if not possible:raise AnalysisError('missing_item')
             # Rebuild exactly one item from the verified source span. Local rules
@@ -362,7 +365,7 @@ def validate(value: dict, post: dict, *, partial: bool = False) -> list[dict]:
             # The span boundaries have already passed disjointness checks.
             # Keep its uncertainty separate; never reuse its price elsewhere.
             evidence='\n'.join(lines[start:end+1])
-            fallback=classifier.classify_listing(lines[start],evidence,post['source'],bool(post['body_complete']),single_item=True)
+            fallback=classifier.classify_listing(lines[start],evidence,post['source'],bool(post['body_complete']),single_item=True,evidence_scope=evidence_scope(post))
             if not fallback:raise
             item=fallback[0]
             item.update(index=len(output),category='unknown',price=None,name=lines[start][:160])
@@ -461,7 +464,7 @@ def run_pending(store, *, limit: int = 1) -> int:
                 db.execute('BEGIN IMMEDIATE')
                 current=dict(db.execute('SELECT * FROM marketplace_posts WHERE source=? AND source_id=?',(post['source'],post['source_id'])).fetchone())
                 current['_required_fields']=json.loads(job['requirements'])
-                if fingerprint(current,job['model'])!=job['fingerprint']:
+                if fingerprint(current,job['model'])!=job['fingerprint'] or current['status'] not in {'pending_analysis','queued'}:
                     db.execute("UPDATE marketplace_analyses SET status='error',error='source_changed',updated_at=? WHERE fingerprint=?",
                                (time.time(),job['fingerprint']))
                     db.execute("UPDATE marketplace_posts SET status='ready' WHERE source=? AND source_id=? AND status='pending_analysis'",
@@ -485,6 +488,12 @@ def run_pending(store, *, limit: int = 1) -> int:
             # Raw responses and prompts must never be copied into operation logs.
             reason=str(error) if isinstance(error,AnalysisError) else type(error).__name__
             with store.box.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                current=dict(db.execute('SELECT * FROM marketplace_posts WHERE source=? AND source_id=?',(post['source'],post['source_id'])).fetchone())
+                current['_required_fields']=json.loads(job['requirements'])
+                if fingerprint(current,job['model'])!=job['fingerprint'] or current['status'] not in {'pending_analysis','queued'}:
+                    db.execute("UPDATE marketplace_analyses SET status='error',error='source_changed',updated_at=? WHERE fingerprint=?",(time.time(),job['fingerprint']))
+                    continue
                 field='semantic_failures' if isinstance(error,AnalysisError) else 'network_failures'
                 failures=job[field]+1
                 terminal=failures >= (2 if isinstance(error,AnalysisError) else 3)

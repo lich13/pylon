@@ -2,15 +2,17 @@
 
 Python 机器人服务、SQLite 待发队列和 systemd timers。维护 Gmail、线报、V2EX、Linux.do、Chiphell、日港 iTunes、KDocs 报价、软件更新、数据清理、SSH 和软件维护任务；四平台统一交易处理任务在关注策略明确启用后工作。
 
-## Linux.do 聚合
+## 情报与交易分流
 
-`b7a84d1d9f21` 每分钟采集，`linuxdo-review` 独立补证和调用现有 Grok，投递由 outbox 完成。Helper 模式通过专用 Telegram 用户会话读取 `linux_do_helper_bot` 私聊；板块帖子按主题聚合并判断价值。关注者公开发帖/回复先识别交易意图，非交易内容直通，交易按同一价格策略筛选，意图不明则重试。私信和对使用者的回复、提及、引用等个人互动提醒直接入队，正文独立保存，不进入模型证据。采集不标记已读、不代为回复或点赞。板块、标签和关注用户由使用者在论坛维护。
+Linux.do 只消费 Helper 通知、摘要、编辑与链接；不主动访问原帖、JSON、回复、附件或摘要里的外链。`b7a84d1d9f21` 采集，`linuxdo-review` 将公开内容持久化到情报队列。私信、回复、提及等私人通知保持独立直达，不进入公共模型。旧频道配置不能恢复原站补抓。
 
-旧版来源配置继续采集 LinuxDoNew、linux_do_channel、linuxdo_tg，直到显式切换。Helper 分页检查点随消息在同一事务内保存，重启续采，首次接入只建立基线。新消息优先，有限回查处理编辑；未知通知保留并合并告警。个人提醒按通知身份去重，同主题不同回复各自保留。同一帖子同时命中板块订阅和个人提醒时，未发送的板块通知让位于个人提醒，已确认或回执不确定的消息不重复发送。
+`intelligence-review` 分别推进 Linux.do、V2EX 非交易与线报队列，统一发往 WebOps；线报保留既有 Bark 分级。每条摘要的具体资源、收益、方法或能力变化有原文依据即可作为线索，缺少步骤或资格细则会注明。未经核验的优惠和经验只表述为原帖声称。纯提问、闲聊、引流、重复、过期与范围外内容仍过滤。
 
-WebOps profile 的 `config/linuxdo_policy.json` 是独立、版本化的关注目录，缺省采用已确认策略。支持 `groups`、`categories` 和优先级更高的 `excluded_categories`；类别见 `pylon.tasks.linuxdo.policy.CATEGORIES`，未知类别拒绝。默认关注顶级 AI 资源，Codex、Claude Code、Grok Build、MCP/Skills、API 工具，开发自动化、自托管、代理稳定性、登录支付方法，以及全国/北京实用福利。DNS/CDN/证书、安全故障资讯、普通效率软件与硬件类关闭。纯国产模型、影音/PT、游戏素材、论文、邮箱账号、非北京限定和 WPS 福利继续排除；涉及这些产品的可复用技术方法独立判断。
+情报策略在 SQLite 中版本化保存，首次迁入原 Linux.do 关注范围，V2EX 和线报保留各自规则及地域例外。`/intel` 打开可展开的分类、来源、关键词筛选页，草稿自动保存，预览后确认应用，可恢复上一版本。交易的 `/market` 继续独立管理出售与求购，两个网页共用一次性登录与最长七天会话。更改情报策略只重评近24小时未投递候选；历史回放不会发送。
 
-主机促销仅腾讯云、阿里云，地域包含大陆、香港和海外；域名和转售排除。配置、地域、实付价格、周期和参与资格须有匹配的官方原文依据，续费未说明时明确标注。`config/linuxdo_sources.json` 可设置来源列表、分页数、请求超时和单来源预算；默认值见 `pipeline.source_config`。
+Linux.do Helper 摘要是独立证据范围：其中明确的商品、价格和地区可参与普通交易判断，但不等于完整原帖，不用于实体重点比价。AI 价格条件继续按确认的规则核对，不补猜期限、人数或总支出。服务使用地区与卖家所在地分开；卡券可邮寄不能证明服务全国可用。
+
+采集、分析、投递分离，内容指纹与模型缓存持久化；同一摘要资料不足后等待 Helper 更新或策略变更，不反复调用模型。普通失败与恢复静默；有积压且组件持续60分钟无进展时只告警一次，恢复静默。记录失败阶段和具体校验原因，单帖资料不足不是服务故障。
 
 授权入口是 `python -m pylon.tasks.linuxdo helper-auth`，必须在运行用户的交互终端使用。自己的 Telegram API 凭据、登录码和两步验证密码均隐藏输入；凭据与会话位于 WebOps profile 的 `private/linuxdo-helper`，目录权限 0700、文件权限 0600，不提交或输出内容。首次部署需预置该目录并归运行用户所有。`helper-check` 只读最近消息，输出识别计数和读取前后的已读标记是否相同。会话为 Telegram 账号级授权，程序仅访问首次授权固定的 Helper 身份；认证失效提示重新授权，限流按服务端时间延后重试。
 
@@ -26,15 +28,13 @@ AI 交易先由 Grok 提取逐项报价和原文依据，再以十进制金额�
 
 同卖家、同规格重复开帖只通知一次，累计较上次通知降价至少 10%，或明确新增权益/补货/恢复/事实纠正，才可再通知。新版本保留旧个人提醒及其隐私边界，不把已通知历史正文转入模型。正文编辑会撤回尚未开始发送的旧公开报价，再独立判断；已送达和回执不确定状态仍按 outbox 处理。采集不等待价格判断或投递。
 
-切换前停止两个 Linux.do timer，等待在途任务结束，执行 `helper-baseline --apply`。在来源配置原有字段基础上设置 `version: 2`、`mode: "helper"`、`page_size: 100`、`recheck_limit: 100`，然后恢复 timer。只有新 Helper 板块消息进入判断，旧源独有候选停止消费；旧证据、投递记录和待发消息保留。再次启动保持已有基线，不重置游标。需要回到三源时停两个 timer 并等待结束，将 `mode` 改为 `"channels"` 后恢复；Helper 暂时失败不会自动启用三源。
+首次切换须停止相关采集、分析与投递任务并等待在途完成，再执行 `python -m pylon.tasks.intelligence.migrate --apply`。迁移保留 Helper 游标、关注范围、价格规则、活动去重、个人通知和 outbox；清除强制补抓标记，仅取消从未发送的旧短故障提示。近24小时未投递且未过期的公开候选重新判断，旧记录仅供回放。已有任务运行状态不能替代真实通知验收。
 
-Grok 只处理合并后的证据并返回结构化判断，不执行操作。关注范围、证据引用、链接、关键条件和重复事实由本地校验。缺证据或暂时失败的候选退避重试，普通提问可在补充明确答案后重新判断。相同证据按策略、模型和提示词版本缓存；候选最长保留七天待处理，明确过期则关闭。通知只发 Telegram，无日报和新增机器人菜单。通知与判断在同一事务中保存；入队不等于送达，失败/不确定回执沿用 outbox。
-
-从早期脚本首次升级到持久聚合时，采集入口会原子导入旧游标、已投主题和旧待发队列。新旧入口不得同时运行。运维入口为 `python -m pylon.tasks.linuxdo status`；隔离回放使用 `replay --store <analysis.sqlite3> --input <observations.json> --limit 4`，输入是 `sources.Observation` 字段数组，回放数据库不可设为正式 outbox，且不连接发送器。仅当需要退回早期脚本时，先停两个新 timer、等待任务结束，再执行 `python -m pylon.tasks.linuxdo export-legacy --apply`，最后恢复旧模块入口与原 timer；正式 outbox 保持原样继续投递。
+该迁移还为其他三论坛的近24小时未投递交易建立独立刷新断点。执行 `python -m pylon.tasks.marketplace.reconsider --intelligence-cutover` 重新确认这些原帖后再筛选；各来源保持原有限速，断点可继续。Linux.do 不进入此刷新流程，只等待 Helper 已提供内容。
 
 ## 四平台交易
 
-`market_active` 指向 SQLite 中的生效策略版本；`config/marketplace.json` 仅作首次导入，必须显式设置 `version`、`enabled` 和 `categories`。`groups` 关注整个大类，`types` 关注小类及其细分类，`categories` 只关注指定细分类；`blocked_groups` 优先级最高，屏蔽该大类全部现有和未来子类，子类关注不能绕过。未选类别不推送，品牌、型号和规格仅作属性。类别使用 `pylon.tasks.marketplace.taxonomy` 中的稳定标识；缺失策略时保留旧流程，新 NGA 任务静默。启用后，V2EX 各节点的明确交易与拼车、CHH、NGA 和 Linux.do 公共交易共用筛选与投递。Linux.do 私人互动、非交易技术信息及官方优惠核验保持原职责。
+`market_active` 指向 SQLite 中的生效策略版本；`config/marketplace.json` 仅作首次导入，必须显式设置 `version`、`enabled` 和 `categories`。`groups` 关注整个大类，`types` 关注小类及其细分类，`categories` 只关注指定细分类；`blocked_groups` 优先级最高，屏蔽该大类全部现有和未来子类，子类关注不能绕过。未选类别不推送，品牌、型号和规格仅作属性。类别使用 `pylon.tasks.marketplace.taxonomy` 中的稳定标识；缺失策略时保留旧流程，新 NGA 任务静默。启用后，V2EX 各节点的明确交易与拼车、CHH、NGA 和 Linux.do 公共交易共用筛选与投递。Linux.do 私人互动保持独立，非交易内容进入情报模块。
 
 关注策略只匹配仍在出售的独立商品，混合帖至少一件命中才通知。整机配置和赠品不作为独立商品；北京自提和可邮寄规则适用于四个来源。正文读取失败会退避重试，最终仅以明确标题生成带缺失说明的普通通知，禁止重点比价。重点比价与普通通知共用关注清单，KDocs 无效或过期只暂停比价。
 
@@ -96,7 +96,7 @@ Agent 由 `pylon-agent.service` 按需执行，无常驻 Agent。全局串行，
 
 复杂交易分析由 `marketplace-analyze` 独立任务处理，不占用四平台采集。来源原类目、商品范围、属性证据和每阶段决定均保留；网页“检查帖子”可查看未推送原因。历史回放只能在独立数据库中运行，不产生通知。
 
-网页使用 `/pylon/market/`，由 `pylon-market-web.service` 在回环地址单 worker 运行。`config/market-web.json` 的 `public_url` 设为实际 HTTPS 页面地址；反向代理转发该路径并设置 `Host`、`X-Forwarded-Proto`，不开放整个 `/pylon/`。服务没有 sudo 提权能力。一次性登录凭据仅保留哈希，10分钟过期；Cookie 为 HttpOnly、Secure、SameSite=Strict，最长7天，退出会撤销会话。写操作校验 CSRF 与来源。客户端只改草稿；预览固定当时的数据范围，新增帖子不使确认失效，并发策略版本变化会拒绝旧草稿。
+网页使用 `/pylon/market/` 与 `/pylon/intel/`，由 `pylon-market-web.service` 在回环地址单 worker 运行。`config/market-web.json` 的 `public_url` 设为实际 HTTPS 页面地址；反向代理仅转发这两个路径并设置 `Host`、`X-Forwarded-Proto`，不开放整个 `/pylon/`。服务没有 sudo 提权能力。一次性登录凭据仅保留哈希，10分钟过期；Cookie 为 HttpOnly、Secure、SameSite=Strict，最长7天，退出会撤销会话。写操作校验 CSRF 与来源。客户端只改草稿；预览固定当时的数据范围，新增帖子不使确认失效，并发策略版本变化会拒绝旧草稿。
 
 四平台 AI 交易共用 `market_active.content.ai_prices` 中已确认的价格规则，独立于本地商品分类器：包括实付总额、期限、每30天折合价、API额度及含车主的拼车分摊。卖家报价去重继承 Linux.do 旧通知记录。执行 `python -m pylon.tasks.marketplace.migrate_v12 --apply` 会一次性迁入现用价格规则、停用旧配置交互，并加入已批准的 Apple Music、88VIP及其明确来源权益、电话/儿童手表排除；不会改动求购目标或重发历史。近24小时漏推单独经 `reconsider --stage` 与新鲜读取后处理。只读审计入口为 `python -m pylon.tasks.marketplace.audit 数据库... --before 旧策略.json --after 新策略.json`，不导入发送器。
 

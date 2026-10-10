@@ -30,11 +30,13 @@ def transfer(store,snapshot,extraction):
     body='\n\n'.join(dict.fromkeys(r['body'] for r in rows))
     title=primary['title'] if primary else snapshot['title']
     complete=bool(primary and primary['body'])
+    provenance=control.dumps({'version':1,'topic_id':snapshot['topic_id'],'identity_verified':complete,
+                              'container':'helper_notification','scope':'helper_excerpt'})
     record={'source':'linuxdo','source_id':snapshot['topic_id'],'title':title,'body':body,
             'url':'https://linux.do/t/topic/'+snapshot['topic_id'],'body_complete':int(complete),
-            'source_context':control.dumps({'snapshot':owned,'trade_extraction':extraction}),
+            'source_context':control.dumps({'snapshot':owned,'trade_extraction':extraction,'evidence_scope':'helper_excerpt'}),
             'posted_at':next((r.get('source_published_at','') for r in rows if r.get('source_published_at')),'')}
-    items=classifier.classify_listing(title,body,'linuxdo',complete)
+    items=classifier.classify_listing(title,body,'linuxdo',complete,evidence_scope='helper_excerpt')
     # Validated AI offers already own their evidence, so retain them even when
     # a local lexicon has never seen this tier or its spelling.
     from .ai_prices import offers_to_items,config
@@ -59,13 +61,12 @@ def transfer(store,snapshot,extraction):
                 VALUES('linuxdo',?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (snapshot['topic_id'],record['url'],title,body,int(complete),record['posted_at'],now,now,
                  control.dumps(items),status,current['historical'],record['source_context'],
-                 control.dumps({'version':1,'topic_id':snapshot['topic_id'],'identity_verified':complete,'container':'post_stream'})))
+                 provenance))
         elif not old['history'] and old['source_context']!=record['source_context'] and (old['status']!='queued' or ai):
-            db.execute("""UPDATE marketplace_posts SET title=?,body=?,body_complete=?,items=?,source_context=?,status='ready',updated_at=?
-                WHERE source='linuxdo' AND source_id=?""",(title,body,int(complete),control.dumps(items),record['source_context'],now,snapshot['topic_id']))
+            db.execute("""UPDATE marketplace_posts SET title=?,body=?,body_complete=?,items=?,source_context=?,body_provenance=?,status='ready',error='',updated_at=?
+                WHERE source='linuxdo' AND source_id=?""",(title,body,int(complete),control.dumps(items),record['source_context'],provenance,now,snapshot['topic_id']))
         db.execute("UPDATE linuxdo_topics SET status=?,lease_until=0,error='',next_attempt=?,attempts=attempts+1 WHERE topic_id=?",
-                   ('marketplace' if complete or current['attempts']>=3 else 'hold',now+600,snapshot['topic_id']))
-        if not complete and not current['historical']:
-            control.review(db,record,-3,'首楼正文尚不可读，目前只有频道摘要；已分开记录为采集问题')
+                   ('marketplace',now+600,snapshot['topic_id']))
+        db.execute("UPDATE market_reviews SET status='resolved',updated_at=? WHERE source='linuxdo' AND source_id=? AND item_index=-3",(now,snapshot['topic_id']))
     pipeline.process(market,source='linuxdo')
     return {'decision':'marketplace','event_id':None,'error':''}

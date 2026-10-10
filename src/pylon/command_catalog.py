@@ -56,6 +56,8 @@ COMMANDS = {item.name: item for item in (
             '识别支持的发布源，保存后校验配置；重复源不会重复添加。不支持的网站会明确提示。原“增加监控 URL”“加监控 owner/repo”仍可使用。'),
     Command('remove_monitor', '列出可移除的监控，回复对应编号完成移除', 'monitor', 'remove',
             detail='先发送此命令取得列表，再单独回复编号。编号对应此次列表中的项目；成功后结束本次选择。原“移除监控”仍可使用。'),
+    Command('intel', '打开情报筛选页，选择分类、来源和排除条件', 'intel',
+            detail='仅库库干提供。Linux.do Helper、V2EX 非交易与线报统一筛选；展开类别、多选来源和排除词，保存草稿、预览后确认应用。Linux.do只使用Helper摘要，不补抓原帖；缺少条件会注明。私人通知保持独立。可恢复上一版本。'),
     Command('market', '打开四平台交易筛选页，批量选择分类、品牌与型号', 'market',
             detail='仅库库干提供。打开一次性登录链接（10分钟有效），在网页展开分类，批量关注或排除类型、品牌、系列、型号及关键词。修改保存为草稿，预览有效清单并确认后生效；可恢复上一版本。出售与求购独立设置。网页可查看待核对、新品种及原帖处理原因；旧 Telegram 配置按钮已停用。登录最长保持7天，可退出撤销。历史样本不会自动补发。'),
     Command('gmail', '批量选择邮件样本、生成逻辑规则并预览应用', 'gmail', 'review',
@@ -84,7 +86,7 @@ RETIRED_MESSAGE = '该入口已下线，请使用 /help'
 
 
 def menu_commands(profile: str = 'default') -> list[dict[str, str]]:
-    return [{'command': item.name, 'description': item.description} for item in COMMANDS.values() if item.menu or (profile=='webops' and item.name=='market')]
+    return [{'command': item.name, 'description': item.description} for item in COMMANDS.values() if item.menu or (profile=='webops' and item.name in {'market','intel'})]
 
 
 def task_list() -> str:
@@ -94,7 +96,7 @@ def task_list() -> str:
 def help_text(name: str = '', profile: str = 'default') -> str:
     name = name.strip().removeprefix('/').split('@', 1)[0]
     if not name:
-        return 'pylon 命令\n\n' + '\n'.join(f'/{c.name} — {c.description}' for c in COMMANDS.values() if c.menu or (profile=='webops' and c.name=='market')) + '\n\n详细用法：/help 命令，例如 /help gmail'
+        return 'pylon 命令\n\n' + '\n'.join(f'/{c.name} — {c.description}' for c in COMMANDS.values() if c.menu or (profile=='webops' and c.name in {'market','intel'})) + '\n\n详细用法：/help 命令，例如 /help gmail'
     if name in RETIRED:
         return RETIRED_MESSAGE
     if name.startswith('gmail_'):
