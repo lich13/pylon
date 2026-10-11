@@ -11,7 +11,7 @@ from pathlib import Path
 from pylon.shared import paths
 from .common import clean, digest, timestamp
 
-VERSION = 'linuxdo-trade-2-helper'
+VERSION = 'linuxdo-trade-3-compact'
 CONFIG_FILE = paths.PROFILE_ROOT / 'config/linuxdo_prices.json'
 IDENTITY_FIELDS = ('product', 'tier', 'delivery', 'access', 'condition', 'currency', 'region',
                    'provider', 'model', 'quota_unit', 'quota_period')
@@ -48,6 +48,36 @@ SCHEMA = {'type': 'object', 'additionalProperties': False, 'properties': {
     'offers': {'type': 'array', 'items': {'type': 'object', 'additionalProperties': False,
                                       'properties': OFFER_PROPERTIES, 'required': list(OFFER_PROPERTIES)}}},
     'required': ['intent', 'offers', 'intel_segments']}
+
+# Sparse evidence on the wire; the fixed internal contract and all grounding
+# checks below remain unchanged. A six-plan listing no longer repeats dozens of
+# empty proof objects for every plan.
+COMPACT_PROPERTIES = {key: value for key, value in OFFER_PROPERTIES.items() if key not in [*ATTRIBUTES, 'tier']}
+COMPACT_PROPERTIES['facts'] = {'type': 'array', 'maxItems': len(ATTRIBUTES)+1, 'items': {
+    'type': 'object', 'additionalProperties': False,
+    'properties': {'field': {'type': 'string', 'enum': [*ATTRIBUTES, 'tier']}, **PROOF['properties']},
+    'required': ['field', 'value', 'ref', 'quote']}}
+COMPACT_SCHEMA = deepcopy(SCHEMA)
+COMPACT_SCHEMA['properties']['offers'] = {'type': 'array', 'maxItems': 12, 'items': {
+    'type': 'object', 'additionalProperties': False, 'properties': COMPACT_PROPERTIES, 'required': list(COMPACT_PROPERTIES)}}
+
+
+def expand_compact(value):
+    if not isinstance(value, dict) or not isinstance(value.get('offers'), list): raise TradeError('invalid compact offers')
+    expanded = deepcopy(value)
+    for offer in expanded['offers']:
+        if not isinstance(offer, dict) or set(offer) != set(COMPACT_PROPERTIES): raise TradeError('invalid compact fields')
+        facts = offer.pop('facts')
+        if not isinstance(facts, list) or len(facts) > len(ATTRIBUTES)+1: raise TradeError('invalid compact evidence')
+        for key in [*ATTRIBUTES, 'tier']: offer[key] = {'value': '', 'ref': '', 'quote': ''}
+        seen = set()
+        for fact in facts:
+            if not isinstance(fact, dict) or set(fact) != {'field', 'value', 'ref', 'quote'}: raise TradeError('invalid compact proof')
+            key = fact['field']
+            if key not in [*ATTRIBUTES, 'tier'] or key in seen: raise TradeError('duplicate or unknown compact field')
+            seen.add(key)
+            offer[key] = {k: fact[k] for k in ('value', 'ref', 'quote')}
+    return expanded
 
 
 class TradeError(ValueError):
@@ -167,7 +197,7 @@ offer=明确出售/代充/出租/拼车；wanted=求购/人找车；non_trade=�
 输入可能仅为 Helper 摘要。明确写出的商品、价格、条件就是可用证据，不得要求补抓原帖；未提到的条件留空。
 混合帖中独立于买卖、拼车的技术方法、官方优惠或资源片段可放入 intel_segments。
 intel_segments 的 value 和 quote 必须完全相同，ref 对应证据；只摘独立完整段落。交易价格、卖家宣传、个人转售、求购、付款与交易条件不能作为情报片段。纯交易、纯非交易时此数组为空。
-所有PROOF字段都返回value/ref/quote。quote必须是对应title/body连续原文。缺失三个都空。
+facts数组仅列原文有依据的字段，每项field/value/ref/quote；同一field只能出现一次。缺失字段完全省略，不输出空PROOF。quote必须是对应title/body连续原文。
 文本value从quote摘取；数字value仅十进制阿拉伯数字，quote必须证明该数字的角色和单位。
 description/personal_quota/restrictions/warranty/allocation_basis/event的value必须直接复制quote，禁止概括或拼接。文本中“一二两三”等可转成对应数字，但不能推算未知车主、期限或额度。
 description包括产品套餐、交付方式、可用功能和账号状态的完整原文依据，不能根据低价猜套餐或正常状态。
@@ -197,9 +227,13 @@ event只摘明确新增权益/补货恢复/纠正事实；普通续顶广告、�
     data = {'evidence': rows, 'previously_notified': bool(snapshot.get('previously_notified')),
             'evidence_scope': snapshot.get('evidence_scope', 'provided_content'),
             'correction': snapshot.get('analysis_correction', '')}
-    response, _ = _request_grok_structured(prompt + json.dumps(data, ensure_ascii=False), schema=SCHEMA,
-                                          name='linuxdo_trade', timeout=45, total_timeout=120)
-    return extract_grok_json(response, label='Linux.do trade')
+    started=time.monotonic()
+    response, request_id = _request_grok_structured(prompt + json.dumps(data, ensure_ascii=False), schema=COMPACT_SCHEMA,
+                                          name='linuxdo_trade', timeout=45, total_timeout=300)
+    try:return expand_compact(extract_grok_json(response, label='Linux.do trade'))
+    except Exception as error:
+        error.request_id=request_id;error.elapsed=time.monotonic()-started
+        raise
 
 
 def _chinese_number(value: str) -> Decimal:

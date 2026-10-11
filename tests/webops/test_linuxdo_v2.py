@@ -1331,7 +1331,11 @@ def test_judge_failure_retains_helper_evidence_and_allows_later_collection(
         trade_request=lambda snapshot: {"intent": "non_trade", "offers": []},
     )
 
-    assert result == {"progress": True, "error": "", "queued": 0}
+    assert result["progress"] is False
+    assert result["error"].startswith("value: JudgeError:")
+    assert "injected judgment failure" in result["error"]
+    assert result["exhausted"] is False
+    assert result["queued"] == 0
     assert request.call_count == 1
     retained = intelligence_item(intelligence_store)
     assert retained["status"] == "retry"
@@ -1369,7 +1373,11 @@ def test_invented_expiration_cannot_close_a_held_candidate(store, intelligence_s
         trade_request=lambda snapshot: {"intent": "non_trade", "offers": []},
     )
 
-    assert result == {"progress": True, "error": "", "queued": 0}
+    assert result["progress"] is False
+    assert result["error"].startswith("value: JudgeError:")
+    assert "expiration date absent from evidence" in result["error"]
+    assert result["exhausted"] is False
+    assert result["queued"] == 0
     request.assert_called_once()
     retained = intelligence_item(intelligence_store)
     assert retained["status"] == "retry"

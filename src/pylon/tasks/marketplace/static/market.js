@@ -16,7 +16,7 @@ function changed(){dirty=true;$('#save-state').textContent='正在保存草稿�
 async function save(){
   if(!dirty)return;dirty=false;const d=state.draft, sent=clone(d.content);
   try{const next=await api('draft',{id:d.id,revision:d.revision,content:sent});
-    next.draft.content=state.draft.content;state=next;$('#save-state').textContent=dirty?'正在保存草稿…':'草稿已保存';
+    next.draft.content=state.draft.content;state=next;$('#save-state').textContent=dirty?'正在保存草稿…':'';
   }catch(error){dirty=true;$('#save-state').textContent='草稿未保存';throw error;}
 }
 async function guarded(fn){if(busy)return;busy=true;try{await pending;if(dirty)await save();await fn();}catch(e){notice(e.message,true);}finally{busy=false;}}
@@ -34,7 +34,7 @@ function summary(){
     if(bits.length)rows.push(`<p>${esc(title)} · ${esc(state.fields[f])}<br>${esc(bits.join('；'))}</p>`);
   }
   $('#summary').innerHTML=rows.join('')||'<p class="muted">尚未关注出售商品</p>';
-  $('#version').textContent=`当前版本 ${state.active.version}；修改先保存到草稿，确认后生效。`;
+  $('#version').textContent=`当前版本 ${state.active.version}`;
 }
 function render(){
   $('#login').hidden=true;$('#workspace').hidden=false;$('#logout').hidden=false;
@@ -85,7 +85,7 @@ async function openFacets(key){
 }
 function renderWanted(){
   const targets=state.draft.content.wanted.targets||[];
-  $('#content').innerHTML='<h2>只看你能满足的求购</h2><p class="muted">与出售关注分别设置；型号、规格和使用地区需要对应。</p>'+targets.map((t,i)=>`<div class="review"><strong>${esc(t.model)}</strong><p>${esc(t.region||'不限地区')} ${esc(Object.entries(t.specs||{}).map(([k,v])=>k+': '+v).join('、'))}</p><button data-remove="${i}">移除此目标</button><button data-filter="${t.category}">附加条件</button></div>`).join('')+'<div class="row"><input id="wanted-new" placeholder="例如：北京 京东家政 2小时"><button id="wanted-add">加入草稿</button></div>';
+  $('#content').innerHTML='<h2>只看你能满足的求购</h2>'+targets.map((t,i)=>`<div class="review"><strong>${esc(t.model)}</strong><p>${esc(t.region||'不限地区')} ${esc(Object.entries(t.specs||{}).map(([k,v])=>k+': '+v).join('、'))}</p><button data-remove="${i}">移除此目标</button><button data-filter="${t.category}">附加条件</button></div>`).join('')+'<div class="row"><input id="wanted-new" placeholder="例如：北京 京东家政 2小时"><button id="wanted-add">加入草稿</button></div>';
   $('#content').onclick=e=>{if(e.target.dataset.remove!==undefined){targets.splice(Number(e.target.dataset.remove),1);changed();renderWanted();}if(e.target.dataset.filter)openFacets(e.target.dataset.filter);};
   $('#wanted-add').onclick=()=>guarded(async()=>{state=await api('wanted-add',{id:state.draft.id,revision:state.draft.revision,text:$('#wanted-new').value});render();});
 }
@@ -99,11 +99,11 @@ async function renderReviews(){
   }catch(e){notice(e.message,true);}
 }
 function renderCheck(){
-  $('#content').innerHTML='<h2>检查一条帖子</h2><p class="muted">查看是否抓到正文、识别到的商品，以及推送或过滤的原因。</p><div class="row"><input type="url" id="post-url" placeholder="粘贴四个平台的原帖链接"><button id="post-check">检查</button></div><pre id="check-result"></pre>';
+  $('#content').innerHTML='<h2>检查一条帖子</h2><div class="row"><input type="url" id="post-url" placeholder="粘贴四个平台的原帖链接"><button id="post-check">检查</button></div><pre id="check-result"></pre>';
   $('#post-check').onclick=async()=>{try{const result=await api('check?url='+encodeURIComponent($('#post-url').value));$('#check-result').textContent=result.text;}catch(e){notice(e.message,true);}};
 }
 $('#preview').onclick=()=>guarded(async()=>{previewResult=await api('preview',{id:state.draft.id,revision:state.draft.revision});const p=previewResult;
-  $('#preview-result').innerHTML=`<h3>确认有效关注清单</h3>${$('#summary').innerHTML}<p class="muted">统计截至 ${new Date(p.at*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}（北京时间）</p><div class="counts">${[['match','保留'],['exclude','排除'],['review','待核对']].map(([k,l])=>`<div>${l}<strong>${p.counts[k]}</strong>件</div>`).join('')}</div><p>回放 ${p.posts} 帖，原记录完整 ${p.complete}，Helper 摘要 ${p.helper||0}，缺正文 ${p.missing}。历史回放不发送通知。</p>${Object.entries(p.details).map(([k,entries])=>`<h3>${{match:'保留样本',exclude:'排除样本',review:'待核对样本'}[k]}</h3>${entries.map(d=>`<p><a href="${esc(d.url)}" target="_blank" rel="noreferrer">${esc(d.title)}</a><br>${esc(d.reasons.join('；'))}${d.price!==null?' · '+d.price+'（原帖标价）':''}${d.price_evidence?'<br>售价依据：'+esc(d.price_evidence):''}${d.usage_regions?.length?'<br>服务使用地区：'+esc(d.usage_regions.join('、')):''}</p>`).join('')}`).join('')}<details><summary>历史覆盖与缺口</summary>${Object.entries(p.coverage).map(([source,v])=>`<p>${esc(source)}：${v.posts} 帖，原记录完整 ${v.complete} 帖。</p>`).join('')}<p>CHH 留存不足90天；V2EX 受公开频道覆盖限制；Linux.do 仅使用 Helper 摘要，均不代表全站。</p></details><p>确认后用于后续处理。已有通知不会重发。</p>`;
+  $('#preview-result').innerHTML=`<h3>确认有效关注清单</h3>${$('#summary').innerHTML}<p class="muted">统计截至 ${new Date(p.at*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}（北京时间）</p><div class="counts">${[['match','保留'],['exclude','排除'],['review','待核对']].map(([k,l])=>`<div>${l}<strong>${p.counts[k]}</strong>件</div>`).join('')}</div><p>回放 ${p.posts} 帖，原记录完整 ${p.complete}，Helper 摘要 ${p.helper||0}，缺正文 ${p.missing}。历史回放不发送通知。</p>${Object.entries(p.details).map(([k,entries])=>`<h3>${{match:'保留样本',exclude:'排除样本',review:'待核对样本'}[k]}</h3>${entries.map(d=>`<p><a href="${esc(d.url)}" target="_blank" rel="noreferrer">${esc(d.title)}</a><br>${esc(d.reasons.join('；'))}${d.price!==null?' · '+d.price+'（原帖标价）':''}${d.price_evidence?'<br>售价依据：'+esc(d.price_evidence):''}${d.usage_regions?.length?'<br>服务使用地区：'+esc(d.usage_regions.join('、')):''}</p>`).join('')}`).join('')}<details><summary>历史覆盖与缺口</summary>${Object.entries(p.coverage).map(([source,v])=>`<p>${esc(source)}：${v.posts} 帖，原记录完整 ${v.complete} 帖。</p>`).join('')}<p>CHH 留存不足90天；V2EX 受公开频道覆盖限制；Linux.do 仅使用 Helper 摘要，均不代表全站。</p></details>`;
   $('#preview-dialog').showModal();});
 $('#apply').onclick=()=>guarded(async()=>{const result=await api('apply',{id:state.draft.id,revision:state.draft.revision,hash:previewResult.hash});state=await api('state');$('#preview-dialog').close();notice(`已应用版本 ${result.version}。`);render();});
 $('#back').onclick=()=>$('#preview-dialog').close();

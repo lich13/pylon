@@ -62,7 +62,7 @@ def main():
             with page.expect_response(lambda r:r.url.endswith('/pylon/intel/api/draft') and r.request.method=='POST') as response:
                 action()
             assert response.value.status==200
-            expect(page.locator('#save-state')).to_have_text('草稿已保存')
+            expect(page.locator('#save-state')).to_have_text('')
 
         def apply(page):
             page.get_by_role('button',name='预览影响',exact=True).click()

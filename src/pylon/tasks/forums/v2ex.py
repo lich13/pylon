@@ -3263,6 +3263,9 @@ def run_once(*, dry_run: bool = False) -> int:
         print(output.wake_agent_false())
         return 0
 
+    if not dry_run:
+        from pylon.tasks.daily_review.capture import v2ex as capture_review
+        capture_review(candidate_posts)
     from pylon.tasks.marketplace import pipeline as marketplace
     if marketplace.enabled():
         trade_posts = [post for post in candidate_posts if marketplace.is_v2ex_trade(post)]

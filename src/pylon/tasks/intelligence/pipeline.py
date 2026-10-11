@@ -9,7 +9,7 @@ from pylon.config import redact
 from pylon.tasks.linuxdo import judge,trade
 from pylon.tasks.linuxdo.common import timestamp
 from pylon.tasks.marketplace.control import digest,dumps
-from . import health,policy
+from . import health,policy,attempts
 from .store import Store,active
 
 VERSION='intelligence-v1'
@@ -58,7 +58,8 @@ def ingest_xianbao(post,decision,eligible,*,bark=None,store=None):
         body=str(post.get('body') or post.get('content') or ''),url=full_url(post),
         published_at=str(post.get('published_at') or post.get('time') or ''),
         evidence_scope='forum_body' if post.get('body') else 'excerpt',
-        context={'native':asdict(decision),'eligible':eligible,'bark':bark or {}})
+        context={'native':asdict(decision),'eligible':eligible,'bark':bark or {},
+                 'first_seen':post.get('_review_first_seen')})
 
 
 def snapshot_for(item):
@@ -144,6 +145,8 @@ def finish(store,item,result,version,config):
         elif item['historical']:state='historical'
         db.execute('UPDATE intel_items SET result=?,status=?,event_id=COALESCE(?,event_id),lease_until=0,error=\'\',phase=\'complete\',policy_version=?,updated_at=? WHERE source=? AND source_id=?',
             (dumps(stored),state,event_id,version,now,item['source'],item['source_id']))
+        from pylon.tasks.daily_review.store import record
+        record(db,item['source'],item['source_id'],lane='intel',status=state,result=stored,rule_version=version,event_id=event_id)
     return {'progress':True,'decision':verdict,'queued':int(bool(event_id))}
 
 
@@ -158,19 +161,18 @@ def process_item(store,item,*,value_request=judge.request,trade_request=trade.re
         if item['source']=='v2ex' and context.get('route')=='exclude' and not context.get('trade'):
             return finish(store,item,{'decision':'skip','reason':context['reason'],'categories':[],'facts':[]},version,config)
         snapshot=snapshot_for(item);focus=policy.model_focus(config,item['source'])
-        if item.get('semantic_attempts',0) and item['error']:
-            snapshot={**snapshot,'analysis_correction':item['error'][:300]}
         if item['source']=='v2ex' and context.get('trade'):
             phase='trade_extraction'
             key=trade.cache_key(snapshot,{},judge.model_name(),focus=focus)
             extracted=store.cached(key)
             if extracted is None:
-                extracted=trade.validate(trade_request(snapshot),snapshot);store.cache(key,extracted)
+                snapshot={**snapshot,'analysis_correction':attempts.correction(store,item,phase)}
+                extracted=attempts.call(store,item,phase,lambda:trade_request(snapshot),lambda value:trade.validate(value,snapshot));store.cache(key,extracted)
             if extracted['intent'] in {'offer','wanted','unknown'}:
                 from .routing import residual
                 snapshot=residual(snapshot,extracted)
                 if not snapshot['evidence']:
-                    with store.box.connect() as db:db.execute("UPDATE intel_items SET status='trade',result=?,lease_until=0,error='',phase='trade' WHERE source=? AND source_id=? AND fingerprint=?",(dumps(extracted),item['source'],item['source_id'],item['fingerprint']))
+                    with store.box.connect() as db:db.execute("UPDATE intel_items SET status='trade',result=?,lease_until=0,error='',phase='trade',updated_at=? WHERE source=? AND source_id=? AND fingerprint=?",(dumps(extracted),time.time(),item['source'],item['source_id'],item['fingerprint']))
                     return {'progress':True,'decision':'trade','queued':0}
         if item['source']=='linuxdo':
             from pylon.tasks.linuxdo.store import Store as LinuxStore
@@ -181,7 +183,9 @@ def process_item(store,item,*,value_request=judge.request,trade_request=trade.re
                 phase='trade_extraction';prices=ai_prices.config()
                 key=trade.cache_key(owned,prices,judge.model_name(),focus=focus)
                 extracted=store.cached(key) or legacy.cached(key)
-                if extracted is None:extracted=trade.validate(trade_request(owned),owned);store.cache(key,extracted)
+                if extracted is None:
+                    owned={**owned,'analysis_correction':attempts.correction(store,item,phase)}
+                    extracted=attempts.call(store,item,phase,lambda:trade_request(owned),lambda value:trade.validate(value,owned));store.cache(key,extracted)
                 else:extracted=trade.validate(extracted,owned)
                 if extracted['intent'] in {'non_trade','cloud_offer'}:
                     with store.box.connect() as db:
@@ -202,41 +206,65 @@ def process_item(store,item,*,value_request=judge.request,trade_request=trade.re
                             db.execute("UPDATE intel_items SET lease_until=0,next_attempt=0 WHERE source=? AND source_id=? AND fingerprint=? AND status IN ('pending','retry')",
                                        (item['source'],item['source_id'],item['fingerprint']))
                         return {'progress':True,'stale':True,'queued':0}
-                    with store.box.connect() as db:db.execute("UPDATE intel_items SET status='trade',result=?,lease_until=0,error='',phase='trade' WHERE source=? AND source_id=? AND fingerprint=?",(dumps(extracted),item['source'],item['source_id'],item['fingerprint']))
+                    with store.box.connect() as db:db.execute("UPDATE intel_items SET status='trade',result=?,lease_until=0,error='',phase='trade',updated_at=? WHERE source=? AND source_id=? AND fingerprint=?",(dumps(extracted),time.time(),item['source'],item['source_id'],item['fingerprint']))
                     from .routing import residual
                     snapshot=residual(snapshot,extracted)
                     if not snapshot['evidence']:return {'progress':True,'decision':'trade','queued':0}
         phase='value';key=digest([VERSION,snapshot['fingerprint'],focus,judge.PROMPT_VERSION,judge.model_name()])
         result=store.cached(key)
         if result is None:
-            result=judge.validate_result(value_request(snapshot,focus),snapshot,focus);store.cache(key,result)
+            snapshot={**snapshot,'analysis_correction':attempts.correction(store,item,phase)}
+            result=attempts.call(store,item,phase,lambda:value_request(snapshot,focus),lambda value:judge.validate_result(value,snapshot,focus));store.cache(key,result)
         return finish(store,item,result,version,config)
     except Exception as exc:
-        # No bodies, prompt or credentials enter failure records.
-        reason=redact(str(exc));reason=re.sub(r'https?://\S+','[url]',reason)[:300]
-        from pylon.tasks.software.monitor import GrokDigestError
-        semantic=(isinstance(exc,(judge.JudgeError,trade.TradeError,ValueError)) or
-                  isinstance(exc,GrokDigestError) and bool(re.search(r'returned (?:an? )?(?:unexpected|invalid)|text is not',str(exc))))
-        attempts=item['attempts']+1
-        semantic_attempts=item.get('semantic_attempts',0)+int(semantic)
-        terminal=semantic and semantic_attempts>=2
-        with store.box.connect() as db:db.execute('UPDATE intel_items SET status=?,attempts=?,semantic_attempts=?,next_attempt=?,lease_until=0,error=?,phase=? WHERE source=? AND source_id=? AND fingerprint=?',
-            ('needs_info' if terminal else 'retry',attempts,semantic_attempts,time.time()+min(1800,60*2**min(attempts,5)),type(exc).__name__+': '+reason,phase,item['source'],item['source_id'],item['fingerprint']))
-        return {'progress':semantic,'error':'' if semantic else type(exc).__name__,'queued':0}
+        reason=type(exc).__name__+': '+attempts.safe_error(exc);now=time.time()
+        with store.box.connect() as db:
+            rows=attempts.history(db,item,phase)
+            if isinstance(exc,attempts.BudgetError) and exc.next_attempt:
+                db.execute("UPDATE intel_items SET status='retry',next_attempt=?,lease_until=0 WHERE source=? AND source_id=? AND fingerprint=?",
+                           (exc.next_attempt,item['source'],item['source_id'],item['fingerprint']))
+                return {'progress':False,'queued':0,'waiting':True}
+            terminal=attempts.exhausted(rows) or not rows
+            if isinstance(exc,attempts.BudgetError): terminal=not bool(exc.next_attempt)
+            due=getattr(exc,'next_attempt',0) or now+(60 if len(rows)<=1 else 300)
+            status='failed' if terminal else 'retry'
+            # A failed new request has no result. The prior result remains in the
+            # review ledger and any immutable event, never masquerading as fresh.
+            changed=db.execute('UPDATE intel_items SET status=?,attempts=?,semantic_attempts=?,next_attempt=?,lease_until=0,error=?,phase=?,updated_at=?,result=NULL WHERE source=? AND source_id=? AND fingerprint=?',
+                (status,len(rows),sum(r['semantic'] for r in rows),0 if terminal else due,reason,phase,now,item['source'],item['source_id'],item['fingerprint']))
+            if not changed.rowcount:return {'progress':True,'stale':True,'queued':0}
+            from pylon.tasks.daily_review.store import record
+            record(db,item['source'],item['source_id'],lane='intel',status=status,
+                result={'reason':reason,'phase':phase,'failed_at':rows[-1]['finished_at'] if rows else now,'attempts':len(rows),
+                        'request_id':rows[-1]['request_id'] if rows else '',
+                        'elapsed':rows[-1]['elapsed'] if rows else 0},rule_version=version)
+        return {'progress':False,'exhausted':terminal,'error':phase+': '+reason,'queued':0}
 
 
 def review_source(store,source,limit=2):
     # Native Xianbao decisions are already computed at collection; drain those
     # cheap records without making useful leads wait behind local rejections.
     rows=store.claim(source,200 if source=='xianbao' else limit);results=[process_item(store,row) for row in rows]
-    with store.box.connect() as db:backlog=db.execute("SELECT count(*) FROM intel_items WHERE source=? AND historical=0 AND status IN ('pending','retry')",(source,)).fetchone()[0]
-    progress=any(r.get('progress') for r in results)
-    error=next((r['error'] for r in results if r.get('error')),'')
-    health.record(store.box,source+':analysis',backlog=backlog,progress=progress,error=error)
+    with store.box.connect() as db:
+        from pylon.tasks.daily_review.capture import intel_decision
+        for item in rows:
+            updated=db.execute('SELECT * FROM intel_items WHERE source=? AND source_id=?',(source,item['source_id'])).fetchone()
+            intel_decision(db,updated)
+    # Retire the coarse source-wide incident. Local exclusions must not reset a
+    # failing model stage, and exhausted individual inputs are no longer work.
+    health.record(store.box,source+':analysis',backlog=0)
+    for phase in ('trade_extraction','value'):
+        with store.box.connect() as db:
+            pending=db.execute("SELECT count(*) FROM intel_items WHERE source=? AND historical=0 AND status IN ('pending','retry') AND phase=?",(source,phase)).fetchone()[0]
+            success=db.execute("SELECT max(finished_at) FROM intel_attempts WHERE source=? AND phase=? AND status='success'",(source,phase)).fetchone()[0] or 0
+            prior=db.execute('SELECT last_progress FROM intel_health WHERE component=?',(source+':'+phase,)).fetchone()
+            error=db.execute("SELECT error FROM intel_items WHERE source=? AND phase=? AND status='retry' ORDER BY updated_at DESC LIMIT 1",(source,phase)).fetchone()
+        health.record(store.box,source+':'+phase,backlog=pending,progress=success>(prior[0] if prior else 0),error=error[0] if error else '')
     return {'source':source,'processed':len(rows),'queued':sum(r.get('queued',0) for r in results),'errors':sum(bool(r.get('error')) for r in results)}
 
 
-def review(store=None,limit=2):
+def review(store=None,limit=2,source=None):
+    if source is not None and source not in policy.SOURCES:raise ValueError('unknown intelligence source')
     store=store or Store()
     with store.box.connect() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -249,6 +277,7 @@ def review(store=None,limit=2):
         completed=db.execute("SELECT max(updated_at) FROM events WHERE job_id='intelligence-review' AND status='delivered'").fetchone()[0] or 0
     health.record(store.box,'notification:delivery',backlog=delivery,
         progress=completed>(prior[0] if prior else 0),error='通知队列尚未推进' if delivery else '')
+    if source is not None:return [review_source(store,source,limit)]
     with ThreadPoolExecutor(max_workers=3) as pool:return list(pool.map(lambda source:review_source(store,source,limit),policy.SOURCES))
 
 
@@ -292,6 +321,6 @@ def summary(box=None):
         counts=dict(db.execute('SELECT status,count(*) FROM intel_items WHERE historical=0 GROUP BY status').fetchall())
         latest=db.execute("SELECT source,phase,error FROM intel_items WHERE error<>'' ORDER BY updated_at DESC LIMIT 1").fetchone()
     line=(f"情报：待判断 {counts.get('pending',0)}；待重试 {counts.get('retry',0)}；"
-          f"待补信息 {counts.get('needs_info',0)}；待投递 {counts.get('queued',0)}；已推送 {counts.get('delivered',0)}")
+          f"待补信息 {counts.get('needs_info',0)}；处理失败 {counts.get('failed',0)}；待投递 {counts.get('queued',0)}；已推送 {counts.get('delivered',0)}")
     if latest:line+=f"\n最近异常：{policy.SOURCES[latest['source']]} / {latest['phase']} / {redact(latest['error'])}"
     return line

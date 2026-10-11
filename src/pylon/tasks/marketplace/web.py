@@ -82,6 +82,9 @@ def _dispatch(store, action, method, data, query, cookie, csrf, origin, request_
         if workspace=='intel' and action!='logout':
             from pylon.tasks.intelligence.web import dispatch
             return dispatch(db,action,data,query,session['csrf'])
+        if workspace=='review' and action!='logout':
+            from pylon.tasks.daily_review.web import dispatch
+            return dispatch(db,action,data,query,session['csrf'])
         if action=='state':return _state(db,session['csrf'])
         if action=='logout':
             db.execute('DELETE FROM market_web_sessions WHERE hash=?',(web_auth.digest(cookie),))
@@ -168,7 +171,7 @@ def create_app(store=None, secure=True):
     with store.box.connect() as db:web_auth.initialize(db)
     async def api(request: Request):
         action=request.path_params['action']
-        reads={'state','options','reviews','check','items'}
+        reads={'state','options','reviews','check','items','detail','batch'}
         if request.method!=('GET' if action in reads else 'POST'):
             return JSONResponse({'error':'请求方式无效'},405)
         try:
@@ -181,7 +184,7 @@ def create_app(store=None, secure=True):
             parsed=urlsplit(str(request.url));expected=parsed.scheme+'://'+parsed.netloc
             result=await run_in_threadpool(_dispatch,store,action,request.method,data,dict(request.query_params),
                 request.cookies.get(web_auth.COOKIE),request.headers.get('x-csrf-token'),origin,expected,
-                'intel' if request.url.path.startswith('/pylon/intel/') else 'market')
+                'review' if request.url.path.startswith('/pylon/review/') else 'intel' if request.url.path.startswith('/pylon/intel/') else 'market')
             if '_session' in result:
                 token,csrf=result['_session'];response=JSONResponse({'csrf':csrf})
                 response.set_cookie(web_auth.COOKIE,token,max_age=7*86400,path=web_auth.COOKIE_PATH,httponly=True,secure=secure,samesite='strict')
@@ -208,8 +211,14 @@ def create_app(store=None, secure=True):
         if name not in {'index.html','intel.js'}:return JSONResponse({'error':'不存在'},404)
         from pylon.tasks.intelligence import web as intel_web
         return FileResponse(Path(intel_web.__file__).with_name('static')/name)
+    async def review_page(request):
+        name=request.path_params.get('name','index.html')
+        if name not in {'index.html','review.js','review.css'}:return JSONResponse({'error':'不存在'},404)
+        from pylon.tasks.daily_review import web as review_web
+        return FileResponse(Path(review_web.__file__).with_name('static')/name)
     app=Starlette(routes=[Route(BASE,page),Route(BASE+'api/{action}',api,methods=['GET','POST']),Route(BASE+'{name}',page),
-        Route('/pylon/intel/',intel_page),Route('/pylon/intel/api/{action}',api,methods=['GET','POST']),Route('/pylon/intel/{name}',intel_page)])
+        Route('/pylon/intel/',intel_page),Route('/pylon/intel/api/{action}',api,methods=['GET','POST']),Route('/pylon/intel/{name}',intel_page),
+        Route('/pylon/review/',review_page),Route('/pylon/review/api/{action}',api,methods=['GET','POST']),Route('/pylon/review/{name}',review_page)])
     async def headers(request,call_next):
         response=await call_next(request)
         response.headers.update({'Cache-Control':'no-store','Referrer-Policy':'no-referrer',

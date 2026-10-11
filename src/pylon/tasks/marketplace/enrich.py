@@ -399,9 +399,13 @@ def request(post: dict) -> tuple[list[dict],str]:
     from pylon.tasks.software.monitor import _request_grok_structured,extract_grok_json
     schema=SCHEMA
     schema['properties']['items']['items']['properties']['category']['enum']=[*CATEGORIES,'unknown']
+    started=time.monotonic()
     response,request_id=_request_grok_structured(build_prompt(post),schema=schema,name='marketplace_items',
                                                timeout=20,total_timeout=120)
-    return validate(extract_grok_json(response,label='marketplace items'),post,partial=bool(post.get('_correction'))),request_id
+    try:return validate(extract_grok_json(response,label='marketplace items'),post,partial=bool(post.get('_correction'))),request_id
+    except Exception as error:
+        error.request_id=request_id;error.elapsed=time.monotonic()-started
+        raise
 
 
 def prepare(db, post: dict, items: list[dict]) -> list[dict] | None:
@@ -450,13 +454,13 @@ def run_pending(store, *, limit: int = 1) -> int:
                 db.execute("UPDATE marketplace_posts SET status='needs_review' WHERE source=? AND source_id=?",(stopped['source'],stopped['source_id']))
             row=db.execute("""SELECT a.* FROM marketplace_analyses a JOIN marketplace_posts p USING(source,source_id)
                 WHERE p.history=0 AND p.status IN ('pending_analysis','queued') AND a.status='pending'
-                AND a.attempts<5 AND a.next_attempt<=? ORDER BY a.updated_at LIMIT 1""",(now,)).fetchone()
+                AND a.attempts<3 AND a.next_attempt<=? ORDER BY a.updated_at LIMIT 1""",(now,)).fetchone()
             if row is None:break
             job=dict(row)
             post=dict(db.execute('SELECT * FROM marketplace_posts WHERE source=? AND source_id=?',(job['source'],job['source_id'])).fetchone())
             db.execute("UPDATE marketplace_analyses SET status='running',attempts=attempts+1,started_at=? WHERE fingerprint=?",(now,job['fingerprint']))
         try:
-            if job['error']:
+            if job['semantic_failures'] and job['error']:
                 post['_correction']=job['error']
             post['_required_fields']=json.loads(job['requirements'])
             items,request_id=request(post)
@@ -486,7 +490,11 @@ def run_pending(store, *, limit: int = 1) -> int:
             count+=1
         except Exception as error:
             # Raw responses and prompts must never be copied into operation logs.
-            reason=str(error) if isinstance(error,AnalysisError) else type(error).__name__
+            from pylon.tasks.intelligence.attempts import safe_error
+            from pylon.tasks.software.monitor import GrokDigestError
+            reason=type(error).__name__
+            if isinstance(error,(AnalysisError,GrokDigestError)):
+                reason+=': '+safe_error(error)
             with store.box.connect() as db:
                 db.execute('BEGIN IMMEDIATE')
                 current=dict(db.execute('SELECT * FROM marketplace_posts WHERE source=? AND source_id=?',(post['source'],post['source_id'])).fetchone())
@@ -496,16 +504,21 @@ def run_pending(store, *, limit: int = 1) -> int:
                     continue
                 field='semantic_failures' if isinstance(error,AnalysisError) else 'network_failures'
                 failures=job[field]+1
-                terminal=failures >= (2 if isinstance(error,AnalysisError) else 3)
+                terminal=job['attempts']+1>=3 or failures >= (2 if isinstance(error,AnalysisError) else 3)
                 db.execute(f'UPDATE marketplace_analyses SET {field}=? WHERE fingerprint=?',(failures,job['fingerprint']))
                 db.execute("UPDATE marketplace_analyses SET status=?,next_attempt=?,updated_at=?,error=? WHERE fingerprint=?",
-                           ('error' if terminal else 'pending',time.time()+60*(2**job['attempts']),time.time(),reason,job['fingerprint']))
+                           ('error' if terminal else 'pending',time.time()+(60 if job['attempts']==0 else 300),time.time(),reason,job['fingerprint']))
                 if terminal:
                     from .control import review
                     review(db,post,-1,'分析校验失败：'+reason)
                     db.execute("UPDATE marketplace_posts SET status='needs_review' WHERE source=? AND source_id=? AND status='pending_analysis'",(post['source'],post['source_id']))
                 db.execute("UPDATE marketplace_posts SET error=? WHERE source=? AND source_id=? AND status IN ('pending_analysis','needs_review')",
                            ('complex_analysis:'+reason,post['source'],post['source_id']))
+                from pylon.tasks.daily_review.store import record
+                record(db,post['source'],post['source_id'],lane='market',status='failed' if terminal else 'pending',
+                    result={'phase':'product_extraction','reason':reason,'failed_at':time.time(),
+                            'request_id':getattr(error,'request_id',''),'elapsed':getattr(error,'elapsed',0),
+                            'attempts':job['attempts']+1},rule_version=VERSION)
     return count
 
 

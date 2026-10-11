@@ -310,15 +310,17 @@ def test_marketplace_requests_bounded_read_only_structured_analysis(monkeypatch)
 
 def test_marketplace_grok_total_deadline_closes_stream(monkeypatch):
     from pylon.tasks.software import monitor
-    ticks=iter([0,121]);captured={}
-    monkeypatch.setattr(monitor.time,'monotonic',lambda:next(ticks))
+    clock=[0.0];captured={}
+    monkeypatch.setattr(monitor.time,'monotonic',lambda:clock[0])
     monkeypatch.setattr(monitor,'read_env',lambda _:{'GROK_MODELS_BASE_URL':'https://example.invalid',
                                                  'XAI_API_KEY':'fixture-not-a-credential'})
     class Response:
         status_code=200
         def __enter__(self):return self
         def __exit__(self,*args):captured['closed']=True
-        def iter_lines(self):yield 'data: {}'
+        def iter_lines(self):
+            clock[0]=121.0
+            yield 'data: {}'
     class Client:
         def __init__(self,**kwargs):pass
         def __enter__(self):return self
@@ -332,6 +334,7 @@ def test_marketplace_grok_total_deadline_closes_stream(monkeypatch):
                                          timeout=20,total_timeout=120)
     assert captured['closed']
     assert captured['payload']['store'] is False and captured['payload']['tools']==[]
+    assert captured['payload']['reasoning']['effort']=='medium'
 
 
 def narrative():

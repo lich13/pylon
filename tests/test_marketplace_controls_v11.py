@@ -208,7 +208,7 @@ def test_retired_command_opens_the_web_surface_without_creating_a_draft(market):
     before = active(market)
     result = RETIRED_COMMAND("webops", store=market)
 
-    assert "登录链接" in result["text"]
+    assert result["text"] == "交易筛选"
     button = result["reply_markup"]["inline_keyboard"][0][0]
     assert button["text"] == "打开交易筛选"
     assert button["url"].startswith("https://example.invalid/pylon/market/#login=")

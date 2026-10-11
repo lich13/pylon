@@ -108,3 +108,9 @@ def audit(db,post,decisions,*,status,event_id=None,policy_version=None):
            'status':status,'event_id':event_id}
     db.execute('UPDATE marketplace_posts SET decision=? WHERE source=? AND source_id=?',
                (dumps(value),post['source'],post['source_id']))
+    from pylon.tasks.daily_review.store import record
+    products=db.execute('SELECT items FROM marketplace_posts WHERE source=? AND source_id=?',(post['source'],post['source_id'])).fetchone()
+    by_index={i.get('index',n):i for n,i in enumerate(json.loads(products[0]))} if products else {}
+    review_value={**value,'items':[{**d,'item':by_index.get(d['index'],{})} for d in decisions]}
+    record(db,post['source'],post['source_id'],lane='market',status=status,result=review_value,
+           event_id=event_id,rule_version=policy_version)

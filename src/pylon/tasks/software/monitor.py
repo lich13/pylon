@@ -2075,6 +2075,9 @@ def _request_grok_structured(prompt: str, *, schema: dict[str, Any], name: str,
     if not base or not key:
         raise GrokDigestError('Grok API configuration is missing')
     request_id = uuid.uuid4().hex
+    from pylon.shared.model_requests import emit
+    started = time.monotonic()
+    emit('start', request_id=request_id)
     deadline = time.monotonic() + total_timeout if total_timeout else None
     payload = {
         'model': env.get('PYLON_GROK_MODEL', 'grok-4.7'),
@@ -2109,14 +2112,20 @@ def _request_grok_structured(prompt: str, *, schema: dict[str, Any], name: str,
                         if not isinstance(event, dict):
                             raise GrokDigestError('Grok stream returned an invalid event')
                         if event.get('type') == 'response.completed':
+                            emit('response', request_id=request_id, elapsed=time.monotonic()-started)
                             return event.get('response'), request_id
                         if event.get('type') in {'response.failed', 'response.incomplete', 'error'}:
                             raise GrokDigestError('Grok stream failed')
                 raise GrokDigestError('Grok stream ended before completion')
-    except GrokDigestError:
+    except GrokDigestError as exc:
+        exc.request_id = request_id
+        exc.elapsed = time.monotonic()-started
         raise
     except (httpx.HTTPError, ValueError, OSError) as exc:
-        raise GrokDigestError(f'Grok request failed: {type(exc).__name__}') from exc
+        error = GrokDigestError(f'Grok request failed: {type(exc).__name__}')
+        error.request_id = request_id
+        error.elapsed = time.monotonic()-started
+        raise error from exc
 
 
 def request_grok_digest(source: dict[str, Any], item: dict[str, Any]) -> tuple[dict[str, Any], str]:

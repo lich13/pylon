@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>每日审核 · pylon</title><link rel="stylesheet" href="/pylon/market/market.css"><link rel="stylesheet" href="review.css"><script src="review.js" defer></script></head>
+<body><main>
+<header><div><p class="brand">pylon</p><h1>每日审核</h1></div><button id="logout" class="quiet" hidden>退出登录</button></header>
+<nav class="workspaces" aria-label="工作区"><a href="/pylon/review/" aria-current="page">每日审核</a><a href="/pylon/intel/">情报筛选</a><a href="/pylon/market/">交易筛选</a></nav>
+<div id="notice" role="status" aria-live="polite"></div>
+<section id="login"><h2>从库库干登录</h2><p>点击汇总消息的「登录后打开」，或通过 /intel、/market 登录。</p></section>
+<section id="workspace" hidden>
+<form id="filters" class="filters">
+<label>日期<select id="day"></select></label><label>来源<select id="source"></select></label>
+<label>内容<select id="lane"><option value="">情报与交易</option value="intel">情报</option><option value="market">交易</option></select></label>
+<label>判断<select id="status"></select></label><label>分类<select id="category"></select></label>
+<label class="search-field">关键词<input id="q" type="search" placeholder="搜索标题与原文"></label><button type="submit">筛选</button>
+</form>
+<div class="review-toolbar"><strong id="count"></strong><span>高价值优先</span><button id="select-page">选择本页</button><button id="clear-selection" class="quiet">清空选择</button></div>
+<div class="review-layout"><section id="feed" aria-label="审核内容"></section>
+<aside><h2 id="selection-count">未选择记录</h2><button id="bulk-feedback" class="primary" disabled>批量填写意见</button>
+<h2 class="draft-heading">本批反馈 <span id="draft-count">0</span></h2><div id="drafts"></div><button id="submit-batch" class="primary" disabled>提交本批反馈</button>
+<details class="coverage"><summary>历史覆盖</summary><div id="coverage"></div></details>
+<details><summary>已提交批次</summary><div id="batches"></div></details></aside></div>
+<div class="pagination"><button id="prev">上一页</button><span id="page-label"></span><button id="next">下一页</button></div>
+<div class="mobile-actions"><button id="mobile-feedback" disabled>填写意见</button><button id="mobile-submit" class="primary" disabled>提交反馈</button></div>
+</section></main>
+<dialog id="feedback-dialog"><form method="dialog"><button class="close" aria-label="关闭">×</button></form>
+<h2 id="feedback-title">填写意见</h2><div id="feedback-actions" class="feedback-actions"></div>
+<div class="field-grid"><label>正确分类<input id="correct-category" placeholder="可留空"></label><label>正确价格／条件<input id="correct-price" placeholder="例如：50 元 / 2 小时"></label><label>使用地区<input id="correct-region" placeholder="例如：仅北京"></label></div>
+<label>原因<textarea id="reason" rows="3" maxlength="2000"></textarea></label>
+<details id="scope-details"><summary>适用范围：当前帖子或商品</summary><label>扩大至<select id="scope"></select></label><label id="scope-value-label" hidden>范围内容<input id="scope-value" maxlength="200"></label></details>
+<p id="feedback-save" role="status"></p><button id="feedback-done" class="primary">完成</button></dialog>
+<dialog id="batch-dialog"><form method="dialog"><button class="close" aria-label="关闭">×</button></form><h2>反馈批次</h2><div id="batch-detail"></div></dialog>
+</body></html>

@@ -61,18 +61,19 @@ def public_url():
     return url.rstrip('/')+'/'
 
 
-def login_card(profile, *, store=None, workspace="market"):
+def login_card(profile, *, store=None, workspace="market", day=''):
     if profile!='webops':return {'text':'请在库库干使用 /intel 打开情报筛选。' if workspace=='intel' else '请在库库干使用 /market 打开交易筛选。'}
     from .store import Store
     url=public_url();store=store or Store()
-    if workspace=='intel':
-        parsed=urlsplit(url);url=parsed.scheme+'://'+parsed.netloc+'/pylon/intel/'
+    if workspace in {'intel','review'}:
+        parsed=urlsplit(url);url=parsed.scheme+'://'+parsed.netloc+'/pylon/'+workspace+'/'
     elif workspace!='market':raise ValueError('工作区无效')
     with store.box.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         token=issue_login(db,profile)
-    if workspace=='intel':
-        return {'text':'情报关注\n展开分类，选择来源与排除词，预览后一次确认。\n登录链接 10 分钟内有效，仅可使用一次。',
-            'reply_markup':{'inline_keyboard':[[{'text':'打开情报筛选','url':url+'#login='+token}]]}}
-    return {'text':'交易关注\n展开分类，批量筛选品牌、系列和型号，预览后一次确认。\n登录链接 10 分钟内有效，仅可使用一次。',
-            'reply_markup':{'inline_keyboard':[[{'text':'打开交易筛选','url':url+'#login='+token}]]}}
+    if workspace=='review' and day:
+        import re
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}',day):raise ValueError('日期无效')
+        url+='?day='+day
+    label={'review':'每日审核','intel':'情报筛选','market':'交易筛选'}[workspace]
+    return {'text':label,'reply_markup':{'inline_keyboard':[[{'text':'打开'+label,'url':url+'#login='+token}]]}}

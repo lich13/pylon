@@ -214,20 +214,69 @@
     "schedule": "* * * * *",
     "deliver": false,
     "failure_notify": false,
-    "timeout": 300,
+    "timeout": 600,
     "module": "pylon.tasks.marketplace.enrich"
   },
   "intelligence-review": {
-    "name": "情报判断与投递",
+    "name": "Linux.do 情报判断",
     "profile": "webops",
     "schedule": "* * * * *",
     "deliver": false,
     "failure_notify": false,
     "wait_for_delivery": false,
-    "timeout": 600,
+    "timeout": 1080,
     "module": "pylon.tasks.intelligence",
     "args": [
       "review",
+      "--source",
+      "linuxdo",
+      "--limit",
+      "2"
+    ]
+  },
+  "daily-review": {
+    "name": "每日全量审核",
+    "profile": "webops",
+    "schedule": "0 9 * * *",
+    "deliver": false,
+    "failure_notify": false,
+    "wait_for_delivery": false,
+    "timeout": 300,
+    "module": "pylon.tasks.daily_review",
+    "args": [
+      "digest"
+    ]
+  },
+  "intelligence-review-v2ex": {
+    "name": "V2EX 情报判断",
+    "profile": "webops",
+    "schedule": "* * * * *",
+    "deliver": false,
+    "failure_notify": false,
+    "wait_for_delivery": false,
+    "timeout": 1080,
+    "module": "pylon.tasks.intelligence",
+    "args": [
+      "review",
+      "--source",
+      "v2ex",
+      "--limit",
+      "2"
+    ]
+  },
+  "intelligence-review-xianbao": {
+    "name": "线报情报判断",
+    "profile": "webops",
+    "schedule": "* * * * *",
+    "deliver": false,
+    "failure_notify": false,
+    "wait_for_delivery": false,
+    "timeout": 120,
+    "module": "pylon.tasks.intelligence",
+    "args": [
+      "review",
+      "--source",
+      "xianbao",
       "--limit",
       "2"
     ]

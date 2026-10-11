@@ -49,6 +49,10 @@ def transfer(store,snapshot,extraction):
     now=time.time()
     with market.box.connect() as db:
         db.execute('BEGIN IMMEDIATE')
+        from pylon.tasks.daily_review.store import capture
+        capture(db,'linuxdo',snapshot['topic_id'],lane='market',title=title,body=body,url=record['url'],
+            published_at=record['posted_at'],first_seen=snapshot.get('first_seen'),evidence_scope='helper_excerpt',
+            metadata={'body_complete':False})
         current=db.execute('SELECT * FROM linuxdo_topics WHERE topic_id=?',(snapshot['topic_id'],)).fetchone()
         if current['version']!=snapshot['version']:
             db.execute("UPDATE linuxdo_topics SET status='pending',lease_until=0 WHERE topic_id=?",(snapshot['topic_id'],))

@@ -284,6 +284,10 @@ def handle(profile: str, text: str) -> str:
             from .tasks.linuxdo.following import import_text
             return import_text(profile, argument)
         if name == 'start':
+            if argument.startswith('review_'):
+                from .tasks.marketplace.web_auth import login_card
+                result=login_card(profile,workspace='review',day=argument.removeprefix('review_'))
+                return encode_response(result['text'],result.get('reply_markup'))
             return help_text(profile=profile)
         if name.startswith('gmail_') or (name == 'gmail' and argument):
             return 'Gmail 操作已合并，请使用 /gmail'
@@ -343,7 +347,10 @@ def handle(profile: str, text: str) -> str:
 
 def handle_callback(profile: str, payload: dict) -> str:
     value = str(payload.get('data') or '')
-    if value.startswith('mk1|'):
+    if value.startswith('rv1|'):
+        from .tasks.daily_review.notifications import callback
+        result=callback(profile,payload)
+    elif value.startswith('mk1|'):
         from .tasks.marketplace import interface
         result=interface.callback(profile,payload)
     elif value.startswith('st1|'):

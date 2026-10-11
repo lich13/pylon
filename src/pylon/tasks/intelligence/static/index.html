@@ -2,12 +2,12 @@
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>情报关注 · pylon</title><link rel="stylesheet" href="/pylon/market/market.css"><script src="intel.js" defer></script></head>
 <body><main>
-  <header><div><p class="brand">pylon</p><h1>选择值得看到的情报</h1><p id="version">Linux.do Helper、V2EX 与线报，汇总到库库干。</p></div><button id="logout" class="quiet" hidden>退出登录</button></header>
-  <nav class="workspaces" aria-label="工作区"><a href="/pylon/intel/" aria-current="page">情报</a><a href="/pylon/market/">交易</a></nav>
+  <header><div><p class="brand">pylon</p><h1>选择值得看到的情报</h1><details><summary>规则版本</summary><p id="version"></p></details></div><button id="logout" class="quiet" hidden>退出登录</button></header>
+  <nav class="workspaces" aria-label="工作区"><a href="/pylon/review/">每日审核</a><a href="/pylon/intel/" aria-current="page">情报筛选</a><a href="/pylon/market/">交易筛选</a></nav>
   <div id="notice" role="status" aria-live="polite"></div>
   <section id="login"><h2>从库库干打开</h2><p>发送 /intel，点击「打开情报筛选」。已登录的设备可以直接打开收藏。</p></section>
   <section id="workspace" hidden>
     <nav aria-label="情报管理"><button data-tab="policy" aria-selected="true">关注范围</button><button data-tab="items">判断与待补信息</button></nav>
-    <div class="layout"><section id="content"></section><aside><h2>有效关注清单</h2><div id="summary"></div><button id="preview" class="primary">预览影响</button><button id="rollback" class="quiet">恢复上一版本到草稿</button><p id="save-state" class="muted" role="status">草稿已保存</p></aside></div>
+    <div class="layout"><section id="content"></section><aside><h2>有效关注清单</h2><div id="summary"></div><button id="preview" class="primary">预览影响</button><button id="rollback" class="quiet">恢复上一版本到草稿</button><p id="save-state" class="muted" role="status"></p></aside></div>
   </section>
 </main><dialog id="preview-dialog"><form method="dialog"><button class="close" aria-label="关闭">×</button></form><h2>确认情报关注清单</h2><div id="preview-result"></div><div class="actions"><button id="apply" class="primary">确认应用</button><button id="back">返回调整</button></div></dialog></body></html>

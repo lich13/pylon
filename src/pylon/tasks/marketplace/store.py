@@ -38,6 +38,8 @@ class Store:
             db.executescript(SCHEMA)
             from .ai_prices import SCHEMA as PRICE_SCHEMA
             db.executescript(PRICE_SCHEMA)
+            if 'semantic_failures' not in {row[1] for row in db.execute('PRAGMA table_info(market_ai_prices)')}:
+                db.execute('ALTER TABLE market_ai_prices ADD COLUMN semantic_failures INTEGER NOT NULL DEFAULT 0')
             db.execute('BEGIN IMMEDIATE')
             columns = {row[1] for row in db.execute('PRAGMA table_info(marketplace_posts)')}
             for column in ('platform_category', 'decision', 'source_context', 'body_provenance'):
@@ -98,6 +100,14 @@ class Store:
                 if not isinstance(context,dict) or not isinstance(provenance,dict):
                     raise ValueError('invalid capture metadata')
                 scope=context.get('evidence_scope','')
+                existing=db.execute('SELECT first_seen,status FROM marketplace_posts WHERE source=? AND source_id=?',(source,source_id)).fetchone()
+                if not existing or complete and existing['status'] in {'pending_body','historical','unavailable'}:
+                    from pylon.tasks.daily_review.store import capture
+                    capture(db,source,source_id,lane='market',title=title,body=body,url=url,
+                        published_at=str(post.get('posted_at') or ''),
+                        first_seen=post.get('first_seen') or context.get('first_seen') or (existing['first_seen'] if existing else None),
+                        restored=history,evidence_scope=scope or ('forum_body' if complete else 'excerpt'),
+                        metadata={'platform_category':platform_category,'body_complete':complete})
                 items = classify_listing(title, body, source, complete,platform_category=platform_category,evidence_scope=scope)
                 stamp = time.time()
                 status = 'historical' if history else 'ready' if complete or source=='linuxdo' else 'pending_body'
@@ -149,6 +159,9 @@ class Store:
             db.execute('''UPDATE marketplace_posts SET attempts=attempts+1,error=?,next_attempt=?,
                 status=CASE WHEN ? THEN CASE WHEN history=1 THEN 'unavailable' ELSE 'ready' END ELSE status END WHERE source=? AND source_id=?''',
                 (reason[:120],time.time()+min(21600,60*2**min(post['attempts'],8)),permanent,post['source'],post['source_id']))
+            from pylon.tasks.daily_review.store import record
+            record(db,post['source'],post['source_id'],lane='market',status='failed' if permanent else 'pending',
+                   result={'phase':'collection','reason':reason[:120],'failed_at':time.time(),'attempts':post['attempts']+1})
 
     def stats(self, *, fresh: bool = False) -> dict:
         from .taxonomy import CATEGORIES, GROUPS, canonical, group_for, hierarchy

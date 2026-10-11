@@ -208,7 +208,7 @@ def test_semantic_error_gets_one_reasoned_correction_then_finishes(market, monke
     assert (first["status"], first["attempts"], first["semantic_failures"], first["network_failures"]) == (
         "pending", 1, 1, 0,
     )
-    assert first["error"] == "price_without_evidence"
+    assert first["error"] == "AnalysisError: price_without_evidence"
     assert post(market)["status"] == "pending_analysis"
     assert enrich.run_pending(market) == 0
     assert len(calls) == 1
@@ -216,7 +216,7 @@ def test_semantic_error_gets_one_reasoned_correction_then_finishes(market, monke
 
     assert enrich.run_pending(market) == int(corrected)
     assert "本轮校验修正要求：无。" in calls[0]
-    assert "本轮校验修正要求：price_without_evidence。" in calls[1]
+    assert "本轮校验修正要求：AnalysisError: price_without_evidence。" in calls[1]
     final = analyses(market)[0]
     assert final["attempts"] == 2 and final["network_failures"] == 0
     if corrected:
@@ -228,37 +228,37 @@ def test_semantic_error_gets_one_reasoned_correction_then_finishes(market, monke
         assert final["status"] == "error" and final["semantic_failures"] == 2
         assert post(market)["status"] == "needs_review"
         reviews = rows(market, "SELECT * FROM market_reviews WHERE status='pending' AND item_index=-1")
-        assert len(reviews) == 1 and "price_without_evidence" in reviews[0]["reason"]
+        assert len(reviews) == 1 and "AnalysisError: price_without_evidence" in reviews[0]["reason"]
         assert process(market) == 0 and events(market) == []
     clock.now += 10000
     assert enrich.run_pending(market) == 0
     assert len(calls) == 2
 
 
-def test_network_budget_is_three_even_after_a_semantic_failure(market, monkeypatch, clock):
+def test_attempt_budget_is_three_even_after_a_semantic_failure(market, monkeypatch, clock):
     invalid = table(market)
     invalid["items"][0]["price"] = 9999
     private_message = "fixture transport diagnostic must not be persisted"
-    calls = provider(monkeypatch, invalid, *[TimeoutError(private_message) for _ in range(3)])
+    calls = provider(monkeypatch, invalid, *[TimeoutError(private_message) for _ in range(2)])
     assert process(market) == 0
     assert enrich.run_pending(market) == 0
     assert analyses(market)[0]["semantic_failures"] == 1
 
-    for number in range(1, 4):
+    for number in range(1, 3):
         next_attempt(market, clock)
         assert enrich.run_pending(market) == 0
         job = analyses(market)[0]
         assert job["network_failures"] == number and job["semantic_failures"] == 1
         assert job["attempts"] == number + 1
-        assert job["status"] == ("error" if number == 3 else "pending")
+        assert job["status"] == ("error" if number == 2 else "pending")
         assert job["error"] == "TimeoutError"
-        assert post(market)["status"] == ("needs_review" if number == 3 else "pending_analysis")
+        assert post(market)["status"] == ("needs_review" if number == 2 else "pending_analysis")
     reviews = rows(market, "SELECT * FROM market_reviews WHERE status='pending' AND item_index=-1")
     assert len(reviews) == 1 and "TimeoutError" in reviews[0]["reason"]
     assert private_message not in json.dumps([analyses(market), post(market), reviews])
     clock.now += 10000
     assert enrich.run_pending(market) == 0 and process(market) == 0
-    assert len(calls) == 4 and events(market) == []
+    assert len(calls) == 3 and events(market) == []
 
 
 @pytest.mark.parametrize("require_condition,provided", [(False, False), (True, True), (True, False)],

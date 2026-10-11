@@ -33,3 +33,4 @@ jobs:
           echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/playwright" >> "$GITHUB_ENV"
           PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright" python -m playwright install --with-deps --only-shell chromium
       - run: python scripts/ci/intelligence-web.py
+      - run: python scripts/ci/daily-review-web.py

@@ -13,7 +13,7 @@ from .content_quality import helper_revision
 SCHEMA='''CREATE TABLE IF NOT EXISTS market_ai_prices (
  fingerprint TEXT PRIMARY KEY, source TEXT NOT NULL, source_id TEXT NOT NULL,
  status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0,
- started_at REAL, result TEXT, error TEXT NOT NULL DEFAULT '');
+ started_at REAL, result TEXT, error TEXT NOT NULL DEFAULT '', semantic_failures INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS market_ai_receipts (
  offer_key TEXT NOT NULL, event_key TEXT PRIMARY KEY, event_id TEXT NOT NULL,
  comparable_price TEXT NOT NULL, change_value TEXT NOT NULL, created_at REAL NOT NULL);
@@ -158,12 +158,26 @@ def acknowledge(db,claims,event_id):
                    (offer_key,event_key,event_id,price,change,time.time()))
 
 
+def extract(post,job):
+    from pylon.shared.model_requests import observer
+    snap=snapshot(post);context=json.loads(post.get('source_context') or '{}')
+    if job.get('semantic_failures'):snap={**snap,'analysis_correction':job['error']}
+    metadata={};started=time.monotonic()
+    token=observer.set(lambda event,fields:metadata.update(fields))
+    try:return trade.validate(context.get('trade_extraction') or trade.request(snap),snap)
+    except Exception as error:
+        error.request_id=getattr(error,'request_id',metadata.get('request_id',''))
+        error.elapsed=getattr(error,'elapsed',time.monotonic()-started)
+        raise
+    finally:observer.reset(token)
+
+
 def run_pending(store,limit=1):
     count=0
     for _ in range(limit):
         with store.box.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            db.execute("UPDATE market_ai_prices SET status='pending',error='interrupted' WHERE status='running' AND started_at<?",(time.time()-180,))
+            db.execute("UPDATE market_ai_prices SET status=CASE WHEN attempts>=3 THEN 'error' ELSE 'pending' END,error='interrupted' WHERE status='running' AND started_at<?",(time.time()-390,))
             row=db.execute("""SELECT a.* FROM market_ai_prices a JOIN marketplace_posts p USING(source,source_id)
                 WHERE a.status='pending' AND a.next_attempt<=? AND a.attempts<3 AND p.history=0
                 AND p.status IN ('pending_price','needs_review','queued','ready') ORDER BY a.next_attempt LIMIT 1""",(time.time(),)).fetchone()
@@ -173,8 +187,7 @@ def run_pending(store,limit=1):
             prices=config(db)
             db.execute("UPDATE market_ai_prices SET status='running',attempts=attempts+1,started_at=? WHERE fingerprint=?",(time.time(),job['fingerprint']))
         try:
-            snap=snapshot(post);context=json.loads(post.get('source_context') or '{}')
-            extraction=trade.validate(context.get('trade_extraction') or trade.request(snap),snap)
+            extraction=extract(post,job)
             items=offers_to_items(post,extraction,prices)
             if not items:raise trade.TradeError('未能确认 AI 商品及报价条件')
             with store.box.connect() as db:
@@ -188,17 +201,25 @@ def run_pending(store,limit=1):
                            (post['source'],post['source_id']))
             count+=1
         except Exception as error:
-            reason=str(error) if isinstance(error,trade.TradeError) else type(error).__name__
-            terminal=job['attempts']+1 >= (2 if isinstance(error,trade.TradeError) else 3)
+            from pylon.tasks.intelligence.attempts import safe_error
+            reason=type(error).__name__+': '+safe_error(error)
+            from pylon.tasks.intelligence.attempts import semantic
+            semantic_count=job['semantic_failures']+int(semantic(error))
+            terminal=job['attempts']+1>=3 or semantic_count>=2
             with store.box.connect() as db:
                 db.execute('BEGIN IMMEDIATE')
                 current=dict(db.execute('SELECT * FROM marketplace_posts WHERE source=? AND source_id=?',(post['source'],post['source_id'])).fetchone())
                 if fingerprint(current,config(db))!=job['fingerprint'] or current['status'] not in {'pending_price','needs_review','queued','ready'}:
                     db.execute("UPDATE market_ai_prices SET status='error',error='source_changed' WHERE fingerprint=?",(job['fingerprint'],))
                     continue
-                db.execute("UPDATE market_ai_prices SET status=?,error=?,next_attempt=? WHERE fingerprint=?",
-                           ('error' if terminal else 'pending',reason[:160],time.time()+60*2**job['attempts'],job['fingerprint']))
+                db.execute("UPDATE market_ai_prices SET status=?,error=?,next_attempt=?,semantic_failures=? WHERE fingerprint=?",
+                           ('error' if terminal else 'pending',reason[:160],time.time()+(60 if job['attempts']==0 else 300),semantic_count,job['fingerprint']))
                 if terminal:
                     control.review(db,post,-2,'AI 报价分析未完成：'+reason[:120])
                     db.execute("UPDATE marketplace_posts SET status='needs_review' WHERE source=? AND source_id=? AND status='pending_price'",(post['source'],post['source_id']))
+                from pylon.tasks.daily_review.store import record
+                record(db,post['source'],post['source_id'],lane='market',status='failed' if terminal else 'pending',
+                    result={'phase':'ai_price','reason':reason,'failed_at':time.time(),
+                            'request_id':getattr(error,'request_id',''),'elapsed':getattr(error,'elapsed',0),
+                            'attempts':job['attempts']+1},rule_version=trade.VERSION)
     return count

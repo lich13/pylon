@@ -36,10 +36,16 @@ def test_all_jobs_keep_schedule_and_native_catchup():
         assert job['schedule'] == '* * * * *'
         assert job['deliver'] is False
     assert catalog['linuxdo-review']['timeout'] == 360
-    assert catalog['intelligence-review']['module'] == 'pylon.tasks.intelligence'
-    assert catalog['intelligence-review']['args'] == ['review', '--limit', '2']
-    assert catalog['intelligence-review']['schedule'] == '* * * * *'
-    assert catalog['intelligence-review']['timeout'] == 600
+    for key, source, timeout in (
+        ('intelligence-review', 'linuxdo', 1080),
+        ('intelligence-review-v2ex', 'v2ex', 1080),
+        ('intelligence-review-xianbao', 'xianbao', 120),
+    ):
+        assert catalog[key]['module'] == 'pylon.tasks.intelligence'
+        assert catalog[key]['args'] == ['review', '--source', source, '--limit', '2']
+        assert catalog[key]['schedule'] == '* * * * *'
+        assert catalog[key]['deliver'] is False
+        assert catalog[key]['timeout'] == timeout
     for key, job in catalog.items():
         unit = bootstrap.timer_text(key, job)
         assert f'Unit=pylon-task@{key}.service' in unit
@@ -65,6 +71,8 @@ def test_all_jobs_keep_schedule_and_native_catchup():
         assert catalog[key]['module'] == 'pylon.tasks.marketplace.' + module
         assert catalog[key]['schedule'] == schedule
         assert catalog[key]['deliver'] is False
+    assert catalog['marketplace-analyze']['timeout'] == 600
+    assert catalog['daily-review']['schedule'] == '0 9 * * *'
     assert '--apply' in catalog['xianbao-retention-cleanup']['args']
     assert catalog['f3ec3ec24210']['lock'] == catalog['e961da51fe69']['lock']
 

@@ -3511,10 +3511,15 @@ def process_once(
     rules_key = rules_hash(rules)
     prune_stats = prune_runtime_state(db, rules, rules_key)
     body_fetch_remaining = int(rules.get("evaluation", {}).get("maxBodyFetchesPerPoll", 8))
+    from pylon.tasks.daily_review.capture import xianbao as capture_review
+    from pylon.outbox import Outbox as ReviewOutbox
+    review_box = None if dry_run else ReviewOutbox()
     for post in reversed(posts[: int(rules["polling"].get("maxPushRowsPerPoll", 150))]):
         fp = fingerprint(post)
         seen_fp = seen_fingerprint(post)
         skip_reason = seen_skip_reason(db, post, rules_key, seen_fp, send_tier2, send_tier3, tier3_min_score)
+        if not dry_run:
+            capture_review(post,db,box=review_box,cached_reason=skip_reason or '')
         if skip_reason:
             skipped_seen_cached += 1
             if skip_reason == "seen-reject":
@@ -3529,6 +3534,7 @@ def process_once(
             duplicates += 1
             decision.duplicate = True
             decision.duplicate_of = dup_of
+            if not dry_run:capture_review(post,db,box=review_box,decision=decision,duplicate=dup_of or 'duplicate')
             reason_counts[decision.reason] += 1
             logged_decisions += int(log_decision(data_dir, post, decision))
             continue
@@ -3559,6 +3565,7 @@ def process_once(
             activity_duplicates += 1
             decision.duplicate = True
             decision.duplicate_of = str(activity_dup.get("duplicate_of") or "")
+            if not dry_run:capture_review(post,db,box=review_box,decision=decision,duplicate=decision.duplicate_of or 'activity')
             if decision.evidence is None:
                 decision.evidence = {}
             decision.evidence["duplicate_group_id"] = activity_dup.get("duplicate_group_id")
