@@ -105,7 +105,12 @@ def seed_fixture(box, *, total=TOTAL_ROWS):
             result = {
                 "decision": "push" if index % 2 == 0 else "hold",
                 "categories": categories,
-                "facts": [{"category": category, "kind": "fixture", "subject": title, "value": body}],
+                "facts": [{
+                    "category": category,
+                    "kind": "fixture",
+                    "subject": title,
+                    "value": f"合成摘要 {index:03d}，用于验证紧凑列表。",
+                }],
                 "items": items,
                 "reason": f"fixture decision {index:03d}",
             }
@@ -556,23 +561,23 @@ def main():
                     expect(page2.locator("#feedback-save")).to_have_text("")
                     page2.locator("#feedback-done").click()
                     state = page2.request.get(origin + "/pylon/review/api/state").json()
-                    assert len(state["drafts"]) == 5, state["drafts"]
+                    assert len(state["drafts"]) == 6, state["drafts"]
 
                     # Submit exactly one batch, then read its frozen evidence in the UI.
                     with page2.expect_response(response_for(origin + "/pylon/review/api/submit", "POST")) as response:
                         page2.locator("#submit-batch").click()
                     assert response.value.status == 200, response.value.text()
                     expect(page2.locator("#draft-count")).to_have_text("0")
-                    expect(page2.locator("#notice")).to_contain_text("已提交 5 条反馈")
-                    expect(page2.locator("#batches")).to_contain_text("5 条")
+                    expect(page2.locator("#notice")).to_contain_text("已提交 6 条反馈")
+                    expect(page2.locator("#batches")).to_contain_text("6 条")
                     page2.locator(".review-extras details:has(#batches) > summary").click()
                     page2.locator("#batches [data-batch]").first.click()
                     expect(page2.locator("#batch-dialog")).to_be_visible()
                     expect(page2.locator("#batch-detail")).to_contain_text("组合纠正原因")
                     expect(page2.locator("#batch-detail")).to_contain_text("逐商品价格纠正")
-                    expect(page2.locator("#batch-detail .feedback-result")).to_have_count(5)
-                    expect(page2.locator("#batch-detail .feedback-result .status")).to_have_count(5)
-                    assert page2.locator("#batch-detail .feedback-result .status").all_inner_texts() == ["已提交"] * 5
+                    expect(page2.locator("#batch-detail .feedback-result")).to_have_count(6)
+                    expect(page2.locator("#batch-detail .feedback-result .status")).to_have_count(6)
+                    assert page2.locator("#batch-detail .feedback-result .status").all_inner_texts() == ["已提交"] * 6
                     page2.locator("#batch-dialog .close").click()
 
                     # A submitted whole-post feedback disappears from pending review but remains visible in all.
@@ -617,7 +622,7 @@ def main():
                     expect(phone.locator("#workspace")).to_be_visible()
                     expect(phone.locator("#review")).to_have_value("pending")
                     expect(phone.locator("#draft-count")).to_have_text("0")
-                    expect(phone.locator("#batches")).to_contain_text("5 条")
+                    expect(phone.locator("#batches")).to_contain_text("6 条")
                     expect(phone.locator(".workspaces a")).to_have_count(3)
                     assert phone.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
 
