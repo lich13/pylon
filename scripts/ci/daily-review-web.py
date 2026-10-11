@@ -565,8 +565,15 @@ def main():
                         page.locator("#refresh-list").click()
                     assert refreshed.value.status == 200, refreshed.value.text()
                     refreshed_group = page.locator("details[data-group='excluded']")
-                    assert refreshed_group.get_attribute("open") is not None
-                    assert abs(refreshed_group.locator(".group-scroll").evaluate("node => node.scrollTop") - saved_group_top) <= 2
+                    page.wait_for_function(
+                        """({selector, target}) => {
+                            const group = document.querySelector(selector);
+                            const scroll = group?.querySelector('.group-scroll');
+                            return group?.open === true && scroll && Math.abs(scroll.scrollTop - target) <= 2;
+                        }""",
+                        {"selector": "details[data-group='excluded']", "target": saved_group_top},
+                        timeout=15000,
+                    )
 
                     assert all(
                         "这是一条 example.invalid 的合成原文" not in text
@@ -580,6 +587,12 @@ def main():
                     assert not any(statuses[index] for index in range(first_pending, len(statuses)))
                     assert_review_viewport(page)
 
+                    # Dense archive scrolling can also advance the main observer. Start the
+                    # selection/continuation check from a fresh top-level view and cursor.
+                    main_browse = submit_filters(page, origin, day="")
+                    assert len(main_browse["items"]) == 50, main_browse
+                    assert_review_viewport(page)
+
                     # Selection survives a cursor continuation; the stream loads another 50 rows automatically.
                     excluded = {single["id"], product["id"], history["id"], *(row["id"] for row in bulk)}
                     first_page_ids = set(page.locator("#feed tr.record-row").evaluate_all("nodes => nodes.map(n => n.dataset.record)"))
@@ -587,7 +600,7 @@ def main():
                     first_selected_id = first_selected.get_attribute("data-record")
                     first_selected.locator("[data-select]").check()
                     continuation = load_next_stream(page, origin)
-                    assert continuation["next_cursor"] != initial_browse["next_cursor"], continuation
+                    assert continuation["next_cursor"] != main_browse["next_cursor"], continuation
                     assert page.locator("#feed tr.record-row").count() <= 120
                     second_selected = first_unrelated_row(page, excluded | {first_selected_id})
                     second_selected_id = second_selected.get_attribute("data-record")
