@@ -402,6 +402,45 @@ def test_compact_trade_expands_sparse_facts_to_the_legacy_full_contract():
     assert compact["offers"][0]["facts"]
 
 
+def test_compact_trade_preserves_more_than_twelve_offers_and_unbounded_send_schema():
+    count = 13
+    offers = []
+    evidence = []
+    expected = []
+    for number in range(1, count + 1):
+        label = f"合成商品{number:02d}套餐"
+        price = str(20 + number)
+        ref = f"offer-{number:02d}"
+        body = f"{label}，售价 {price} 元，月付。"
+        evidence.append({"ref": ref, "title": label, "body": body})
+        offers.append(
+            _compact_offer(
+                [
+                    {"field": "description", "value": label, "ref": ref, "quote": label},
+                    {"field": "price", "value": price, "ref": ref, "quote": f"售价 {price} 元"},
+                    {"field": "term", "value": "1", "ref": ref, "quote": "月付"},
+                ]
+            )
+        )
+        expected.append((label, price, ref))
+
+    compact = {"intent": "offer", "intel_segments": [], "offers": offers}
+    schema = trade.COMPACT_SCHEMA["properties"]["offers"]
+    assert "maxItems" not in schema
+
+    expanded = trade.expand_compact(compact)
+    checked = trade.validate(
+        expanded,
+        {"title": "合成多套餐样本", "evidence": evidence},
+    )
+
+    assert len(checked["offers"]) == count
+    assert [
+        (offer["description"]["quote"], offer["price"]["value"], offer["price"]["ref"])
+        for offer in checked["offers"]
+    ] == expected
+
+
 def test_compact_trade_keeps_quote_and_price_validation_bound_to_source_text():
     snapshot = {
         "title": "GPT Pro 合成报价",

@@ -114,9 +114,9 @@ def main():
                     # Navigation must wait for the last blurred field to save.
                     page.locator('#global-exclude').fill('排除样本、尚未应用的草稿')
                     # The shared cookie opens the second workspace without a new login.
-                    page.get_by_role('link',name='交易',exact=True).click()
+                    page.get_by_role('link',name='交易筛选',exact=True).click()
                     expect(page.locator('#workspace')).to_be_visible()
-                    page.get_by_role('link',name='情报',exact=True).click()
+                    page.get_by_role('link',name='情报筛选',exact=True).click()
                     expect(page.locator('#global-exclude')).to_have_value('排除样本、尚未应用的草稿')
                     assert version()[0]==initial+1
                     page.get_by_role('button',name='恢复上一版本到草稿',exact=True).click()

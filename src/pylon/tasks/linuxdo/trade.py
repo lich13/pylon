@@ -58,7 +58,7 @@ COMPACT_PROPERTIES['facts'] = {'type': 'array', 'maxItems': len(ATTRIBUTES)+1, '
     'properties': {'field': {'type': 'string', 'enum': [*ATTRIBUTES, 'tier']}, **PROOF['properties']},
     'required': ['field', 'value', 'ref', 'quote']}}
 COMPACT_SCHEMA = deepcopy(SCHEMA)
-COMPACT_SCHEMA['properties']['offers'] = {'type': 'array', 'maxItems': 12, 'items': {
+COMPACT_SCHEMA['properties']['offers'] = {'type': 'array', 'items': {
     'type': 'object', 'additionalProperties': False, 'properties': COMPACT_PROPERTIES, 'required': list(COMPACT_PROPERTIES)}}
 
 
@@ -283,7 +283,7 @@ def validate(value: dict, snapshot: dict) -> dict:
     if (not isinstance(value, dict) or set(value) not in ({'intent', 'offers'}, {'intent', 'offers', 'intel_segments'})
             or value['intent'] not in SCHEMA['properties']['intent']['enum']):
         raise TradeError('invalid trade intent')
-    if not isinstance(value['offers'], list) or len(value['offers']) > 12:
+    if not isinstance(value['offers'], list):
         raise TradeError('invalid offers')
     if value['intent'] in {'non_trade', 'cloud_offer'} and value['offers']:
         raise TradeError('nontrade cannot include offers')
