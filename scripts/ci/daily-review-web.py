@@ -341,6 +341,128 @@ def assert_review_viewport(page):
     assert layout["title"].strip(), layout
 
 
+def main_row_ids(page):
+    return page.locator("#feed tr.record-row").evaluate_all("nodes => nodes.map(node => node.dataset.record)")
+
+
+def wait_main_rows(page, minimum):
+    page.wait_for_function(
+        """minimum => {
+            try {
+                const saved = JSON.parse(sessionStorage.getItem('pylon-review-position-v3') || 'null');
+                return Number(saved?.streams?.main?.count || 0) >= minimum;
+            } catch {
+                return false;
+            }
+        }""",
+        arg=minimum,
+        timeout=15000,
+    )
+
+
+def capture_main_anchor(page):
+    """Move to a middle row and capture its reading position before refresh."""
+    page.locator("#main-stream").evaluate(
+        "node => window.scrollTo(0, scrollY + node.getBoundingClientRect().top + node.offsetHeight / 2 - innerHeight / 2)"
+    )
+    page.wait_for_function(
+        """() => {
+            const toolbar = document.querySelector('.review-toolbar').getBoundingClientRect();
+            return scrollY > 1000 && [...document.querySelectorAll('#feed tr.record-row')].some(row => {
+                const box = row.getBoundingClientRect();
+                return box.top >= toolbar.bottom && box.bottom < innerHeight;
+            });
+        }"""
+    )
+    anchor_id = page.locator("#feed tr.record-row").evaluate_all(
+        """rows => rows.find(row => {
+            const box = row.getBoundingClientRect();
+            const toolbar = document.querySelector('.review-toolbar').getBoundingClientRect();
+            return box.top >= toolbar.bottom && box.bottom < innerHeight;
+        }).dataset.record"""
+    )
+    assert anchor_id
+    page.wait_for_function(
+        """id => {
+            const row = [...document.querySelectorAll('#feed tr.record-row')]
+                .find(node => node.dataset.record === id);
+            const toolbar = document.querySelector('.review-toolbar')?.getBoundingClientRect();
+            if (!row || !toolbar) return false;
+            const box = row.getBoundingClientRect();
+            return box.bottom > 0 && box.top < innerHeight && toolbar.bottom > 0 && toolbar.top < innerHeight;
+        }""",
+        arg=anchor_id,
+        timeout=15000,
+    )
+    position = page.evaluate(
+        """id => {
+            const row = [...document.querySelectorAll('#feed tr.record-row')]
+                .find(node => node.dataset.record === id);
+            const box = row.getBoundingClientRect();
+            const toolbar = document.querySelector('.review-toolbar').getBoundingClientRect();
+            return {
+                anchorTop: box.top,
+                anchorBottom: box.bottom,
+                scrollY,
+                toolbarTop: toolbar.top,
+                toolbarBottom: toolbar.bottom,
+                viewportHeight: innerHeight,
+            };
+        }""",
+        anchor_id,
+    )
+    assert position["toolbarTop"] >= -1 and position["toolbarBottom"] <= position["viewportHeight"] + 1, position
+    assert position["anchorBottom"] > 0 and position["anchorTop"] < position["viewportHeight"], position
+    return {"id": anchor_id, **position}
+
+
+def wait_refresh_anchor(page, anchor, *, view_id, minimum_rows=100):
+    """Wait for browse bootstrap, cursor restoration, and the saved anchor to settle."""
+    page.wait_for_function(
+        """({id, top, y, minimum, view}) => {
+            const workspace = document.querySelector('#workspace');
+            const rows = [...document.querySelectorAll('#feed tr.record-row')];
+            const row = rows.find(node => node.dataset.record === id);
+            const toolbar = document.querySelector('.review-toolbar')?.getBoundingClientRect();
+            let loaded = 0;
+            try {
+                const saved = JSON.parse(sessionStorage.getItem('pylon-review-position-v3') || 'null');
+                if (saved?.view !== view) return false;
+                loaded = Number(saved?.streams?.main?.count || 0);
+            } catch {}
+            if (!workspace || workspace.hidden || loaded < minimum || !row || !toolbar) return false;
+            const ready = typeof restoring === 'undefined' || restoring === false;
+            const box = row.getBoundingClientRect();
+            return ready && box.bottom > 0 && box.top < innerHeight
+                && Math.abs(box.top - top) <= 6 && Math.abs(scrollY - y) <= 6
+                && toolbar.top >= -1 && toolbar.bottom <= innerHeight + 1;
+        }""",
+        arg={"id": anchor["id"], "top": anchor["anchorTop"], "y": anchor["scrollY"], "minimum": minimum_rows, "view": view_id},
+        timeout=15000,
+    )
+    position = page.evaluate(
+        """id => {
+            const row = [...document.querySelectorAll('#feed tr.record-row')]
+                .find(node => node.dataset.record === id);
+            const box = row.getBoundingClientRect();
+            const toolbar = document.querySelector('.review-toolbar').getBoundingClientRect();
+            return {
+                anchorTop: box.top,
+                anchorBottom: box.bottom,
+                scrollY,
+                toolbarTop: toolbar.top,
+                toolbarBottom: toolbar.bottom,
+                viewportHeight: innerHeight,
+            };
+        }""",
+        anchor["id"],
+    )
+    assert abs(position["anchorTop"] - anchor["anchorTop"]) <= 6, (anchor, position)
+    assert abs(position["scrollY"] - anchor["scrollY"]) <= 6, (anchor, position)
+    assert position["toolbarTop"] >= -1 and position["toolbarBottom"] <= position["viewportHeight"] + 1, position
+    assert position["anchorBottom"] > 0 and position["anchorTop"] < position["viewportHeight"], position
+
+
 def wait_feedback_save(page, origin, action):
     with page.expect_response(response_for(origin + "/pylon/review/api/feedback", "POST")) as response:
         action()
@@ -621,6 +743,64 @@ def main():
                     state = page.request.get(origin + "/pylon/review/api/state").json()
                     assert {draft["entry_id"] for draft in state["drafts"]} == {first_selected_id, second_selected_id}
                     page.locator("#clear-selection").click()
+
+                    # Refresh from the middle of a two-page stream through the visible sticky toolbar.
+                    desktop_second_ids = {item["id"] for item in continuation["items"]}
+                    assert len(desktop_second_ids) == 50
+                    assert first_page_ids.isdisjoint(desktop_second_ids)
+                    wait_main_rows(page, 100)
+                    desktop_loaded_ids = main_row_ids(page)
+                    assert desktop_loaded_ids
+                    assert len(desktop_loaded_ids) == len(set(desktop_loaded_ids)), desktop_loaded_ids
+                    desktop_anchor = capture_main_anchor(page)
+                    refresh = page.locator("#refresh-list")
+                    expect(refresh).to_be_visible()
+                    refresh_box = refresh.bounding_box()
+                    assert refresh_box and 0 <= refresh_box["y"] < 960, refresh_box
+                    with page.expect_response(response_for(origin + "/pylon/review/api/browse", "POST")) as refreshed:
+                        refresh.click()
+                    assert refreshed.value.status == 200, refreshed.value.text()
+                    wait_refresh_anchor(page, desktop_anchor, view_id=refreshed.value.json()["view_id"])
+                    desktop_refreshed_ids = main_row_ids(page)
+                    assert desktop_refreshed_ids
+                    assert len(desktop_refreshed_ids) == len(set(desktop_refreshed_ids)), desktop_refreshed_ids
+                    assert desktop_anchor["id"] in desktop_refreshed_ids
+
+                    # Repeat the same user path on a fresh 390px context and require a full second page.
+                    refresh_mobile = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True)
+                    refresh_phone = refresh_mobile.new_page()
+                    hook(refresh_phone, origin)
+                    refresh_phone.goto(origin + "/pylon/review/#login=" + login_token(box))
+                    expect(refresh_phone.locator("#workspace")).to_be_visible()
+                    mobile_browse = submit_filters(refresh_phone, origin, day="")
+                    assert len(mobile_browse["items"]) == 50, mobile_browse
+                    mobile_first_ids = {item["id"] for item in mobile_browse["items"]}
+                    assert len(mobile_first_ids) == 50
+                    mobile_continuation = load_next_stream(refresh_phone, origin)
+                    mobile_second_ids = {item["id"] for item in mobile_continuation["items"]}
+                    assert len(mobile_second_ids) == 50
+                    assert mobile_first_ids.isdisjoint(mobile_second_ids)
+                    wait_main_rows(refresh_phone, 100)
+                    mobile_loaded_ids = main_row_ids(refresh_phone)
+                    assert mobile_loaded_ids
+                    assert len(mobile_loaded_ids) == len(set(mobile_loaded_ids)), mobile_loaded_ids
+                    assert refresh_phone.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
+                    mobile_anchor = capture_main_anchor(refresh_phone)
+                    mobile_refresh = refresh_phone.locator("#refresh-list")
+                    expect(mobile_refresh).to_be_visible()
+                    mobile_refresh_box = mobile_refresh.bounding_box()
+                    assert mobile_refresh_box and 0 <= mobile_refresh_box["y"] < 844, mobile_refresh_box
+                    with refresh_phone.expect_response(response_for(origin + "/pylon/review/api/browse", "POST")) as mobile_refreshed:
+                        mobile_refresh.click()
+                    assert mobile_refreshed.value.status == 200, mobile_refreshed.value.text()
+                    wait_refresh_anchor(refresh_phone, mobile_anchor, view_id=mobile_refreshed.value.json()["view_id"])
+                    mobile_refreshed_ids = main_row_ids(refresh_phone)
+                    assert mobile_refreshed_ids
+                    assert len(mobile_refreshed_ids) == len(set(mobile_refreshed_ids)), mobile_refreshed_ids
+                    assert mobile_anchor["id"] in mobile_refreshed_ids
+                    assert refresh_phone.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
+                    refresh_phone.close()
+                    refresh_mobile.close()
 
                     # A failed continuation exposes a retry control and succeeds without discarding loaded rows.
                     failed = {"value": True}
