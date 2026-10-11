@@ -260,6 +260,38 @@ def submit_filters(page, origin, *, day="", source="", status="", category="", q
         page.locator("#filters button[type=submit]").click()
 
 
+def scroll_to_bottom(page):
+    """Make pagination retainment observable before triggering a reload."""
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    assert page.evaluate("window.scrollY") > 0
+
+
+def assert_review_viewport(page):
+    """Ensure a paged review result is readable from the reset viewport."""
+    layout = page.evaluate(
+        """() => {
+            const toolbar = document.querySelector('.review-toolbar')?.getBoundingClientRect();
+            const table = document.querySelector('.table-wrap')?.getBoundingClientRect();
+            const row = document.querySelector('#feed tr.record-row')?.getBoundingClientRect();
+            const title = document.querySelector('#feed tr.record-row .title-toggle')?.innerText || '';
+            return {
+                scrollY: window.scrollY,
+                viewportHeight: window.innerHeight,
+                toolbarTop: toolbar?.top,
+                toolbarBottom: toolbar?.bottom,
+                tableTop: table?.top,
+                rowTop: row?.top,
+                rowBottom: row?.bottom,
+                title,
+            };
+        }"""
+    )
+    assert 0 <= layout["toolbarTop"] <= 4, layout
+    assert layout["tableTop"] >= layout["toolbarBottom"] - 1, layout
+    assert 0 <= layout["rowTop"] < layout["rowBottom"] <= layout["viewportHeight"], layout
+    assert layout["title"].strip(), layout
+
+
 def wait_feedback_save(page, origin, action):
     with page.expect_response(response_for(origin + "/pylon/review/api/feedback", "POST")) as response:
         action()
@@ -386,38 +418,52 @@ def main():
                     assert all(statuses[index] for index in range(first_pending))
                     assert not any(statuses[index] for index in range(first_pending, len(statuses)))
 
+                    scroll_to_bottom(page)
                     with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
                         page.locator("#next").click()
                     expect(page.locator("#page-label")).to_have_text("2 / 3")
                     expect(page.locator("#feed tr.record-row")).to_have_count(50)
+                    assert_review_viewport(page)
+                    scroll_to_bottom(page)
                     with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
                         page.locator("#next").click()
                     expect(page.locator("#page-label")).to_have_text("3 / 3")
                     expect(page.locator("#feed tr.record-row")).to_have_count(TOTAL_ROWS - 100)
+                    assert_review_viewport(page)
+                    scroll_to_bottom(page)
                     with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
                         page.locator("#prev").click()
                     expect(page.locator("#page-label")).to_have_text("2 / 3")
+                    assert_review_viewport(page)
 
                     # The alternate supported page size is real API pagination, not a CSS-only change.
+                    scroll_to_bottom(page)
                     with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
                         page.locator("#page_size").select_option("100")
                     expect(page.locator("#page-label")).to_have_text("1 / 2")
                     expect(page.locator("#feed tr.record-row")).to_have_count(100)
+                    assert_review_viewport(page)
+                    scroll_to_bottom(page)
                     with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
                         page.locator("#next").click()
                     expect(page.locator("#page-label")).to_have_text("2 / 2")
                     expect(page.locator("#feed tr.record-row")).to_have_count(TOTAL_ROWS - 100)
+                    assert_review_viewport(page)
+                    scroll_to_bottom(page)
                     with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
                         page.locator("#page_size").select_option("50")
                     expect(page.locator("#page-label")).to_have_text("1 / 3")
+                    assert_review_viewport(page)
 
                     # Selection survives pagination and bulk-correct creates independent drafts.
                     excluded = {single["id"], product["id"], history["id"], *(row["id"] for row in bulk)}
                     first_selected = first_unrelated_row(page, excluded)
                     first_selected_id = first_selected.get_attribute("data-record")
                     first_selected.locator("[data-select]").check()
+                    scroll_to_bottom(page)
                     with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
                         page.locator("#next").click()
+                    assert_review_viewport(page)
                     second_selected = first_unrelated_row(page, excluded | {first_selected_id})
                     second_selected_id = second_selected.get_attribute("data-record")
                     assert first_selected_id and second_selected_id and first_selected_id != second_selected_id
@@ -429,11 +475,15 @@ def main():
                     state = page.request.get(origin + "/pylon/review/api/state").json()
                     assert {draft["entry_id"] for draft in state["drafts"]} == {first_selected_id, second_selected_id}
                     page.locator("#clear-selection").click()
+                    scroll_to_bottom(page)
                     with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
                         page.locator("#next").click()
                     expect(page.locator("#page-label")).to_have_text("3 / 3")
+                    assert_review_viewport(page)
+                    scroll_to_bottom(page)
                     with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
                         page.locator("#prev").click()
+                    assert_review_viewport(page)
 
                     # Date, source, status, category and full-text filters all narrow the real API result.
                     expected_day_a = sum(row["day"] == DAY_A for row in fixture)
