@@ -11,6 +11,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 
@@ -256,6 +257,11 @@ def response_for(path, method=None):
 
 
 def submit_filters(page, origin, *, day="", source="", status="", category="", query="", review=None):
+    # The workspace is shown before its initial browse completes. Do not let
+    # that response satisfy the next filter request's response expectation.
+    page.wait_for_function(
+        "() => !!JSON.parse(sessionStorage.getItem('pylon-review-position-v3') || 'null')?.view"
+    )
     values = {"day": day, "source": source, "status": status, "category": category, "q": query}
     if review is not None:
         values["review"] = review
@@ -268,27 +274,40 @@ def submit_filters(page, origin, *, day="", source="", status="", category="", q
         }""",
         values,
     )
-    with page.expect_response(response_for(origin + "/pylon/review/api/browse", "POST")) as response:
+    def matches_filters(response):
+        if not response_for(origin + "/pylon/review/api/browse", "POST")(response):
+            return False
+        submitted = response.request.post_data_json
+        return all(submitted.get(key, "") == value for key, value in values.items())
+
+    with page.expect_response(matches_filters) as response:
         page.locator("#filters button[type=submit]").click()
     assert response.value.status == 200, response.value.text()
-    page.locator("#main-count").wait_for(state="visible")
-    return response.value.json()
+    payload = response.value.json()
+    page.wait_for_function(
+        "view => JSON.parse(sessionStorage.getItem('pylon-review-position-v3') || 'null')?.view === view",
+        arg=payload["view_id"],
+    )
+    return payload
 
 
-def feed_response(origin, section="main"):
+def feed_response(origin, section="main", *, view_id=None, cursor=None):
     def predicate(response):
+        query = parse_qs(urlsplit(response.url).query)
         return (
             response.url.startswith(origin + "/pylon/review/api/feed?")
             and response.request.method == "GET"
-            and f"section={section}" in response.url
+            and query.get("section") == [section]
+            and (view_id is None or query.get("view") == [view_id])
+            and (cursor is None or query.get("cursor") == [cursor])
         )
 
     return predicate
 
 
-def load_next_stream(page, origin, *, section="main"):
+def load_next_stream(page, origin, *, section="main", view_id=None, cursor=None):
     """Trigger one cursor continuation through the real stream sentinel."""
-    with page.expect_response(feed_response(origin, section)) as response:
+    with page.expect_response(feed_response(origin, section, view_id=view_id, cursor=cursor)) as response:
         page.locator(f"[data-sentinel='{section}']").scroll_into_view_if_needed()
         page.wait_for_timeout(250)
     assert response.value.status == 200, response.value.text()
@@ -728,7 +747,7 @@ def main():
                     first_selected = first_unrelated_row(page, excluded)
                     first_selected_id = first_selected.get_attribute("data-record")
                     first_selected.locator("[data-select]").check()
-                    continuation = load_next_stream(page, origin)
+                    continuation = load_next_stream(page, origin, view_id=main_browse["view_id"], cursor=main_browse["next_cursor"])
                     assert continuation["next_cursor"] != main_browse["next_cursor"], continuation
                     assert page.locator("#feed tr.record-row").count() <= 120
                     second_selected = first_unrelated_row(page, excluded | {first_selected_id})
@@ -776,7 +795,9 @@ def main():
                     assert len(mobile_browse["items"]) == 50, mobile_browse
                     mobile_first_ids = {item["id"] for item in mobile_browse["items"]}
                     assert len(mobile_first_ids) == 50
-                    mobile_continuation = load_next_stream(refresh_phone, origin)
+                    mobile_continuation = load_next_stream(
+                        refresh_phone, origin, view_id=mobile_browse["view_id"], cursor=mobile_browse["next_cursor"]
+                    )
                     mobile_second_ids = {item["id"] for item in mobile_continuation["items"]}
                     assert len(mobile_second_ids) == 50
                     assert mobile_first_ids.isdisjoint(mobile_second_ids)
