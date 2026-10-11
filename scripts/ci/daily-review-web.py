@@ -297,12 +297,13 @@ def main():
         errors = []
 
         def hook(page, origin):
-            def route(request):
-                if request.url.startswith(origin + "/"):
-                    request.continue_()
+            def route(route):
+                url = route.request.url
+                if url.startswith(origin + "/"):
+                    route.continue_()
                 else:
-                    blocked.append(request.url)
-                    request.abort()
+                    blocked.append(url)
+                    route.abort()
 
             page.route("**/*", route)
             page.on("pageerror", lambda error: errors.append(f"pageerror: {error}"))
