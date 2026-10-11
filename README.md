@@ -6,6 +6,8 @@
 
 处理完成用 `reconcile --id <批次> --status processing|fixed|needs_info --result-file <结果文件>` 回填。`comparisons` 中每项必须指明 `feedback_id`；已修复项还须提供 `commit`、`before`、`after` 和 `evidence`。可以逐条回填，全部反馈都有修复证据后才能将整批标为 `fixed`。判断正确的反馈也应关联防回归验证。
 
+审核主页优先展示已送达、手动取回及每天固定的最多 50 条优先核对记录；其余内容折叠收纳，仍可全局搜索。各列表滚动续载，浏览顺序固定到用户刷新。每日名单和取回状态存入 SQLite，审核完成不补位；取回与撤销只影响展示，不产生反馈、通知或策略变更。
+
 自动内容分析沿用 Grok API 和现有推理强度，本地不限制模型等待时长。领取归属由进程文件锁判断，心跳仅用于显示；不要按耗时回收仍在运行的请求。人工 Agent 与 Gmail 执行时限独立保留。
 
 Python 机器人服务、SQLite 待发队列和 systemd timers。维护 Gmail、线报、V2EX、Linux.do、Chiphell、日港 iTunes、KDocs 报价、软件更新、数据清理、SSH 和软件维护任务；四平台统一交易处理任务在关注策略明确启用后工作。

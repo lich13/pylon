@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-from . import feedback, store
+from . import browse, feedback, store
 
 
 def dispatch(db, action, data, query, csrf):
     from pylon.tasks.marketplace.web import WebError
-    store.initialize(db)
+    browse.initialize(db)
     try:
         if action == 'state':
             store.sync_deliveries(db)
@@ -28,6 +28,11 @@ def dispatch(db, action, data, query, csrf):
                         'missing_decisions': db.execute('SELECT count(*) FROM review_entries WHERE status=\'unknown\'').fetchone()[0],
                         'unknown_dates': db.execute('SELECT count(*) FROM review_entries WHERE day=\'unknown\'').fetchone()[0]}}
         if action == 'items': return store.items(db, query)
+        if action == 'browse': return browse.create(db, data)
+        if action == 'feed': return browse.feed(db, query)
+        if action == 'browse-updates': return browse.updates(db, query.get('view', ''))
+        if action == 'browse-view': return browse.resume(db, query.get('view', ''))
+        if action == 'recall': return browse.recall(db, data.get('targets'), active=data.get('active', True))
         if action == 'detail': return store.detail(db, query.get('id', ''))
         if action == 'feedback': return feedback.save(db, data.get('targets'), data.get('value'))
         if action == 'discard': return feedback.discard(db, data.get('targets', []))

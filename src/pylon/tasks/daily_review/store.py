@@ -233,6 +233,15 @@ def detail(db, entry_id):
     return value
 
 
+# Whole-post feedback is tied to both the input and judgment versions.
+REVIEWED_SQL = '''EXISTS (SELECT 1 FROM review_feedback f WHERE f.entry_id=r.id
+        AND f.owner='webops' AND f.batch_id IS NOT NULL AND f.item_key=''
+        AND f.snapshot_id=(SELECT max(id) FROM review_snapshots WHERE entry_id=r.id)
+        AND f.decision_ids=(SELECT json_group_array(id) FROM
+          (SELECT d.id FROM review_decisions d WHERE d.entry_id=r.id AND d.id IN
+           (SELECT max(v.id) FROM review_decisions v JOIN review_snapshots s ON s.id=v.snapshot_id
+            WHERE v.entry_id=r.id GROUP BY v.lane,s.source,s.source_id) ORDER BY d.id)))'''
+
 def items(db, query):
     sync_deliveries(db)
     page = max(1, int(query.get('page', 1))); where = []; args = []
@@ -240,15 +249,7 @@ def items(db, query):
     if size not in (50, 100): raise ValueError('每页可选 50 或 100 条')
     mode = query.get('review', 'pending')
     if mode not in ('pending', 'all'): raise ValueError('审核范围无效')
-    # Match the exact displayed content and judgments; item feedback alone must
-    # never hide the other products in a mixed post.
-    reviewed = '''EXISTS (SELECT 1 FROM review_feedback f WHERE f.entry_id=r.id
-        AND f.owner='webops' AND f.batch_id IS NOT NULL AND f.item_key=''
-        AND f.snapshot_id=(SELECT max(id) FROM review_snapshots WHERE entry_id=r.id)
-        AND f.decision_ids=(SELECT json_group_array(id) FROM
-          (SELECT d.id FROM review_decisions d WHERE d.entry_id=r.id AND d.id IN
-           (SELECT max(v.id) FROM review_decisions v JOIN review_snapshots s ON s.id=v.snapshot_id
-            WHERE v.entry_id=r.id GROUP BY v.lane,s.source,s.source_id) ORDER BY d.id)))'''
+    reviewed = REVIEWED_SQL
     if mode == 'pending':
         where.append('(NOT ' + reviewed + " OR EXISTS (SELECT 1 FROM review_feedback f WHERE f.entry_id=r.id AND f.owner='webops' AND f.batch_id IS NULL))")
     for key in ('day', 'status'):
@@ -267,6 +268,10 @@ def items(db, query):
                       reviewed + ' reviewed' + sql +
                       " ORDER BY (r.status='delivered') DESC,r.priority DESC,r.first_seen DESC,r.id LIMIT ? OFFSET ?",
                       (*args, size, (page-1)*size)).fetchall()
+    return {'items': summaries(db, rows), 'total': total, 'page': page, 'page_size': size, 'pages': (total+size-1)//size}
+
+
+def summaries(db, rows):
     result = []
     for row in rows:
         value = dict(row); value['reviewed'] = bool(value['reviewed'])
@@ -303,7 +308,7 @@ def items(db, query):
             same = feedback['snapshot_id'] == value['snapshot_id'] and sorted(json.loads(feedback['decision_ids'])) == value['decision_ids']
             value['feedback_state'] = feedback['status'] if same else 'updated'
         result.append(value)
-    return {'items': result, 'total': total, 'page': page, 'page_size': size, 'pages': (total+size-1)//size}
+    return result
 
 
 def prune(db, *, now=None):
@@ -313,6 +318,9 @@ def prune(db, *, now=None):
         (SELECT 1 FROM review_feedback f LEFT JOIN review_batches b ON b.id=f.batch_id
          WHERE f.entry_id=r.id AND (f.batch_id IS NULL OR b.status<>'fixed'))''', (cutoff,))]
     for entry_id in ids:
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='review_recalls'").fetchone():
+            for table in ('review_recalls', 'review_daily_choices', 'review_view_rows'):
+                db.execute(f'DELETE FROM {table} WHERE entry_id=?', (entry_id,))
         db.execute('DELETE FROM review_resolutions WHERE feedback_id IN (SELECT id FROM review_feedback WHERE entry_id=?)', (entry_id,))
         for table in ('review_feedback', 'review_decisions', 'review_snapshots', 'review_origins'):
             db.execute(f'DELETE FROM {table} WHERE entry_id=?', (entry_id,))

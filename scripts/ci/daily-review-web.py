@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import tempfile
 import threading
@@ -14,7 +15,9 @@ from zoneinfo import ZoneInfo
 
 
 ZONE = ZoneInfo("Asia/Shanghai")
-TOTAL_ROWS = 126
+BASE_ROWS = 126
+DENSE_ROWS = 1100
+TOTAL_ROWS = BASE_ROWS + DENSE_ROWS
 DAY_A = "2026-10-11"
 DAY_B = "2026-10-10"
 SOURCES = ("linuxdo", "v2ex", "chiphell", "nga", "xianbao")
@@ -36,7 +39,9 @@ def seed_fixture(box, *, total=TOTAL_ROWS):
     with box.connect() as db:
         review_store.initialize(db)
         for index in range(total):
-            day = DAY_A if index < total // 2 else DAY_B
+            # Keep the named behavior fixtures on two days and add a large excluded
+            # archive so windowing and cursor continuation are exercised in CI.
+            day = DAY_A if index < BASE_ROWS // 2 else DAY_B
             source = SOURCES[index % len(SOURCES)]
             lane = "market" if index % 3 == 0 else "intel"
             source_id = f"fixture-{index:03d}"
@@ -114,7 +119,7 @@ def seed_fixture(box, *, total=TOTAL_ROWS):
                 "items": items,
                 "reason": f"fixture decision {index:03d}",
             }
-            status = STATUSES[index % len(STATUSES)]
+            status = "excluded" if index >= BASE_ROWS else STATUSES[index % len(STATUSES)]
             event_id = None
             if index == 0:
                 review_store.record(
@@ -250,30 +255,73 @@ def response_for(path, method=None):
     return predicate
 
 
-def submit_filters(page, origin, *, day="", source="", status="", category="", query=""):
-    page.locator("#day").select_option(day)
-    page.locator("#source").select_option(source)
-    page.locator("#status").select_option(status)
-    page.locator("#category").select_option(category)
-    page.locator("#q").fill(query)
-    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
+def submit_filters(page, origin, *, day="", source="", status="", category="", query="", review=None):
+    values = {"day": day, "source": source, "status": status, "category": category, "q": query}
+    if review is not None:
+        values["review"] = review
+    page.evaluate(
+        """values => {
+            for (const [id, value] of Object.entries(values)) {
+                const node = document.querySelector('#' + id);
+                if (node) node.value = value;
+            }
+        }""",
+        values,
+    )
+    with page.expect_response(response_for(origin + "/pylon/review/api/browse", "POST")) as response:
         page.locator("#filters button[type=submit]").click()
+    assert response.value.status == 200, response.value.text()
+    page.locator("#main-count").wait_for(state="visible")
+    return response.value.json()
+
+
+def feed_response(origin, section="main"):
+    def predicate(response):
+        return (
+            response.url.startswith(origin + "/pylon/review/api/feed?")
+            and response.request.method == "GET"
+            and f"section={section}" in response.url
+        )
+
+    return predicate
+
+
+def load_next_stream(page, origin, *, section="main"):
+    """Trigger one cursor continuation through the real stream sentinel."""
+    with page.expect_response(feed_response(origin, section)) as response:
+        page.locator(f"[data-sentinel='{section}']").scroll_into_view_if_needed()
+        page.wait_for_timeout(250)
+    assert response.value.status == 200, response.value.text()
+    page.wait_for_timeout(250)
+    payload = response.value.json()
+    assert 0 < len(payload.get("items", [])) <= 50, payload
+    return payload
+
+
+def count_from_label(page, selector):
+    text = page.locator(selector).inner_text()
+    match = re.search(r"(\d+)", text)
+    assert match, (selector, text)
+    return int(match.group(1))
 
 
 def scroll_to_bottom(page):
-    """Make pagination retainment observable before triggering a reload."""
-    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    assert page.evaluate("window.scrollY") > 0
+    """Move the main stream sentinel into view for cursor continuation."""
+    page.locator("[data-sentinel='main']").scroll_into_view_if_needed()
+    page.wait_for_timeout(150)
 
 
 def assert_review_viewport(page):
-    """Ensure a paged review result is readable from the reset viewport."""
+    """Ensure the windowed main stream remains readable and bounded."""
     layout = page.evaluate(
         """() => {
             const toolbar = document.querySelector('.review-toolbar')?.getBoundingClientRect();
             const table = document.querySelector('.table-wrap')?.getBoundingClientRect();
-            const row = document.querySelector('#feed tr.record-row')?.getBoundingClientRect();
-            const title = document.querySelector('#feed tr.record-row .title-toggle')?.innerText || '';
+            const visible = [...document.querySelectorAll('#feed tr.record-row')]
+                .map(row => ({box: row.getBoundingClientRect(), title: row.querySelector('.title-toggle')?.innerText || ''}))
+                .filter(({box}) => box.bottom > 0 && box.top < innerHeight);
+            const row = visible[0]?.box;
+            const title = visible[0]?.title || '';
             return {
                 scrollY: window.scrollY,
                 viewportHeight: window.innerHeight,
@@ -283,12 +331,13 @@ def assert_review_viewport(page):
                 rowTop: row?.top,
                 rowBottom: row?.bottom,
                 title,
+                rows: document.querySelectorAll('#feed tr.record-row').length,
+                visibleRows: visible.length,
             };
         }"""
     )
-    assert -1 <= layout["toolbarTop"] <= 4, layout
-    assert layout["tableTop"] >= layout["toolbarBottom"] - 1, layout
-    assert 0 <= layout["rowTop"] < layout["rowBottom"] <= layout["viewportHeight"], layout
+    assert layout["rows"] <= 120, layout
+    assert layout["visibleRows"] > 0 and layout["rowTop"] < layout["viewportHeight"] and layout["rowBottom"] > 0, layout
     assert layout["title"].strip(), layout
 
 
@@ -336,13 +385,63 @@ def check_navigation(page, origin):
 
 
 def first_unrelated_row(page, excluded):
-    """Choose a visible row while keeping later named fixtures independent."""
+    """Choose a visible main-stream row while keeping named fixtures independent."""
     rows = page.locator("#feed tr.record-row")
     for index in range(rows.count()):
         row = rows.nth(index)
         if row.get_attribute("data-record") not in excluded:
             return row
     raise AssertionError("no unrelated review row available for selection")
+
+
+def open_group(page, origin, key, *, return_payload=False):
+    group = page.locator(f"details[data-group='{key}']")
+    payload = None
+    if group.get_attribute("open") is None:
+        with page.expect_response(feed_response(origin, key)) as response:
+            group.locator("summary").click()
+        assert response.value.status == 200, response.value.text()
+        payload = response.value.json()
+    group.locator(f"tbody#feed-{key}").wait_for(state="visible")
+    return (group, payload) if return_payload else group
+
+
+def recall_group_row(page, origin, row, *, key):
+    """Recall a dense group row so existing feedback assertions can use #feed."""
+    entry_id = row.get_attribute("data-record")
+    assert entry_id
+    with page.expect_response(response_for(origin + "/pylon/review/api/recall", "POST")) as recall:
+        with page.expect_response(response_for(origin + "/pylon/review/api/browse", "POST")) as browse:
+            row.locator(f"[data-recall='{entry_id}']").click()
+    assert recall.value.status == 200, recall.value.text()
+    assert browse.value.status == 200, browse.value.text()
+    page.locator(f"#feed tr.record-row[data-record='{entry_id}']").wait_for(state="visible")
+    return page.locator(f"#feed tr.record-row[data-record='{entry_id}']")
+
+
+def ensure_main_fixture(page, origin, row, *, group):
+    """Locate a fixture in the main stream, recalling it from its archive group when needed."""
+    main_row = page.locator(f"#feed tr.record-row[data-record='{row['id']}']")
+    if main_row.count():
+        return main_row
+    group_node = open_group(page, origin, group)
+    dense = group_node.locator(f"tbody#feed-{group} tr.record-row[data-record='{row['id']}']")
+    dense.wait_for(state="visible")
+    return recall_group_row(page, origin, dense, key=group)
+
+
+def assert_group_contract(page):
+    from playwright.sync_api import expect
+
+    groups = page.locator("#archive-groups details[data-group]")
+    assert groups.count() == 4
+    for key in ("other", "excluded", "unresolved", "duplicate"):
+        group = page.locator(f"#archive-groups details[data-group='{key}']")
+        expect(group.locator("summary")).to_be_visible()
+        assert group.locator("summary .sample-titles > span").count() <= 3
+        assert group.locator(f"form[data-group-filter='{key}']").count() == 1
+        assert group.locator(f".group-scroll[data-scroll='{key}']").count() == 1
+        assert group.locator(f"tbody#feed-{key} tr.record-row").count() == 0
 
 
 def main():
@@ -371,6 +470,7 @@ def main():
         initial_events = box.counts().get("delivered", 0)
         blocked = []
         errors = []
+        expected_feed_abort = {"value": False}
 
         def hook(page, origin):
             def route(route):
@@ -383,7 +483,16 @@ def main():
 
             page.route("**/*", route)
             page.on("pageerror", lambda error: errors.append(f"pageerror: {error}"))
-            page.on("console", lambda message: errors.append(f"console: {message.text}") if message.type == "error" else None)
+
+            def collect_console_error(message):
+                if message.type != "error":
+                    return
+                if expected_feed_abort["value"] and ("ERR_FAILED" in message.text or "Failed to load resource" in message.text):
+                    expected_feed_abort["value"] = False
+                    return
+                errors.append(f"console: {message.text}")
+
+            page.on("console", collect_console_error)
 
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch()
@@ -399,14 +508,67 @@ def main():
                     expect(page.locator(".workspaces a")).to_have_count(3)
                     check_navigation(page, origin)
 
-                    # The compact table defaults to pending review and keeps delivered rows first.
+                    # The layered browse view removes page controls and opens with 50 main candidates.
                     expect(page.locator("#review")).to_have_value("pending")
-                    expect(page.locator("#page_size")).to_have_value("50")
-                    submit_filters(page, origin, day="")
-                    expect(page.locator("#count")).to_have_text(f"{TOTAL_ROWS} 条")
-                    expect(page.locator("#page-label")).to_have_text("1 / 3")
-                    expect(page.locator("#feed tr.record-row")).to_have_count(50)
-                    expect(page.locator("#feed tr.expanded-row[hidden]")).to_have_count(50)
+                    for obsolete in ("#page_size", "#page-label", "#prev", "#next"):
+                        expect(page.locator(obsolete)).to_have_count(0)
+                    initial_browse = submit_filters(page, origin, day="")
+                    assert len(initial_browse["items"]) == 50, initial_browse
+                    assert 0 < page.locator("#feed tr.record-row").count() <= 120
+                    expect(page.locator("#main-count")).to_contain_text("主列表")
+                    expect(page.locator("#stored-count")).to_contain_text("已收纳")
+                    expect(page.locator("#count")).to_contain_text("全部")
+                    assert count_from_label(page, "#main-count") >= 100
+                    assert count_from_label(page, "#count") == TOTAL_ROWS
+                    assert_group_contract(page)
+
+                    # The excluded archive carries a large synthetic fixture; its DOM stays windowed
+                    # while its own scroll container follows an independent cursor.
+                    excluded_group, excluded_initial = open_group(page, origin, "excluded", return_payload=True)
+                    assert count_from_label(page, "#archive-groups details[data-group='excluded'] summary") >= 1000
+                    excluded_scroll = excluded_group.locator(".group-scroll[data-scroll='excluded']")
+                    excluded_group.locator("summary").scroll_into_view_if_needed()
+                    before_page_y = page.evaluate("window.scrollY")
+                    dense_ids = {item["id"] for item in excluded_initial["items"]}
+                    dense_cursors = {excluded_initial["next_cursor"]}
+                    assert len(dense_ids) == len(excluded_initial["items"]) == 50
+                    while len(dense_ids) < 1000:
+                        with page.expect_response(feed_response(origin, "excluded")) as excluded_response:
+                            excluded_scroll.evaluate("node => node.scrollTop = node.scrollHeight")
+                            page.wait_for_timeout(250)
+                        assert excluded_response.value.status == 200, excluded_response.value.text()
+                        excluded_page = excluded_response.value.json()
+                        page_ids = {item["id"] for item in excluded_page["items"]}
+                        assert len(page_ids) == len(excluded_page["items"]) <= 50
+                        assert dense_ids.isdisjoint(page_ids), (len(dense_ids), page_ids & dense_ids)
+                        dense_ids.update(page_ids)
+                        if excluded_page["next_cursor"] is None:
+                            break
+                        assert excluded_page["next_cursor"] not in dense_cursors
+                        dense_cursors.add(excluded_page["next_cursor"])
+                        assert excluded_group.locator("tbody#feed-excluded tr.record-row").count() <= 120
+                    assert len(dense_ids) >= 1000
+                    assert 0 < excluded_group.locator("tbody#feed-excluded tr.record-row").count() <= 120
+                    assert excluded_scroll.evaluate("node => node.scrollTop") > 0
+                    assert page.evaluate("window.scrollY") == before_page_y
+                    excluded_filter = excluded_group.locator("form[data-group-filter='excluded']")
+                    excluded_filter.locator("select[name=category]").select_option("fixture-a")
+                    with page.expect_response(feed_response(origin, "excluded")) as filtered_excluded:
+                        excluded_filter.locator("button").click()
+                    assert "category=fixture-a" in filtered_excluded.value.url
+                    assert filtered_excluded.value.status == 200, filtered_excluded.value.text()
+                    assert excluded_group.locator("tbody#feed-excluded tr.record-row").count() <= 120
+
+                    # Refreshing the browse view keeps the open dense group and its local reading offset.
+                    excluded_group.locator("summary").scroll_into_view_if_needed()
+                    saved_group_top = excluded_scroll.evaluate("node => node.scrollTop")
+                    with page.expect_response(response_for(origin + "/pylon/review/api/browse", "POST")) as refreshed:
+                        page.locator("#refresh-list").click()
+                    assert refreshed.value.status == 200, refreshed.value.text()
+                    refreshed_group = page.locator("details[data-group='excluded']")
+                    assert refreshed_group.get_attribute("open") is not None
+                    assert abs(refreshed_group.locator(".group-scroll").evaluate("node => node.scrollTop") - saved_group_top) <= 2
+
                     assert all(
                         "这是一条 example.invalid 的合成原文" not in text
                         for text in page.locator("#feed tr.record-row").all_inner_texts()
@@ -417,56 +579,21 @@ def main():
                     first_pending = next((index for index, delivered in enumerate(statuses) if not delivered), len(statuses))
                     assert all(statuses[index] for index in range(first_pending))
                     assert not any(statuses[index] for index in range(first_pending, len(statuses)))
-
-                    scroll_to_bottom(page)
-                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
-                        page.locator("#next").click()
-                    expect(page.locator("#page-label")).to_have_text("2 / 3")
-                    expect(page.locator("#feed tr.record-row")).to_have_count(50)
-                    assert_review_viewport(page)
-                    scroll_to_bottom(page)
-                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
-                        page.locator("#next").click()
-                    expect(page.locator("#page-label")).to_have_text("3 / 3")
-                    expect(page.locator("#feed tr.record-row")).to_have_count(TOTAL_ROWS - 100)
-                    assert_review_viewport(page)
-                    scroll_to_bottom(page)
-                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
-                        page.locator("#prev").click()
-                    expect(page.locator("#page-label")).to_have_text("2 / 3")
                     assert_review_viewport(page)
 
-                    # The alternate supported page size is real API pagination, not a CSS-only change.
-                    scroll_to_bottom(page)
-                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
-                        page.locator("#page_size").select_option("100")
-                    expect(page.locator("#page-label")).to_have_text("1 / 2")
-                    expect(page.locator("#feed tr.record-row")).to_have_count(100)
-                    assert_review_viewport(page)
-                    scroll_to_bottom(page)
-                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
-                        page.locator("#next").click()
-                    expect(page.locator("#page-label")).to_have_text("2 / 2")
-                    expect(page.locator("#feed tr.record-row")).to_have_count(TOTAL_ROWS - 100)
-                    assert_review_viewport(page)
-                    scroll_to_bottom(page)
-                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
-                        page.locator("#page_size").select_option("50")
-                    expect(page.locator("#page-label")).to_have_text("1 / 3")
-                    assert_review_viewport(page)
-
-                    # Selection survives pagination and bulk-correct creates independent drafts.
+                    # Selection survives a cursor continuation; the stream loads another 50 rows automatically.
                     excluded = {single["id"], product["id"], history["id"], *(row["id"] for row in bulk)}
+                    first_page_ids = set(page.locator("#feed tr.record-row").evaluate_all("nodes => nodes.map(n => n.dataset.record)"))
                     first_selected = first_unrelated_row(page, excluded)
                     first_selected_id = first_selected.get_attribute("data-record")
                     first_selected.locator("[data-select]").check()
-                    scroll_to_bottom(page)
-                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
-                        page.locator("#next").click()
-                    assert_review_viewport(page)
+                    continuation = load_next_stream(page, origin)
+                    assert continuation["next_cursor"] != initial_browse["next_cursor"], continuation
+                    assert page.locator("#feed tr.record-row").count() <= 120
                     second_selected = first_unrelated_row(page, excluded | {first_selected_id})
                     second_selected_id = second_selected.get_attribute("data-record")
                     assert first_selected_id and second_selected_id and first_selected_id != second_selected_id
+                    assert second_selected_id not in first_page_ids or second_selected_id != first_selected_id
                     second_selected.locator("[data-select]").check()
                     expect(page.locator("#selection-count")).to_have_text("已选 2 条")
                     with page.expect_response(response_for(origin + "/pylon/review/api/feedback", "POST")):
@@ -475,32 +602,48 @@ def main():
                     state = page.request.get(origin + "/pylon/review/api/state").json()
                     assert {draft["entry_id"] for draft in state["drafts"]} == {first_selected_id, second_selected_id}
                     page.locator("#clear-selection").click()
+
+                    # A failed continuation exposes a retry control and succeeds without discarding loaded rows.
+                    failed = {"value": True}
+
+                    def fail_once(route):
+                        if failed["value"] and "section=main" in route.request.url:
+                            failed["value"] = False
+                            expected_feed_abort["value"] = True
+                            route.abort("failed")
+                        else:
+                            route.continue_()
+
+                    page.route("**/pylon/review/api/feed**", fail_once)
                     scroll_to_bottom(page)
-                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
-                        page.locator("#next").click()
-                    expect(page.locator("#page-label")).to_have_text("3 / 3")
-                    assert_review_viewport(page)
-                    scroll_to_bottom(page)
-                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
-                        page.locator("#prev").click()
+                    expect(page.locator("[data-load-state='main']")).to_have_text("加载未完成")
+                    expect(page.locator("[data-retry='main']")).to_be_visible()
+                    expected_feed_abort["value"] = False
+                    page.unroute("**/pylon/review/api/feed**", fail_once)
+                    with page.expect_response(feed_response(origin, "main")) as retry_response:
+                        page.locator("[data-retry='main']").click()
+                    assert retry_response.value.status == 200, retry_response.value.text()
                     assert_review_viewport(page)
 
                     # Date, source, status, category and full-text filters all narrow the real API result.
                     expected_day_a = sum(row["day"] == DAY_A for row in fixture)
                     submit_filters(page, origin, day=DAY_A)
-                    expect(page.locator("#count")).to_have_text(f"{expected_day_a} 条")
+                    expect(page.locator("#count")).to_have_text(f"全部 {expected_day_a}")
                     expected_source = sum(row["source"] == "linuxdo" for row in fixture)
                     submit_filters(page, origin, source="linuxdo")
-                    expect(page.locator("#count")).to_have_text(f"{expected_source} 条")
+                    expect(page.locator("#count")).to_have_text(f"全部 {expected_source}")
                     expected_status = sum(row["status"] == "delivered" for row in fixture)
                     submit_filters(page, origin, status="delivered")
-                    expect(page.locator("#count")).to_have_text(f"{expected_status} 条")
+                    expect(page.locator("#count")).to_have_text(f"全部 {expected_status}")
                     expected_category = sum("fixture-a" in row["categories"] for row in fixture)
                     submit_filters(page, origin, category="fixture-a")
-                    expect(page.locator("#count")).to_have_text(f"{expected_category} 条")
+                    expect(page.locator("#count")).to_have_text(f"全部 {expected_category}")
                     submit_filters(page, origin, query="needle-077")
-                    expect(page.locator("#count")).to_have_text("1 条")
-                    expect(page.locator("#feed tr.record-row")).to_have_count(1)
+                    expect(page.locator("#count")).to_have_text("全部 1")
+                    expect(page.locator("#feed tr.record-row")).to_have_count(0)
+                    unresolved = open_group(page, origin, "unresolved")
+                    expect(unresolved.locator("tbody#feed-unresolved tr.record-row")).to_have_count(1)
+                    expect(unresolved.locator("[data-load-state='unresolved']")).to_contain_text("已显示")
 
                     # Historical decisions, source snapshots, and notification text are lazy-loaded by title.
                     submit_filters(page, origin, query="history-keyword")
@@ -518,7 +661,7 @@ def main():
 
                     # Row-level combined correction with an explicit brand scope.
                     submit_filters(page, origin, query=single["title"])
-                    single_row = page.locator(f"tr.record-row[data-record='{single['id']}']")
+                    single_row = ensure_main_fixture(page, origin, single, group="unresolved")
                     expect(single_row).to_be_visible()
                     open_action(page, origin, f"tr.record-row[data-record='{single['id']}'] [data-feedback='open']")
                     wait_feedback_save(
@@ -547,7 +690,9 @@ def main():
                         scope="brand",
                         scope_value="fixture-brand",
                     )
-                    page.reload()
+                    with page.expect_response(response_for(origin + "/pylon/review/api/browse-view", "GET")) as resumed:
+                        page.reload()
+                    assert resumed.value.status == 200, resumed.value.text()
                     expect(page.locator("#workspace")).to_be_visible()
                     expect(page.locator("#draft-count")).to_have_text("3")
                     expect(page.locator("#drafts")).to_contain_text("组合纠正原因")
@@ -562,7 +707,7 @@ def main():
 
                     # Product-level feedback uses the displayed decision/item key.
                     submit_filters(page2, origin, query=product["title"])
-                    product_row = page2.locator(f"tr.record-row[data-record='{product['id']}']")
+                    product_row = ensure_main_fixture(page2, origin, product, group="duplicate")
                     expect(product_row).to_be_visible()
                     expect(product_row.locator("details")).to_have_count(0)
                     expect(product_row).not_to_contain_text("商品 003-A")
@@ -602,6 +747,9 @@ def main():
 
                     # Bulk feedback selects both records on the filtered page and saves one shared opinion.
                     submit_filters(page2, origin, query="批量反馈样本")
+                    expect(page2.locator("#count")).to_have_text("全部 2")
+                    ensure_main_fixture(page2, origin, bulk[0], group="other")
+                    ensure_main_fixture(page2, origin, bulk[1], group="unresolved")
                     expect(page2.locator("#feed tr.record-row")).to_have_count(2)
                     page2.locator("#select-page").click()
                     expect(page2.locator("#bulk-feedback")).to_be_enabled()
@@ -632,18 +780,15 @@ def main():
 
                     # A submitted whole-post feedback disappears from pending review but remains visible in all.
                     submit_filters(page2, origin, query=bulk[0]["title"])
-                    expect(page2.locator("#count")).to_have_text("0 条")
-                    with page2.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
-                        page2.locator("#review").select_option("all")
-                    expect(page2.locator("#count")).to_have_text("1 条")
+                    expect(page2.locator("#count")).to_have_text("全部 0")
+                    submit_filters(page2, origin, query=bulk[0]["title"], review="all")
+                    expect(page2.locator("#count")).to_have_text("全部 1")
                     expect(page2.locator("#feed tr.record-row .row-hints")).to_contain_text("已提交")
 
                     # Capturing a newer field version makes the old feedback stale and reopens review.
                     bump_fixture_version(box, bulk[0])
-                    with page2.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
-                        page2.locator("#review").select_option("pending")
-                    submit_filters(page2, origin, query=bulk[0]["title"])
-                    expect(page2.locator("#count")).to_have_text("1 条")
+                    submit_filters(page2, origin, query=bulk[0]["title"], review="pending")
+                    expect(page2.locator("#count")).to_have_text("全部 1")
                     expect(page2.locator("#feed tr.record-row .row-hints")).to_contain_text("内容已更新")
 
                     # Unauthorized and invalid-CSRF writes are rejected before dispatch.
@@ -708,7 +853,7 @@ def main():
                     phone.locator("#batch-dialog .close").click()
 
                     submit_filters(phone, restarted_origin, query="<script>")
-                    malicious_row = phone.locator(f"tr.record-row[data-record='{malicious['id']}']")
+                    malicious_row = ensure_main_fixture(phone, restarted_origin, malicious, group="excluded")
                     expect(malicious_row).to_be_visible()
                     with phone.expect_response(response_for(restarted_origin + f"/pylon/review/api/detail?id={malicious['id']}", "GET")):
                         malicious_row.locator("[data-expand]").click()
@@ -718,9 +863,9 @@ def main():
                     assert not errors, errors
                     assert not blocked, blocked
                     print(
-                        "Daily review desktop/mobile: navigation, filters, 50-row paging, history/notification detail, "
-                        "row/product/bulk feedback, autosave, cross-session and restart recovery passed; auth/CSRF and "
-                        "no-external-request checks passed."
+                        "Daily review desktop/mobile: layered browse, 50-row cursor streams, dense archive windowing, "
+                        "history/notification detail, row/product/bulk feedback, autosave, cross-session and restart "
+                        "recovery passed; auth/CSRF and no-external-request checks passed."
                     )
                     phone.close()
                     mobile.close()

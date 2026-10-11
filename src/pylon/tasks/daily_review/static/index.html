@@ -14,11 +14,14 @@
 <label>判断<select id="status"></select></label><label>分类<select id="category"></select></label>
 <label class="search-field">关键词<input id="q" type="search" placeholder="搜索标题与原文"></label><button type="submit">筛选</button>
 </form>
-<div class="review-toolbar"><strong id="count"></strong><span>已推送优先</span><label>每页 <select id="page_size"><option value="50">50 条</option><option value="100">100 条</option></select></label><button id="select-page">选择本页</button><button id="clear-selection" class="quiet">清空选择</button></div>
+<div class="review-toolbar"><strong id="main-count"></strong><span id="stored-count"></span><span id="count"></span><button id="refresh-list" class="quiet">刷新</button><button id="select-page">选择可见项</button><button id="clear-selection" class="quiet">清空选择</button></div>
+<section id="main-stream" class="stream" aria-label="主审核列表">
 <div class="table-wrap"><table class="review-table" aria-label="审核内容"><thead><tr><th aria-label="选择"></th><th>标题</th><th class="secondary">来源</th><th class="secondary">分类</th><th>价格／收益</th><th>推送状态</th><th>反馈</th></tr></thead><tbody id="feed"></tbody></table></div>
-<div class="pagination"><button id="prev">上一页</button><span id="page-label"></span><button id="next">下一页</button></div>
+<div class="load-state" data-load-state="main" role="status"></div><button data-retry="main" class="quiet" hidden>重试加载</button><div class="sentinel" data-sentinel="main" aria-hidden="true"></div>
+</section>
+<section id="archive-groups" aria-label="已收纳内容"></section>
 <div class="review-extras"><details><summary>反馈草稿 <span id="draft-count">0</span></summary><div id="drafts"></div></details><details><summary>处理进度</summary><div id="batches"></div></details><details class="coverage"><summary>历史覆盖</summary><div id="coverage"></div></details></div>
-<footer class="batch-bar"><strong id="selection-count">未选择记录</strong><button id="bulk-correct" disabled>批量正确</button><button id="bulk-feedback" disabled>批量反馈</button><button id="submit-batch" class="primary" disabled>提交本批反馈</button></footer>
+<footer class="batch-bar"><strong id="selection-count">未选择记录</strong><button id="bulk-recall" disabled>取回已选</button><button id="bulk-correct" disabled>批量正确</button><button id="bulk-feedback" disabled>批量反馈</button><button id="submit-batch" class="primary" disabled>提交本批反馈</button></footer>
 </section></main>
 <dialog id="feedback-dialog"><form method="dialog"><button class="close" aria-label="关闭">×</button></form>
 <h2 id="feedback-title">填写意见</h2><div id="feedback-actions" class="feedback-actions"></div>

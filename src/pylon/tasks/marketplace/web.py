@@ -171,7 +171,7 @@ def create_app(store=None, secure=True):
     with store.box.connect() as db:web_auth.initialize(db)
     async def api(request: Request):
         action=request.path_params['action']
-        reads={'state','options','reviews','check','items','detail','batch'}
+        reads={'state','options','reviews','check','items','detail','batch','feed','browse-updates','browse-view'}
         if request.method!=('GET' if action in reads else 'POST'):
             return JSONResponse({'error':'请求方式无效'},405)
         try:
