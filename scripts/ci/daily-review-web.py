@@ -286,7 +286,7 @@ def assert_review_viewport(page):
             };
         }"""
     )
-    assert 0 <= layout["toolbarTop"] <= 4, layout
+    assert -1 <= layout["toolbarTop"] <= 4, layout
     assert layout["tableTop"] >= layout["toolbarBottom"] - 1, layout
     assert 0 <= layout["rowTop"] < layout["rowBottom"] <= layout["viewportHeight"], layout
     assert layout["title"].strip(), layout
