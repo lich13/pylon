@@ -97,9 +97,14 @@ def seed_fixture(box, *, total=TOTAL_ROWS):
                         "reasons": ["second fixture product"],
                     },
                 ]
+            categories = [category]
+            for row in items:
+                item_category = row["item"]["category"]
+                if item_category not in categories:
+                    categories.append(item_category)
             result = {
                 "decision": "push" if index % 2 == 0 else "hold",
-                "categories": [category],
+                "categories": categories,
                 "facts": [{"category": category, "kind": "fixture", "subject": title, "value": body}],
                 "items": items,
                 "reason": f"fixture decision {index:03d}",
@@ -166,6 +171,7 @@ def seed_fixture(box, *, total=TOTAL_ROWS):
                     "day": day,
                     "status": "delivered" if index == 0 else status,
                     "category": category,
+                    "categories": categories,
                     "title": title,
                     "body": body,
                 }
@@ -347,7 +353,7 @@ def main():
                     expected_status = sum(row["status"] == "delivered" for row in fixture)
                     submit_filters(page, origin, status="delivered")
                     expect(page.locator("#count")).to_have_text(f"{expected_status} 条")
-                    expected_category = sum(row["category"] == "fixture-a" for row in fixture)
+                    expected_category = sum("fixture-a" in row["categories"] for row in fixture)
                     submit_filters(page, origin, category="fixture-a")
                     expect(page.locator("#count")).to_have_text(f"{expected_category} 条")
                     submit_filters(page, origin, query="needle-077")
