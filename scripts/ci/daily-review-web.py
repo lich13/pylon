@@ -571,7 +571,7 @@ def main():
                             const scroll = group?.querySelector('.group-scroll');
                             return group?.open === true && scroll && Math.abs(scroll.scrollTop - target) <= 2;
                         }""",
-                        {"selector": "details[data-group='excluded']", "target": saved_group_top},
+                        arg={"selector": "details[data-group='excluded']", "target": saved_group_top},
                         timeout=15000,
                     )
 
