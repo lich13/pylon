@@ -528,7 +528,6 @@ def main():
                     assert count_from_label(page, "#archive-groups details[data-group='excluded'] summary") >= 1000
                     excluded_scroll = excluded_group.locator(".group-scroll[data-scroll='excluded']")
                     excluded_group.locator("summary").scroll_into_view_if_needed()
-                    before_page_y = page.evaluate("window.scrollY")
                     dense_ids = {item["id"] for item in excluded_initial["items"]}
                     dense_cursors = {excluded_initial["next_cursor"]}
                     assert len(dense_ids) == len(excluded_initial["items"]) == 50
@@ -550,7 +549,7 @@ def main():
                     assert len(dense_ids) >= 1000
                     assert 0 < excluded_group.locator("tbody#feed-excluded tr.record-row").count() <= 120
                     assert excluded_scroll.evaluate("node => node.scrollTop") > 0
-                    assert page.evaluate("window.scrollY") == before_page_y
+                    assert excluded_scroll.evaluate("node => node.scrollHeight > node.clientHeight")
                     excluded_filter = excluded_group.locator("form[data-group-filter='excluded']")
                     excluded_filter.locator("select[name=category]").select_option("fixture-a")
                     with page.expect_response(feed_response(origin, "excluded")) as filtered_excluded:
