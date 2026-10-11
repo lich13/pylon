@@ -62,6 +62,9 @@ def save(db, targets, value, *, owner='webops'):
         if (not isinstance(shown,list) or len(shown)>100 or any(type(i) is not int or not db.execute(
                 'SELECT 1 FROM review_decisions WHERE id=? AND entry_id=?',(i,entry_id)).fetchone() for i in shown)):
             raise ValueError('原判断标识无效')
+        shown = sorted(set(shown))
+        if shown != [r['id'] for r in latest(db, entry_id)]:
+            raise Conflict('判断已更新，请重新打开记录后填写反馈')
         ids = dumps(shown)
         if old:
             fid = old['id']
@@ -86,25 +89,30 @@ def discard(db, targets, *, owner='webops'):
 
 
 def submit(db, targets, *, owner='webops'):
-    if not isinstance(targets, list) or not 1 <= len(targets) <= 1000: raise ValueError('请先填写本批反馈')
+    if not isinstance(targets, list) or not 1 <= len(targets) <= 200: raise ValueError('每批可提交 1 至 200 条反馈')
     if any(not isinstance(t,dict) or not isinstance(t.get('id'),str) or type(t.get('revision')) is not int for t in targets):raise ValueError('反馈标识无效')
     if len({t['id'] for t in targets}) != len(targets): raise ValueError('重复反馈标识')
     request_id = digest([owner, sorted((t['id'], t['revision']) for t in targets)])
     old = db.execute('SELECT * FROM review_batches WHERE request_id=?', (request_id,)).fetchone()
-    if old: return {'batch_id': old['id'], 'status': old['status'], 'repeated': True}
+    if old:
+        count = db.execute('SELECT count(*) FROM review_feedback WHERE batch_id=?', (old['id'],)).fetchone()[0]
+        return {'batch_id': old['id'], 'status': old['status'], 'repeated': True, 'count': count}
     rows = []
     for target in targets:
         row = db.execute('SELECT * FROM review_feedback WHERE id=? AND owner=? AND batch_id IS NULL', (target['id'], owner)).fetchone()
         if not row or row['revision'] != target['revision']: raise Conflict('反馈草稿已变化，请刷新后提交')
         current = db.execute('SELECT max(id) FROM review_snapshots WHERE entry_id=?', (row['entry_id'],)).fetchone()[0]
         if current != row['snapshot_id']: raise Conflict('本批存在已更新的原文，请重新核对后提交')
+        if sorted(json.loads(row['decision_ids'])) != [r['id'] for r in latest(db, row['entry_id'])]:
+            raise Conflict('本批存在已更新的判断，请重新核对后提交')
         rows.append(row)
     bid = uuid.uuid4().hex; now = time.time()
     db.execute('INSERT INTO review_batches(id,owner,request_id,status,created_at,updated_at) VALUES(?,?,?,\'submitted\',?,?)',
                (bid, owner, request_id, now, now))
     for row in rows:
         # Preserve the exact displayed evidence and original decisions for repair/regression work.
-        frozen = detail(db, row['entry_id']); frozen.pop('drafts', None)
+        frozen = detail(db, row['entry_id'])
+        for field in ('drafts', 'feedback', 'latest'): frozen.pop(field, None)
         shown=set(json.loads(row['decision_ids']))
         frozen['decisions']=[d for d in frozen['decisions'] if d['id'] in shown]
         value = json.loads(row['value']); value['snapshot'] = frozen
@@ -112,24 +120,60 @@ def submit(db, targets, *, owner='webops'):
     return {'batch_id': bid, 'status': 'submitted', 'count': len(rows)}
 
 
-def batches(db, *, owner='webops'):
+def batches(db, *, owner='webops', unresolved=False):
     result = []
-    for row in db.execute('SELECT * FROM review_batches WHERE owner=? ORDER BY created_at DESC', (owner,)):
+    for row in db.execute('SELECT * FROM review_batches WHERE owner=?' + (" AND status<>'fixed'" if unresolved else '') + ' ORDER BY created_at DESC', (owner,)):
         result.append({**dict(row), 'result': json.loads(row['result']),
-                       'count': db.execute('SELECT count(*) FROM review_feedback WHERE batch_id=?', (row['id'],)).fetchone()[0]})
+                       'count': db.execute('SELECT count(*) FROM review_feedback WHERE batch_id=?', (row['id'],)).fetchone()[0],
+                       'fixed_count': db.execute("SELECT count(*) FROM review_resolutions x JOIN review_feedback f ON f.id=x.feedback_id WHERE f.batch_id=? AND x.status='fixed'", (row['id'],)).fetchone()[0]})
     return result
+
+
+def results(db, *, entry_id=None, batch_id=None):
+    where, args = ["f.owner='webops'", 'f.batch_id IS NOT NULL'], []
+    for column, val in (('entry_id', entry_id), ('batch_id', batch_id)):
+        if val is not None: where.append('f.'+column+'=?'); args.append(val)
+    return [{**dict(row), 'result': json.loads(row['result']), 'value': json.loads(row['value'])}
+            for row in db.execute('''SELECT f.*,coalesce(x.status,b.status) status,coalesce(x.result,'{}') result
+                FROM review_feedback f JOIN review_batches b ON b.id=f.batch_id
+                LEFT JOIN review_resolutions x ON x.feedback_id=f.id WHERE ''' + ' AND '.join(where) +
+                ' ORDER BY f.updated_at DESC', args)]
 
 
 def update_batch(db, batch_id, *, status, result):
     """Maintenance-only reconciliation, never exposed as a web mutation."""
     if status not in {'processing', 'fixed', 'needs_info'}: raise ValueError('invalid batch state')
     if not isinstance(result, dict): raise ValueError('反馈处理结果无效')
-    if not db.execute('SELECT 1 FROM review_batches WHERE id=?', (batch_id,)).fetchone(): raise ValueError('batch not found')
-    if status == 'fixed':
-        comparisons = result.get('comparisons')
-        if (not isinstance(result.get('commit'),str) or not re.fullmatch(r'[0-9a-f]{40}', result['commit'])
-                or not isinstance(comparisons,list) or not 1 <= len(comparisons) <= 1000
-                or any(not isinstance(row,dict) or any(not isinstance(row.get(key),str) or not row[key].strip()
-                    for key in ('before','after')) for row in comparisons)):
-            raise ValueError('修复需提供完整提交和逐样本前后结果')
-    db.execute('UPDATE review_batches SET status=?,result=?,updated_at=? WHERE id=?', (status, dumps(result), time.time(), batch_id))
+    old = db.execute('SELECT * FROM review_batches WHERE id=?', (batch_id,)).fetchone()
+    if not old: raise ValueError('batch not found')
+    ids = {r[0] for r in db.execute('SELECT id FROM review_feedback WHERE batch_id=?', (batch_id,))}
+    resolved = {r['feedback_id']: dict(r) for r in db.execute('SELECT * FROM review_resolutions WHERE feedback_id IN (SELECT id FROM review_feedback WHERE batch_id=?)', (batch_id,))}
+    comparisons = result.get('comparisons', [])
+    if not isinstance(comparisons, list) or len(comparisons) > 1000: raise ValueError('逐条结果无效')
+    updates = {}
+    for row in comparisons:
+        if not isinstance(row, dict) or row.get('feedback_id') not in ids or row['feedback_id'] in updates:
+            raise ValueError('请提供本批不重复的具体反馈 ID')
+        item_status = row.get('status', 'fixed')
+        if item_status not in {'processing', 'fixed', 'needs_info'}: raise ValueError('反馈状态无效')
+        value = {**row, 'commit': row.get('commit', result.get('commit', ''))}
+        if item_status == 'fixed' and (not re.fullmatch(r'[0-9a-f]{40}', str(value['commit'])) or
+                any(not isinstance(value.get(key), str) or not value[key].strip() for key in ('before', 'after', 'evidence'))):
+            raise ValueError('修复需提供完整提交、逐样本前后结果和验证证据')
+        updates[row['feedback_id']] = {'status': item_status, 'result': dumps(value)}
+    combined = {**resolved, **updates}
+    all_fixed = bool(ids) and all(combined.get(fid, {}).get('status') == 'fixed' for fid in ids)
+    if status == 'fixed' and not all_fixed: raise ValueError('本批还有未修复反馈，不能标记整批完成')
+    now = time.time()
+    for fid, value in updates.items():
+        db.execute('INSERT OR REPLACE INTO review_resolutions VALUES(?,?,?,?)', (fid, value['status'], value['result'], now))
+    for fid in ids - set(updates):
+        if resolved.get(fid, {}).get('status') == 'fixed': continue
+        db.execute('INSERT OR REPLACE INTO review_resolutions VALUES(?,?,?,?)',
+                   (fid, status, dumps({'feedback_id':fid,'status':status,'reason': result.get('reason', '')}), now))
+    final_status = 'fixed' if all_fixed else ('needs_info' if status == 'needs_info' else 'processing')
+    history = json.loads(old['result'])
+    history.update({k: v for k, v in result.items() if k != 'comparisons'})
+    history['comparisons'] = [json.loads(r['result']) for r in db.execute(
+        'SELECT result FROM review_resolutions WHERE feedback_id IN (SELECT id FROM review_feedback WHERE batch_id=?)', (batch_id,))]
+    db.execute('UPDATE review_batches SET status=?,result=?,updated_at=? WHERE id=?', (final_status, dumps(history), now, batch_id))

@@ -400,8 +400,7 @@ def request(post: dict) -> tuple[list[dict],str]:
     schema=SCHEMA
     schema['properties']['items']['items']['properties']['category']['enum']=[*CATEGORIES,'unknown']
     started=time.monotonic()
-    response,request_id=_request_grok_structured(build_prompt(post),schema=schema,name='marketplace_items',
-                                               timeout=20,total_timeout=120)
+    response,request_id=_request_grok_structured(build_prompt(post),schema=schema,name='marketplace_items')
     try:return validate(extract_grok_json(response,label='marketplace items'),post,partial=bool(post.get('_correction'))),request_id
     except Exception as error:
         error.request_id=request_id;error.elapsed=time.monotonic()-started
@@ -441,12 +440,19 @@ def prepare(db, post: dict, items: list[dict]) -> list[dict] | None:
 
 
 def run_pending(store, *, limit: int = 1) -> int:
+    from pylon.shared.model_execution import Execution
+    with Execution(store.box, 'market:items') as execution:
+        if execution is None: return 0
+        return _run_pending(store,limit=limit,execution=execution)
+
+
+def _run_pending(store,limit,execution):
     count=0
     for _ in range(limit):
         now=time.time()
         with store.box.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            db.execute("UPDATE marketplace_analyses SET status=CASE WHEN attempts>=3 THEN 'error' ELSE 'pending' END,error='interrupted_read_only_analysis' WHERE status='running' AND started_at<?",(now-180,))
+            db.execute("UPDATE marketplace_analyses SET status=CASE WHEN attempts>=3 THEN 'error' ELSE 'pending' END,error='interrupted_read_only_analysis' WHERE status='running'")
             failed=db.execute("SELECT p.* FROM marketplace_posts p WHERE p.status='pending_analysis' AND EXISTS (SELECT 1 FROM marketplace_analyses a WHERE a.source=p.source AND a.source_id=p.source_id AND a.status='error' AND a.error='interrupted_read_only_analysis')").fetchall()
             for stopped in failed:
                 from .control import review
@@ -459,6 +465,7 @@ def run_pending(store, *, limit: int = 1) -> int:
             job=dict(row)
             post=dict(db.execute('SELECT * FROM marketplace_posts WHERE source=? AND source_id=?',(job['source'],job['source_id'])).fetchone())
             db.execute("UPDATE marketplace_analyses SET status='running',attempts=attempts+1,started_at=? WHERE fingerprint=?",(now,job['fingerprint']))
+        execution.track(post['source'],post['source_id'],job['fingerprint'])
         try:
             if job['semantic_failures'] and job['error']:
                 post['_correction']=job['error']
@@ -526,8 +533,6 @@ def main():
     from .store import Store
     from .pipeline import process
     store=Store()
-    from .ai_prices import run_pending as run_prices
-    run_prices(store,limit=1)
     run_pending(store,limit=1)
     process(store)
     print('{"wakeAgent":false}')

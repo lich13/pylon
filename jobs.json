@@ -111,9 +111,9 @@
     "profile": "webops",
     "schedule": "* * * * *",
     "deliver": false,
-    "timeout": 720,
-    "lock": "software-update-monitor",
-    "failure_notify": true,
+    "timeout": null,
+    "lock": "software-update-enrich",
+    "failure_notify": false,
     "module": "pylon.tasks.software.enrich"
   },
   "b7a84d1d9f21": {
@@ -214,7 +214,7 @@
     "schedule": "* * * * *",
     "deliver": false,
     "failure_notify": false,
-    "timeout": 600,
+    "timeout": null,
     "module": "pylon.tasks.marketplace.enrich"
   },
   "intelligence-review": {
@@ -224,7 +224,7 @@
     "deliver": false,
     "failure_notify": false,
     "wait_for_delivery": false,
-    "timeout": 1080,
+    "timeout": null,
     "module": "pylon.tasks.intelligence",
     "args": [
       "review",
@@ -254,7 +254,7 @@
     "deliver": false,
     "failure_notify": false,
     "wait_for_delivery": false,
-    "timeout": 1080,
+    "timeout": null,
     "module": "pylon.tasks.intelligence",
     "args": [
       "review",
@@ -280,5 +280,14 @@
       "--limit",
       "2"
     ]
+  },
+  "marketplace-prices": {
+    "name": "交易 AI 价格判断",
+    "profile": "webops",
+    "schedule": "* * * * *",
+    "deliver": false,
+    "failure_notify": false,
+    "timeout": null,
+    "module": "pylon.tasks.marketplace.ai_prices"
   }
 }

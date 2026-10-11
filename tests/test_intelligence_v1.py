@@ -91,10 +91,10 @@ def test_persistent_backlog_opens_one_alert_and_restarts_do_not_duplicate_it(tmp
     path = tmp_path / "health.sqlite3"
     box = Outbox(path)
 
-    health.record(box, "helper-summary", backlog=3, error="synthetic blocked", now=1000)
-    health.record(box, "helper-summary", backlog=3, error="synthetic blocked", now=4600)
+    health.record(box, "helper-summary", backlog=3, error="fixture upstream unavailable", now=1000)
+    health.record(box, "helper-summary", backlog=3, error="fixture upstream unavailable", now=4600)
     restarted = Outbox(path)
-    health.record(restarted, "helper-summary", backlog=3, error="synthetic blocked", now=8200)
+    health.record(restarted, "helper-summary", backlog=3, error="fixture upstream unavailable", now=8200)
 
     events = rows(box, "SELECT * FROM events ORDER BY created_at")
     assert len(events) == 1
@@ -106,7 +106,7 @@ def test_persistent_backlog_opens_one_alert_and_restarts_do_not_duplicate_it(tmp
     ]
 
 
-def test_backlog_without_a_current_error_still_opens_one_episode_alert(tmp_path):
+def test_backlog_without_a_current_error_stays_silent_even_after_sixty_minutes(tmp_path):
     box = Outbox(tmp_path / "health-no-error.sqlite3")
 
     health.record(box, "delivery", backlog=1, now=1000)
@@ -114,7 +114,10 @@ def test_backlog_without_a_current_error_still_opens_one_episode_alert(tmp_path)
     health.record(box, "delivery", backlog=1, now=8200)
 
     alerts = rows(box, "SELECT * FROM events WHERE job_id='intelligence-review'")
-    assert len(alerts) == 1
+    assert alerts == []
+    assert rows(box, "SELECT blocked_since,open,backlog FROM intel_health") == [
+        {"blocked_since": None, "open": 0, "backlog": 1}
+    ]
 
 
 def test_progress_or_empty_backlog_closes_the_episode_without_a_recovery_notice(tmp_path):

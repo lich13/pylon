@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS review_batches (
  status TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
  result TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS review_digests (day TEXT PRIMARY KEY,event_id TEXT,created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS review_resolutions (
+ feedback_id TEXT PRIMARY KEY,status TEXT NOT NULL,result TEXT NOT NULL DEFAULT '{}',updated_at REAL NOT NULL);
 '''
 
 
@@ -172,6 +174,9 @@ def refresh(db, entry_id):
                 score += 8
             if item.get('opportunity') or item.get('price_advantage'): score += 15
         if value.get('policy_decision') == 'push' or value.get('decision') == 'push': score += 8
+    # Later analysis cannot erase evidence that this post was actually sent.
+    if db.execute("SELECT 1 FROM review_decisions d JOIN events e ON e.id=d.event_id WHERE d.entry_id=? AND e.status='delivered' LIMIT 1", (entry_id,)).fetchone():
+        states.add('delivered')
     state = next((s for s in ('delivered', 'queued', 'failed', 'needs_info', 'excluded', 'duplicate', 'pending', 'unknown') if s in states), 'pending')
     text = entry['title'] + '\n' + entry['body']
     signals = [(r'免费|免单|返现|立减|补贴|白嫖|赠送|开源', 12, '明确收益'),
@@ -209,12 +214,43 @@ def detail(db, entry_id):
         if event: decision['notification'] = {'status': event['status'], 'text': json.loads(event['payload']).get('text', ''), 'at': event['updated_at']}
         value['decisions'].append(decision)
     value['drafts'] = [{**dict(r), 'value': json.loads(r['value'])} for r in db.execute('SELECT * FROM review_feedback WHERE entry_id=? AND batch_id IS NULL', (entry_id,))]
+    from .feedback import results
+    value['feedback'] = results(db, entry_id=entry_id)
+    value['latest'] = [{**r, 'data': json.loads(r['data'])} for r in latest(db, entry_id)]
+    value['snapshot_id'] = max((s['id'] for s in value['snapshots']), default=None)
+    value['analysis'] = []
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='model_executions'").fetchone():
+        from pathlib import Path
+        from types import SimpleNamespace
+        from pylon.shared.model_execution import active
+        path = db.execute('PRAGMA database_list').fetchone()[2]
+        if path:
+            box = SimpleNamespace(path=Path(path))
+            for origin in value['origins']:
+                for run in db.execute("SELECT component,started_at,heartbeat_at,request_id,status FROM model_executions WHERE source=? AND source_id=? AND status='running'", (origin['source'],origin['source_id'])):
+                    value['analysis'].append({**dict(run), 'status': 'waiting' if active(box,run['component']) else 'interrupted',
+                                              'elapsed': max(0,time.time()-run['started_at'])})
     return value
 
 
 def items(db, query):
     sync_deliveries(db)
     page = max(1, int(query.get('page', 1))); where = []; args = []
+    size = int(query.get('page_size', 50))
+    if size not in (50, 100): raise ValueError('每页可选 50 或 100 条')
+    mode = query.get('review', 'pending')
+    if mode not in ('pending', 'all'): raise ValueError('审核范围无效')
+    # Match the exact displayed content and judgments; item feedback alone must
+    # never hide the other products in a mixed post.
+    reviewed = '''EXISTS (SELECT 1 FROM review_feedback f WHERE f.entry_id=r.id
+        AND f.owner='webops' AND f.batch_id IS NOT NULL AND f.item_key=''
+        AND f.snapshot_id=(SELECT max(id) FROM review_snapshots WHERE entry_id=r.id)
+        AND f.decision_ids=(SELECT json_group_array(id) FROM
+          (SELECT d.id FROM review_decisions d WHERE d.entry_id=r.id AND d.id IN
+           (SELECT max(v.id) FROM review_decisions v JOIN review_snapshots s ON s.id=v.snapshot_id
+            WHERE v.entry_id=r.id GROUP BY v.lane,s.source,s.source_id) ORDER BY d.id)))'''
+    if mode == 'pending':
+        where.append('(NOT ' + reviewed + " OR EXISTS (SELECT 1 FROM review_feedback f WHERE f.entry_id=r.id AND f.owner='webops' AND f.batch_id IS NULL))")
     for key in ('day', 'status'):
         if query.get(key): where.append(f'r.{key}=?'); args.append(query[key])
     if query.get('source'):
@@ -227,17 +263,47 @@ def items(db, query):
         where.append('instr(lower(r.title||char(10)||r.body),lower(?))>0'); args.append(str(query['q'])[:200])
     sql = ' FROM review_entries r' + (' WHERE ' + ' AND '.join(where) if where else '')
     total = db.execute('SELECT count(*)' + sql, args).fetchone()[0]
-    rows = db.execute('SELECT r.*' + sql + ' ORDER BY r.priority DESC,r.first_seen DESC,r.id LIMIT 50 OFFSET ?', (*args, (page-1)*50)).fetchall()
+    rows = db.execute('SELECT r.id,r.title,r.status,r.categories,r.priority,r.first_seen,r.published_at,r.url,r.day,' +
+                      reviewed + ' reviewed' + sql +
+                      " ORDER BY (r.status='delivered') DESC,r.priority DESC,r.first_seen DESC,r.id LIMIT ? OFFSET ?",
+                      (*args, size, (page-1)*size)).fetchall()
     result = []
     for row in rows:
-        value = dict(row); value['body'] = value['body'][:800]
-        value['categories'] = json.loads(value['categories']); value['priority_reasons'] = json.loads(value['priority_reasons'])
+        value = dict(row); value['reviewed'] = bool(value['reviewed'])
+        value['categories'] = json.loads(value['categories'])
         value['origins'] = [dict(r) for r in db.execute('SELECT source,source_id FROM review_origins WHERE entry_id=?', (row['id'],))]
-        value['latest'] = [{**r, 'data': json.loads(r['data'])} for r in latest(db, row['id'])]
+        decisions = latest(db, row['id'])
+        value['decision_ids'] = [d['id'] for d in decisions]
+        products, facts = [], []
+        for decision in decisions:
+            data = json.loads(decision['data'])
+            products.extend(p.get('item') or p for p in data.get('items', []) if isinstance(p, dict))
+            facts.extend(str(f.get('value', '')) for f in data.get('facts', []) if isinstance(f, dict))
+        value['product_count'] = len(products)
+        prices = []
+        for product in products:
+            if not isinstance(product, dict): continue
+            attrs = product.get('attributes') or {}
+            price = product.get('price', attrs.get('price'))
+            if price is None or isinstance(price, bool) or not str(price).strip(): continue
+            quoted_currency = ((attrs.get('ai_price_result') or {}).get('offer') or {}).get('currency')
+            if isinstance(quoted_currency, dict): quoted_currency = quoted_currency.get('value')
+            currency = product.get('currency') or attrs.get('currency') or quoted_currency or 'CNY'
+            prices.append(str(price) + ' ' + {'CNY': '元', 'USD': '美元'}.get(currency, str(currency)))
+        value['price_summary'] = ' / '.join(dict.fromkeys(prices))[:100] or ('价格未标' if products else '')
+        value['summary'] = '；'.join(facts)[:100]
         value['snapshot_id'] = db.execute('SELECT max(id) FROM review_snapshots WHERE entry_id=?', (row['id'],)).fetchone()[0]
         value['feedback_count'] = db.execute('SELECT count(*) FROM review_feedback WHERE entry_id=?', (row['id'],)).fetchone()[0]
+        feedback = db.execute('''SELECT f.batch_id,f.snapshot_id,f.decision_ids,coalesce(x.status,b.status,'draft') status
+            FROM review_feedback f LEFT JOIN review_batches b ON b.id=f.batch_id
+            LEFT JOIN review_resolutions x ON x.feedback_id=f.id
+            WHERE f.entry_id=? AND f.owner='webops' ORDER BY f.updated_at DESC LIMIT 1''', (row['id'],)).fetchone()
+        value['feedback_state'] = ''
+        if feedback:
+            same = feedback['snapshot_id'] == value['snapshot_id'] and sorted(json.loads(feedback['decision_ids'])) == value['decision_ids']
+            value['feedback_state'] = feedback['status'] if same else 'updated'
         result.append(value)
-    return {'items': result, 'total': total, 'page': page, 'page_size': 50, 'pages': (total+49)//50}
+    return {'items': result, 'total': total, 'page': page, 'page_size': size, 'pages': (total+size-1)//size}
 
 
 def prune(db, *, now=None):
@@ -247,6 +313,7 @@ def prune(db, *, now=None):
         (SELECT 1 FROM review_feedback f LEFT JOIN review_batches b ON b.id=f.batch_id
          WHERE f.entry_id=r.id AND (f.batch_id IS NULL OR b.status<>'fixed'))''', (cutoff,))]
     for entry_id in ids:
+        db.execute('DELETE FROM review_resolutions WHERE feedback_id IN (SELECT id FROM review_feedback WHERE entry_id=?)', (entry_id,))
         for table in ('review_feedback', 'review_decisions', 'review_snapshots', 'review_origins'):
             db.execute(f'DELETE FROM {table} WHERE entry_id=?', (entry_id,))
         db.execute('DELETE FROM review_entries WHERE id=?', (entry_id,))

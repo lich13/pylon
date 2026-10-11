@@ -1,5 +1,13 @@
 # pylon
 
+## 每日审核反馈维护
+
+接续用户反馈时，先运行 `python -m pylon.tasks.daily_review batches --unresolved`，再用 `batch --id <批次>` 读取冻结的原文、原判断和预期结果。草稿和提交本身不会修改生产筛选，也不会执行 Agent 或重发历史帖子。
+
+处理完成用 `reconcile --id <批次> --status processing|fixed|needs_info --result-file <结果文件>` 回填。`comparisons` 中每项必须指明 `feedback_id`；已修复项还须提供 `commit`、`before`、`after` 和 `evidence`。可以逐条回填，全部反馈都有修复证据后才能将整批标为 `fixed`。判断正确的反馈也应关联防回归验证。
+
+自动内容分析沿用 Grok API 和现有推理强度，本地不限制模型等待时长。领取归属由进程文件锁判断，心跳仅用于显示；不要按耗时回收仍在运行的请求。人工 Agent 与 Gmail 执行时限独立保留。
+
 Python 机器人服务、SQLite 待发队列和 systemd timers。维护 Gmail、线报、V2EX、Linux.do、Chiphell、日港 iTunes、KDocs 报价、软件更新、数据清理、SSH 和软件维护任务；四平台统一交易处理任务在关注策略明确启用后工作。
 
 ## 情报与交易分流

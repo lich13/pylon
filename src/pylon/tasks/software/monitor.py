@@ -49,7 +49,7 @@ MAX_TRANSLATE_SLEEP_SECONDS = 1.5
 TRANSLATE_FAILURE_BACKOFF_SECONDS = 10 * 60
 TRANSLATION_MAX_ATTEMPTS = 3
 TRANSLATE_RETRY_SLEEP_SECONDS = 0.5
-GROK_DIGEST_TIMEOUT_SECONDS = 45
+GROK_DIGEST_TIMEOUT_SECONDS = None
 GROK_DIGEST_INPUT_CHARS = 6000
 GROK_DIGEST_MAX_ITEMS_PER_RUN = 4
 # Initial request plus at most two retries, as configured by the rollout plan.
@@ -57,7 +57,7 @@ GROK_DIGEST_MAX_ATTEMPTS = 3
 GROK_DIGEST_PROMPT_VERSION = '2026-10-02-v1'
 GROK_ENDPOINT_ENV = Path(os.environ.get('PYLON_GROK_ENV', '/srv/pylon/secrets/grok.env'))
 TRANSLATION_ENDPOINT_ENV = Path(os.environ.get('PYLON_TRANSLATION_ENV', '/srv/pylon/secrets/translation.env'))
-GROK_POLISH_TIMEOUT_SECONDS = 300
+GROK_POLISH_TIMEOUT_SECONDS = None
 GROK_POLISH_INPUT_CHARS = 2400
 GROK_POLISH_SCHEMA = json.dumps({
     'type': 'object',
@@ -2067,7 +2067,7 @@ def validate_grok_digest(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _request_grok_structured(prompt: str, *, schema: dict[str, Any], name: str,
-                             timeout: int = GROK_DIGEST_TIMEOUT_SECONDS,
+                             timeout: int | None = None,
                              total_timeout: int | None = None) -> tuple[dict[str, Any], str]:
     env = read_env(GROK_ENDPOINT_ENV) | os.environ.copy()
     base = env.get('GROK_MODELS_BASE_URL', '').rstrip('/')
@@ -2115,7 +2115,10 @@ def _request_grok_structured(prompt: str, *, schema: dict[str, Any], name: str,
                             emit('response', request_id=request_id, elapsed=time.monotonic()-started)
                             return event.get('response'), request_id
                         if event.get('type') in {'response.failed', 'response.incomplete', 'error'}:
-                            raise GrokDigestError('Grok stream failed')
+                            info = event.get('error') or (event.get('response') or {}).get('error') or {}
+                            code = info.get('code', '') if isinstance(info, dict) else ''
+                            code = code if isinstance(code, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,80}', code) else ''
+                            raise GrokDigestError('Grok stream failed: ' + event['type'] + (': '+code if code else ''))
                 raise GrokDigestError('Grok stream ended before completion')
     except GrokDigestError as exc:
         exc.request_id = request_id
@@ -2130,11 +2133,15 @@ def _request_grok_structured(prompt: str, *, schema: dict[str, Any], name: str,
 
 def request_grok_digest(source: dict[str, Any], item: dict[str, Any]) -> tuple[dict[str, Any], str]:
     response, request_id = _request_grok_structured(
-        build_grok_digest_prompt(source, item),
+        build_grok_digest_prompt(source, item) + ("\n修正上次输出：" + str(item.get("_correction"))[:300] if item.get("_correction") else ""),
         schema=GROK_DIGEST_SCHEMA,
         name='software_update_digest',
     )
-    return validate_grok_digest(extract_grok_json(response, label='Grok digest')), request_id
+    try: return validate_grok_digest(extract_grok_json(response, label='Grok digest')), request_id
+    except GrokDigestError as error:
+        error.semantic = True
+        error.request_id = request_id
+        raise
 
 
 def load_translation_endpoints() -> list[dict[str, str]]:
@@ -2489,7 +2496,7 @@ def request_grok_polish(prompt: str) -> dict[str, Any]:
         'stream': True,
     }
     try:
-        with httpx.Client(timeout=GROK_POLISH_TIMEOUT_SECONDS, trust_env=False) as client:
+        with httpx.Client(timeout=None, trust_env=False) as client:
             with client.stream('POST', base + '/responses', headers={'Authorization': 'Bearer ' + key}, json=payload) as response:
                 if response.status_code != 200:
                     raise TranslationError(f'Grok polish HTTP {response.status_code}')
@@ -2735,7 +2742,7 @@ def _translate_for_fallback(client: LibreTranslateClient, text: str) -> str:
     return restored.strip()
 
 
-def enrich_event(event: dict[str, Any], *, state: dict[str, Any]) -> tuple[dict[str, Any], str, str | None, str | None]:
+def enrich_event(event: dict[str, Any], *, state: dict[str, Any], checkpoint=None) -> tuple[dict[str, Any], str, str | None, str | None]:
     """Return digest, provider, request id, and a sanitized error if any."""
     source = event.get('source') if isinstance(event.get('source'), dict) else {}
     item = event.get('item') if isinstance(event.get('item'), dict) else {}
@@ -2768,22 +2775,39 @@ def enrich_event(event: dict[str, Any], *, state: dict[str, Any]) -> tuple[dict[
 
     request_id = None
     grok_error = None
-    for attempt in range(GROK_DIGEST_MAX_ATTEMPTS):
+    requests = event.setdefault('enrichment_requests', [])
+    for previous in requests:
+        if previous['status'] == 'started':
+            previous.update(status='interrupted', error='执行进程已结束，请求中断', finished_at=utc_now_iso())
+    semantic_errors = [r for r in requests if r.get('semantic')]
+    for attempt in range(len(requests), GROK_DIGEST_MAX_ATTEMPTS):
+        if len(semantic_errors) >= 2: break
+        request_row = {'number': attempt+1, 'status': 'started', 'started_at': utc_now_iso()}
+        requests.append(request_row)
+        if checkpoint and not checkpoint(event): raise GrokDigestError('content changed before request')
         try:
-            digest, request_id = request_grok_digest(source, item)
+            request_item = {**item, '_correction': semantic_errors[-1]['error']} if semantic_errors else item
+            digest, request_id = request_grok_digest(source, request_item)
+            request_row.update(status='success', request_id=request_id, finished_at=utc_now_iso())
             enrichment['grok_successes'] = int(enrichment.get('grok_successes') or 0) + 1
             enrichment['last_provider'] = 'grok'
             enrichment['last_success_at'] = utc_now_iso()
             enrichment['last_error'] = None
-            if not isinstance(cache, dict):
-                cache = {}
+            if not isinstance(cache, dict): cache = {}
             cache[cache_key] = digest
             save_json(ENRICHMENT_CACHE_FILE, cache)
+            if checkpoint: checkpoint(event)
             return digest, 'grok', request_id, None
         except (GrokDigestError, TranslationError, OSError, httpx.HTTPError) as exc:
-            grok_error = f'{type(exc).__name__}: {exc}'[:500]
-            if attempt + 1 < GROK_DIGEST_MAX_ATTEMPTS:
+            from pylon.tasks.intelligence.attempts import safe_error
+            grok_error = type(exc).__name__ + ': ' + safe_error(exc)
+            request_row.update(status='failed', error=grok_error, semantic=bool(getattr(exc,'semantic',False)),
+                               request_id=getattr(exc,'request_id',''), finished_at=utc_now_iso())
+            if request_row['semantic']: semantic_errors.append(request_row)
+            if checkpoint: checkpoint(event)
+            if attempt + 1 < GROK_DIGEST_MAX_ATTEMPTS and len(semantic_errors) < 2:
                 time.sleep(0.5 * (attempt + 1))
+    grok_error = grok_error or (requests[-1].get('error') if requests else None) or '本内容已用尽请求次数'
     enrichment['grok_failures'] = int(enrichment.get('grok_failures') or 0) + 1
     enrichment['last_error'] = grok_error
 
@@ -2805,62 +2829,82 @@ def enrich_event(event: dict[str, Any], *, state: dict[str, Any]) -> tuple[dict[
         return digest, 'original', request_id, error
 
 
+def merge_enrichment_event(event, *, state=None, baseline=None, remove=False):
+    """Commit only this content version under the collector's short state lock."""
+    key = event_key(event)
+    version = enrichment_cache_key(event['source'], event['item'])
+    with NonBlockingLock(LOCK_PATH, blocking=True):
+        fresh = load_state()
+        pending = fresh.get('pending_events', [])
+        current = next((e for e in pending if event_key(e) == key and
+                        enrichment_cache_key(e['source'], e['item']) == version), None)
+        if current is None: return False
+        current.update({k:v for k,v in event.items() if k.startswith('enrichment_')})
+        if state is not None:
+            metrics = fresh.setdefault('enrichment', {})
+            for field, value in state.get('enrichment', {}).items():
+                if field in {'grok_successes','grok_failures','fallback_translations','original_fallbacks','cache_hits'}:
+                    metrics[field] = int(metrics.get(field) or 0) + max(0, int(value or 0)-int((baseline or {}).get(field) or 0))
+                else: metrics[field] = value
+        if remove: fresh['pending_events'] = [e for e in pending if e is not current]
+        save_state(fresh)
+        return True
+
+
 def process_pending_enrichment(*, max_items: int = GROK_DIGEST_MAX_ITEMS_PER_RUN,
                                dry_run: bool = False) -> dict[str, Any]:
-    state = load_state()
-    pending = state.get('pending_events')
-    if not isinstance(pending, list):
-        pending = []
-        state['pending_events'] = pending
+    from pylon.outbox import Outbox
+    from pylon.shared.model_execution import Execution
+    with Execution(Outbox(), 'software:enrich') as execution:
+        if execution is None:
+            return {'processed':0,'sent':0,'pending':len(load_state().get('pending_events',[])),'errors':[]}
+        return _process_pending_enrichment(max_items=max_items,dry_run=dry_run,execution=execution)
+
+
+def _process_pending_enrichment(*, max_items, dry_run, execution):
+    pending = load_state().get('pending_events', [])
     processed = sent = 0
-    errors: list[str] = []
-    remaining: list[dict[str, Any]] = []
-    for event in pending:
-        if not isinstance(event, dict):
-            continue
-        if processed >= max(1, int(max_items)):
-            remaining.append(event)
-            continue
-        status = str(event.get('enrichment_status') or 'pending')
-        if status == 'sent':
-            continue
+    errors = []
+    for event in pending[:max(1, int(max_items))]:
+        if not isinstance(event, dict): continue
+        # Collector state can change while the previous item waits for a model.
+        state = load_state()
+        baseline = dict(state.get('enrichment', {}))
+        if not any(event_key(e)==event_key(event) and enrichment_cache_key(e['source'],e['item'])==
+                   enrichment_cache_key(event['source'],event['item']) for e in state.get('pending_events',[])): continue
+        execution.track('software', event_key(event), enrichment_cache_key(event['source'],event['item']))
+        processed += 1
         try:
-            digest, provider, request_id, error = enrich_event(event, state=state)
-            event['enrichment_status'] = 'ready'
-            event['enrichment_provider'] = provider
-            event['enrichment_request_id'] = request_id
-            event['enrichment_attempts'] = int(event.get('enrichment_attempts') or 0) + 1
-            event['enrichment_result'] = digest
-            event['enrichment_result_hash'] = hashlib.sha256(json.dumps(digest, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
-            event['enrichment_completed_at'] = utc_now_iso()
-            if error:
-                event['enrichment_error'] = error
-            processed += 1
-            if not dry_run:
-                save_state(state)
-            message = format_digest_event(event, digest, provider=provider)
-            if dry_run:
-                remaining.append(event)
-                continue
+            digest, provider, request_id, error = enrich_event(event, state=state,
+                checkpoint=None if dry_run else merge_enrichment_event)
+            event.update(enrichment_status='ready',enrichment_provider=provider,enrichment_request_id=request_id,
+                         enrichment_attempts=len(event.get('enrichment_requests', [])),enrichment_result=digest,
+                         enrichment_result_hash=hashlib.sha256(json.dumps(digest,sort_keys=True,ensure_ascii=False).encode()).hexdigest(),
+                         enrichment_completed_at=utc_now_iso())
+            if error: event['enrichment_error'] = error
+            if dry_run: continue
+            if not merge_enrichment_event(event,state=state,baseline=baseline): continue
+            message = format_digest_event(event,digest,provider=provider)
             key = f"software-update:{event_key(event)}:{event['enrichment_result_hash']}"
-            event_id = notification_events.publish(message, key=key)
-            if not event_id:
-                remaining.append(event)
-                errors.append(f"{event_key(event)}: outbox unavailable")
-                continue
-            sent += 1
+            # Publish and remove while holding the state lock so source removal
+            # cannot race a completed result. publish only persists to outbox.
+            with NonBlockingLock(LOCK_PATH,blocking=True):
+                fresh=load_state()
+                current=next((e for e in fresh.get('pending_events',[]) if event_key(e)==event_key(event) and
+                              enrichment_cache_key(e['source'],e['item'])==enrichment_cache_key(event['source'],event['item'])),None)
+                if current is None: continue
+                event_id=notification_events.publish(message,key=key)
+                if event_id:
+                    fresh['pending_events']=[e for e in fresh['pending_events'] if e is not current]
+                    save_state(fresh);sent+=1
+                else: errors.append(f"{event_key(event)}: outbox unavailable")
         except Exception as exc:
-            event['enrichment_status'] = 'error'
-            event['enrichment_error'] = f'{type(exc).__name__}: {exc}'[:500]
-            remaining.append(event)
+            from pylon.tasks.intelligence.attempts import safe_error
+            event['enrichment_status']='error'
+            event['enrichment_error']=type(exc).__name__+': '+safe_error(exc)
+            if not dry_run: merge_enrichment_event(event)
             errors.append(event['enrichment_error'])
-            processed += 1
-        if not dry_run:
-            save_state(state)
-    state['pending_events'] = remaining
-    if not dry_run:
-        save_state(state)
-    return {'processed': processed, 'sent': sent, 'pending': len(remaining), 'errors': errors}
+    return {'processed':processed,'sent':sent,'pending':len(load_state().get('pending_events',[])),'errors':errors}
 
 
 def fetch_url(url: str, *, timeout: int = SOURCE_TIMEOUT_SECONDS) -> bytes:

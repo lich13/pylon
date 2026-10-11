@@ -242,9 +242,26 @@ def process_item(store,item,*,value_request=judge.request,trade_request=trade.re
 
 
 def review_source(store,source,limit=2):
+    from pylon.shared.model_execution import Execution
+    from .attempts import SCHEMA
+    with Execution(store.box, 'intel:'+source) as execution:
+        if execution is None: return {'source':source,'processed':0,'queued':0,'errors':0,'waiting':True}
+        with store.box.connect() as db:
+            db.execute(SCHEMA)
+            db.execute("UPDATE intel_attempts SET status='failed',finished_at=?,elapsed=?-started_at,error='执行进程已结束，请求中断' WHERE source=? AND status='started'", (time.time(),time.time(),source))
+            db.execute('UPDATE intel_items SET lease_until=0 WHERE source=?', (source,))
+        try: return _review_source(store,source,limit,execution)
+        finally:
+            with store.box.connect() as db: db.execute('UPDATE intel_items SET lease_until=0 WHERE source=?', (source,))
+
+
+def _review_source(store,source,limit,execution):
     # Native Xianbao decisions are already computed at collection; drain those
     # cheap records without making useful leads wait behind local rejections.
-    rows=store.claim(source,200 if source=='xianbao' else limit);results=[process_item(store,row) for row in rows]
+    rows=store.claim(source,200 if source=='xianbao' else limit);results=[]
+    for row in rows:
+        execution.track(source,row['source_id'],row['fingerprint'])
+        results.append(process_item(store,row))
     with store.box.connect() as db:
         from pylon.tasks.daily_review.capture import intel_decision
         for item in rows:

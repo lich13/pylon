@@ -35,8 +35,7 @@ def dispatch(db, action, data, query, csrf):
         if action == 'batch':
             row = db.execute('SELECT * FROM review_batches WHERE id=? AND owner=\'webops\'', (query.get('id', ''),)).fetchone()
             if not row: raise WebError('反馈批次不存在', 404)
-            return {**dict(row), 'result': json.loads(row['result']), 'feedback': [
-                {**dict(r), 'value': json.loads(r['value'])} for r in db.execute('SELECT * FROM review_feedback WHERE batch_id=?', (row['id'],))]}
+            return {**dict(row), 'result': json.loads(row['result']), 'feedback': feedback.results(db, batch_id=row['id'])}
         raise WebError('接口不存在', 404)
     except feedback.Conflict as error: raise WebError(str(error), 409) from None
     except ValueError as error: raise WebError(str(error)) from None

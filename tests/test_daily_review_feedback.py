@@ -144,6 +144,7 @@ def test_submit_is_idempotent_once_and_freezes_the_displayed_snapshot(review_db)
         "batch_id": submission["batch_id"],
         "status": "submitted",
         "repeated": True,
+        "count": 1,
     }
     assert db.execute("SELECT count(*) FROM review_batches").fetchone()[0] == 1
     row = db.execute("SELECT batch_id,value FROM review_feedback WHERE id=?", (saved["id"],)).fetchone()
@@ -213,7 +214,17 @@ def test_prune_removes_old_unreferenced_rows_but_protects_unresolved_feedback(re
         db,
         fixed_batch["batch_id"],
         status="fixed",
-        result={"commit": "a" * 40, "comparisons": [{"before": "x", "after": "y"}]},
+        result={
+            "commit": "a" * 40,
+            "comparisons": [
+                {
+                    "feedback_id": fixed_saved["id"],
+                    "before": "x",
+                    "after": "y",
+                    "evidence": "synthetic fixture assertion",
+                }
+            ],
+        },
     )
 
     for entry_id in (disposable, draft_entry, pending_entry, fixed_entry):

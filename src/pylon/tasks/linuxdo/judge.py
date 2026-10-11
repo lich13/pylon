@@ -174,7 +174,7 @@ skip/hold前逐项检查：是否已有具体收益/资源/方法/能力变化�
 def request(snapshot: dict, config: dict) -> dict:
     from pylon.tasks.software.monitor import _request_grok_structured, extract_grok_json
     response, _ = _request_grok_structured(build_prompt(snapshot, config), schema=SCHEMA,
-                                          name='linuxdo_value', timeout=45, total_timeout=120)
+                                          name='linuxdo_value')
     return extract_grok_json(response, label='Linux.do value')
 
 

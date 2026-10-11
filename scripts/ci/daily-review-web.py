@@ -179,6 +179,29 @@ def seed_fixture(box, *, total=TOTAL_ROWS):
     return fixture
 
 
+def bump_fixture_version(box, row, *, version="fixture-v2"):
+    """Capture a newer content version so submitted feedback becomes stale."""
+    from pylon.tasks.daily_review import store as review_store
+
+    with box.connect() as db:
+        snapshot_id = review_store.capture(
+            db,
+            row["source"],
+            row["source_id"],
+            lane=row["lane"],
+            title=row["title"],
+            body=f"{row['body']} 字段版本 {version}。",
+            url=f"https://example.invalid/review/{row['source_id']}",
+            published_at=_iso(row["day"], row["index"]),
+            first_seen=_iso(row["day"], row["index"]),
+            evidence_scope="forum_body" if row["lane"] == "market" else "helper_excerpt",
+            metadata={"fixture": True, "index": row["index"], "field_version": version},
+            fingerprint=f"fixture-fingerprint-{row['index']}-{version}",
+        )
+    assert snapshot_id
+    return snapshot_id
+
+
 @contextmanager
 def running_app(store):
     """Run the same app instance on a disposable loopback port."""
@@ -275,6 +298,16 @@ def check_navigation(page, origin):
     assert page.url.startswith(origin + "/pylon/review/")
 
 
+def first_unrelated_row(page, excluded):
+    """Choose a visible row while keeping later named fixtures independent."""
+    rows = page.locator("#feed tr.record-row")
+    for index in range(rows.count()):
+        row = rows.nth(index)
+        if row.get_attribute("data-record") not in excluded:
+            return row
+    raise AssertionError("no unrelated review row available for selection")
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="pylon-daily-review-web-") as directory:
         root = Path(directory)
@@ -329,19 +362,73 @@ def main():
                     expect(page.locator(".workspaces a")).to_have_count(3)
                     check_navigation(page, origin)
 
-                    # The default is the newest day; select all days to exercise 50-row paging.
+                    # The compact table defaults to pending review and keeps delivered rows first.
+                    expect(page.locator("#review")).to_have_value("pending")
+                    expect(page.locator("#page_size")).to_have_value("50")
                     submit_filters(page, origin, day="")
                     expect(page.locator("#count")).to_have_text(f"{TOTAL_ROWS} 条")
                     expect(page.locator("#page-label")).to_have_text("1 / 3")
-                    expect(page.locator("#feed .review-card")).to_have_count(50)
-                    page.locator("#next").click()
+                    expect(page.locator("#feed tr.record-row")).to_have_count(50)
+                    expect(page.locator("#feed tr.expanded-row[hidden]")).to_have_count(50)
+                    assert all(
+                        "这是一条 example.invalid 的合成原文" not in text
+                        for text in page.locator("#feed tr.record-row").all_inner_texts()
+                    )
+                    statuses = page.locator("#feed tr.record-row .status").evaluate_all(
+                        "nodes => nodes.map(node => node.className.includes('delivered'))"
+                    )
+                    first_pending = next((index for index, delivered in enumerate(statuses) if not delivered), len(statuses))
+                    assert all(statuses[index] for index in range(first_pending))
+                    assert not any(statuses[index] for index in range(first_pending, len(statuses)))
+
+                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
+                        page.locator("#next").click()
                     expect(page.locator("#page-label")).to_have_text("2 / 3")
-                    expect(page.locator("#feed .review-card")).to_have_count(50)
-                    page.locator("#next").click()
+                    expect(page.locator("#feed tr.record-row")).to_have_count(50)
+                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
+                        page.locator("#next").click()
                     expect(page.locator("#page-label")).to_have_text("3 / 3")
-                    expect(page.locator("#feed .review-card")).to_have_count(TOTAL_ROWS - 100)
-                    page.locator("#prev").click()
+                    expect(page.locator("#feed tr.record-row")).to_have_count(TOTAL_ROWS - 100)
+                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
+                        page.locator("#prev").click()
                     expect(page.locator("#page-label")).to_have_text("2 / 3")
+
+                    # The alternate supported page size is real API pagination, not a CSS-only change.
+                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
+                        page.locator("#page_size").select_option("100")
+                    expect(page.locator("#page-label")).to_have_text("1 / 2")
+                    expect(page.locator("#feed tr.record-row")).to_have_count(100)
+                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
+                        page.locator("#next").click()
+                    expect(page.locator("#page-label")).to_have_text("2 / 2")
+                    expect(page.locator("#feed tr.record-row")).to_have_count(TOTAL_ROWS - 100)
+                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
+                        page.locator("#page_size").select_option("50")
+                    expect(page.locator("#page-label")).to_have_text("1 / 3")
+
+                    # Selection survives pagination and bulk-correct creates independent drafts.
+                    excluded = {single["id"], product["id"], history["id"], *(row["id"] for row in bulk)}
+                    first_selected = first_unrelated_row(page, excluded)
+                    first_selected_id = first_selected.get_attribute("data-record")
+                    first_selected.locator("[data-select]").check()
+                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
+                        page.locator("#next").click()
+                    second_selected = first_unrelated_row(page, excluded | {first_selected_id})
+                    second_selected_id = second_selected.get_attribute("data-record")
+                    assert first_selected_id and second_selected_id and first_selected_id != second_selected_id
+                    second_selected.locator("[data-select]").check()
+                    expect(page.locator("#selection-count")).to_have_text("已选 2 条")
+                    with page.expect_response(response_for(origin + "/pylon/review/api/feedback", "POST")):
+                        page.locator("#bulk-correct").click()
+                    expect(page.locator("#draft-count")).to_have_text("2")
+                    state = page.request.get(origin + "/pylon/review/api/state").json()
+                    assert {draft["entry_id"] for draft in state["drafts"]} == {first_selected_id, second_selected_id}
+                    page.locator("#clear-selection").click()
+                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
+                        page.locator("#next").click()
+                    expect(page.locator("#page-label")).to_have_text("3 / 3")
+                    with page.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
+                        page.locator("#prev").click()
 
                     # Date, source, status, category and full-text filters all narrow the real API result.
                     expected_day_a = sum(row["day"] == DAY_A for row in fixture)
@@ -358,25 +445,32 @@ def main():
                     expect(page.locator("#count")).to_have_text(f"{expected_category} 条")
                     submit_filters(page, origin, query="needle-077")
                     expect(page.locator("#count")).to_have_text("1 条")
-                    expect(page.locator("#feed .review-card")).to_have_count(1)
+                    expect(page.locator("#feed tr.record-row")).to_have_count(1)
 
-                    # Historical decisions, source snapshots, and the notification text are all expandable.
+                    # Historical decisions, source snapshots, and notification text are lazy-loaded by title.
                     submit_filters(page, origin, query="history-keyword")
-                    history_card = page.locator(f"article[data-record='{history['id']}']")
-                    history_card.locator("details.record-details").click()
-                    expect(history_card.locator(".detail-content")).to_contain_text("历史第一条判断")
-                    expect(history_card.locator(".detail-content")).to_contain_text("历史最终判断")
-                    expect(history_card.locator(".detail-content")).to_contain_text("fixture notification delivered")
-                    expect(history_card.locator(".detail-content")).to_contain_text("历史通知样本 body")
+                    history_row = page.locator(f"tr.record-row[data-record='{history['id']}']")
+                    expect(history_row).to_be_visible()
+                    expect(history_row).not_to_contain_text("历史通知样本 body")
+                    expect(page.locator(f"tr[data-detail='{history['id']}']")).to_be_hidden()
+                    with page.expect_response(response_for(origin + f"/pylon/review/api/detail?id={history['id']}", "GET")):
+                        history_row.locator("[data-expand]").click()
+                    history_detail = page.locator(f"tr[data-detail='{history['id']}'] .detail-content")
+                    expect(history_detail).to_contain_text("历史第一条判断")
+                    expect(history_detail).to_contain_text("历史最终判断")
+                    expect(history_detail).to_contain_text("fixture notification delivered")
+                    expect(history_detail).to_contain_text("历史通知样本 body")
 
                     # Row-level combined correction with an explicit brand scope.
                     submit_filters(page, origin, query=single["title"])
-                    single_card = page.locator(f"article[data-record='{single['id']}']")
-                    open_action(page, origin, f"article[data-record='{single['id']}'] [data-feedback='category']")
+                    single_row = page.locator(f"tr.record-row[data-record='{single['id']}']")
+                    expect(single_row).to_be_visible()
+                    open_action(page, origin, f"tr.record-row[data-record='{single['id']}'] [data-feedback='open']")
                     wait_feedback_save(
                         page,
                         origin,
                         lambda: (
+                            page.locator("[data-action='category']").check(),
                             page.locator("[data-action='facts']").check(),
                             page.locator("#correct-category").fill("fixture-corrected"),
                             page.locator("#correct-price").fill("50 元"),
@@ -400,7 +494,7 @@ def main():
                     )
                     page.reload()
                     expect(page.locator("#workspace")).to_be_visible()
-                    expect(page.locator("#draft-count")).to_have_text("1")
+                    expect(page.locator("#draft-count")).to_have_text("3")
                     expect(page.locator("#drafts")).to_contain_text("组合纠正原因")
 
                     # A second authenticated context proves the draft survives a session boundary.
@@ -409,21 +503,29 @@ def main():
                     hook(page2, origin)
                     page2.goto(origin + "/pylon/review/#login=" + login_token(box))
                     expect(page2.locator("#workspace")).to_be_visible()
-                    expect(page2.locator("#draft-count")).to_have_text("1")
+                    expect(page2.locator("#draft-count")).to_have_text("3")
 
                     # Product-level feedback uses the displayed decision/item key.
                     submit_filters(page2, origin, query=product["title"])
-                    product_card = page2.locator(f"article[data-record='{product['id']}']")
-                    expect(product_card.locator("details.products")).to_contain_text("商品")
-                    product_card.locator("details.products").click()
-                    product_button = product_card.locator("details.products [data-feedback='facts']").first
+                    product_row = page2.locator(f"tr.record-row[data-record='{product['id']}']")
+                    expect(product_row).to_be_visible()
+                    expect(product_row.locator("details")).to_have_count(0)
+                    expect(product_row).not_to_contain_text("商品 003-A")
+                    expect(page2.locator(f"tr[data-detail='{product['id']}']")).to_be_hidden()
+                    with page2.expect_response(response_for(origin + f"/pylon/review/api/detail?id={product['id']}", "GET")):
+                        product_row.locator("[data-expand]").click()
+                    product_detail = page2.locator(f"tr[data-detail='{product['id']}']")
+                    expect(product_detail.locator("details.products")).to_contain_text("商品")
+                    product_detail.locator("details.products").click()
+                    product_button = product_detail.locator("details.products [data-feedback='open']").first
                     product_item_key = product_button.get_attribute("data-item")
                     assert product_item_key and product_item_key.endswith(":0"), product_item_key
-                    open_action(page2, origin, f"article[data-record='{product['id']}'] details.products [data-feedback='facts']")
+                    open_action(page2, origin, f"tr[data-detail='{product['id']}'] details.products [data-feedback='open']")
                     wait_feedback_save(
                         page2,
                         origin,
                         lambda: (
+                            page2.locator("[data-action='facts']").check(),
                             page2.locator("#reason").fill("逐商品价格纠正"),
                             page2.locator("#scope-details summary").click(),
                             page2.locator("#scope").select_option("series"),
@@ -445,7 +547,7 @@ def main():
 
                     # Bulk feedback selects both records on the filtered page and saves one shared opinion.
                     submit_filters(page2, origin, query="批量反馈样本")
-                    expect(page2.locator("#feed .review-card")).to_have_count(2)
+                    expect(page2.locator("#feed tr.record-row")).to_have_count(2)
                     page2.locator("#select-page").click()
                     expect(page2.locator("#bulk-feedback")).to_be_enabled()
                     page2.locator("#bulk-feedback").click()
@@ -454,20 +556,40 @@ def main():
                     expect(page2.locator("#feedback-save")).to_have_text("")
                     page2.locator("#feedback-done").click()
                     state = page2.request.get(origin + "/pylon/review/api/state").json()
-                    assert len(state["drafts"]) == 4, state["drafts"]
+                    assert len(state["drafts"]) == 5, state["drafts"]
 
                     # Submit exactly one batch, then read its frozen evidence in the UI.
                     with page2.expect_response(response_for(origin + "/pylon/review/api/submit", "POST")) as response:
                         page2.locator("#submit-batch").click()
                     assert response.value.status == 200, response.value.text()
                     expect(page2.locator("#draft-count")).to_have_text("0")
-                    expect(page2.locator("#notice")).to_contain_text("已提交 4 条反馈")
-                    expect(page2.locator("#batches")).to_contain_text("4 条")
-                    page2.locator("aside details:has(#batches) > summary").click()
+                    expect(page2.locator("#notice")).to_contain_text("已提交 5 条反馈")
+                    expect(page2.locator("#batches")).to_contain_text("5 条")
+                    page2.locator(".review-extras details:has(#batches) > summary").click()
                     page2.locator("#batches [data-batch]").first.click()
                     expect(page2.locator("#batch-dialog")).to_be_visible()
                     expect(page2.locator("#batch-detail")).to_contain_text("组合纠正原因")
                     expect(page2.locator("#batch-detail")).to_contain_text("逐商品价格纠正")
+                    expect(page2.locator("#batch-detail .feedback-result")).to_have_count(5)
+                    expect(page2.locator("#batch-detail .feedback-result .status")).to_have_count(5)
+                    assert page2.locator("#batch-detail .feedback-result .status").all_inner_texts() == ["已提交"] * 5
+                    page2.locator("#batch-dialog .close").click()
+
+                    # A submitted whole-post feedback disappears from pending review but remains visible in all.
+                    submit_filters(page2, origin, query=bulk[0]["title"])
+                    expect(page2.locator("#count")).to_have_text("0 条")
+                    with page2.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
+                        page2.locator("#review").select_option("all")
+                    expect(page2.locator("#count")).to_have_text("1 条")
+                    expect(page2.locator("#feed tr.record-row .row-hints")).to_contain_text("已提交")
+
+                    # Capturing a newer field version makes the old feedback stale and reopens review.
+                    bump_fixture_version(box, bulk[0])
+                    with page2.expect_response(response_for(origin + "/pylon/review/api/items", "GET")):
+                        page2.locator("#review").select_option("pending")
+                    submit_filters(page2, origin, query=bulk[0]["title"])
+                    expect(page2.locator("#count")).to_have_text("1 条")
+                    expect(page2.locator("#feed tr.record-row .row-hints")).to_contain_text("内容已更新")
 
                     # Unauthorized and invalid-CSRF writes are rejected before dispatch.
                     anonymous = playwright.request.new_context()
@@ -493,41 +615,49 @@ def main():
                     hook(phone, restarted_origin)
                     phone.goto(restarted_origin + "/pylon/review/#login=" + login_token(box))
                     expect(phone.locator("#workspace")).to_be_visible()
+                    expect(phone.locator("#review")).to_have_value("pending")
                     expect(phone.locator("#draft-count")).to_have_text("0")
-                    expect(phone.locator("#batches")).to_contain_text("4 条")
+                    expect(phone.locator("#batches")).to_contain_text("5 条")
                     expect(phone.locator(".workspaces a")).to_have_count(3)
                     assert phone.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
 
                     # The fixed mobile action bar can complete a fresh single-record batch
                     # and the submitted evidence remains available after the restart.
                     submit_filters(phone, restarted_origin, query="history-keyword")
-                    history_card = phone.locator(f"article[data-record='{history['id']}']")
-                    expect(history_card).to_be_visible()
-                    history_card.locator(f"[data-select='{history['id']}']").check()
-                    expect(phone.locator("#mobile-feedback")).to_be_enabled()
-                    phone.locator("#mobile-feedback").click()
+                    history_row = phone.locator(f"tr.record-row[data-record='{history['id']}']")
+                    expect(history_row).to_be_visible()
+                    expect(history_row).not_to_contain_text("历史通知样本 body")
+                    expect(phone.locator(f"tr[data-detail='{history['id']}']")).to_be_hidden()
+                    with phone.expect_response(response_for(restarted_origin + f"/pylon/review/api/detail?id={history['id']}", "GET")):
+                        history_row.locator("[data-expand]").click()
+                    expect(phone.locator(f"tr[data-detail='{history['id']}'] .detail-content")).to_contain_text("历史通知样本 body")
+                    history_row.locator(f"[data-select='{history['id']}']").check()
+                    expect(phone.locator("#bulk-feedback")).to_be_enabled()
+                    phone.locator("#bulk-feedback").click()
                     expect(phone.locator("#feedback-dialog")).to_be_visible()
                     wait_feedback_save(phone, restarted_origin, lambda: phone.locator("[data-action='should_push']").check())
                     phone.locator("#feedback-done").click()
                     expect(phone.locator("#draft-count")).to_have_text("1")
-                    expect(phone.locator("#mobile-submit")).to_be_enabled()
+                    expect(phone.locator("#submit-batch")).to_be_enabled()
                     with phone.expect_response(response_for(restarted_origin + "/pylon/review/api/submit", "POST")) as response:
-                        phone.locator("#mobile-submit").click()
+                        phone.locator("#submit-batch").click()
                     assert response.value.status == 200, response.value.text()
                     expect(phone.locator("#draft-count")).to_have_text("0")
                     expect(phone.locator("#notice")).to_contain_text("已提交 1 条反馈")
                     expect(phone.locator("#batches")).to_contain_text("1 条")
-                    phone.locator("aside details:has(#batches) > summary").click()
+                    phone.locator(".review-extras details:has(#batches) > summary").click()
                     phone.locator("#batches [data-batch]").first.click()
                     expect(phone.locator("#batch-dialog")).to_be_visible()
                     expect(phone.locator("#batch-detail")).to_contain_text("应该推送")
+                    expect(phone.locator("#batch-detail .feedback-result .status")).to_have_text("已提交")
                     phone.locator("#batch-dialog .close").click()
 
                     submit_filters(phone, restarted_origin, query="<script>")
-                    malicious_card = phone.locator(f"article[data-record='{malicious['id']}']")
-                    expect(malicious_card).to_be_visible()
-                    malicious_card.locator("details.record-details").click()
-                    expect(malicious_card.locator(".detail-content")).to_contain_text("恶意标题 fixture body")
+                    malicious_row = phone.locator(f"tr.record-row[data-record='{malicious['id']}']")
+                    expect(malicious_row).to_be_visible()
+                    with phone.expect_response(response_for(restarted_origin + f"/pylon/review/api/detail?id={malicious['id']}", "GET")):
+                        malicious_row.locator("[data-expand]").click()
+                    expect(phone.locator(f"tr[data-detail='{malicious['id']}'] .detail-content")).to_contain_text("恶意标题 fixture body")
                     assert phone.evaluate("window.__review_pwned || null") is None
                     assert phone.locator("[onerror]").count() == 0
                     assert not errors, errors

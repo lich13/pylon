@@ -97,7 +97,9 @@ class Store:
             db.execute('BEGIN IMMEDIATE')
             sql="SELECT * FROM intel_items WHERE source=? AND historical=0 AND status IN ('pending','retry') AND next_attempt<=? AND lease_until<=?"
             rows=[dict(r) for r in db.execute(sql+' ORDER BY observed_at LIMIT ?',(source,now,now,max(1,limit//2)))]
-            lease=180 if source=='xianbao' else 1140
+            # The source execution lock owns these claims until its process
+            # ends. A long model response is not evidence of a dead owner.
+            lease=1e30
             for row in rows:db.execute('UPDATE intel_items SET lease_until=? WHERE source=? AND source_id=?',(now+lease,source,row['source_id']))
             fresh=[dict(r) for r in db.execute(sql+' ORDER BY updated_at DESC LIMIT ?',(source,now,now,limit-len(rows)))]
             for row in fresh:db.execute('UPDATE intel_items SET lease_until=? WHERE source=? AND source_id=?',(now+lease,source,row['source_id']))

@@ -294,7 +294,7 @@ def test_marketplace_analysis_wait_does_not_hold_simple_posts(tmp_path,monkeypat
     assert enrich.summary(store)=='复杂帖待分析 1，AI 报价待分析 0，待核对 0'
 
 
-def test_marketplace_requests_bounded_read_only_structured_analysis(monkeypatch):
+def test_marketplace_requests_unbounded_read_only_structured_analysis(monkeypatch):
     from pylon.tasks.software import monitor
     calls=[]
     def request(prompt,**kwargs):
@@ -305,10 +305,10 @@ def test_marketplace_requests_bounded_read_only_structured_analysis(monkeypatch)
     items,request_id=enrich.request(example())
     assert len(items)==4 and request_id=='fixture-request'
     assert calls[0]['schema'] is enrich.SCHEMA
-    assert calls[0]['timeout']==20 and calls[0]['total_timeout']==120
+    assert calls[0].get('timeout') is None and calls[0].get('total_timeout') is None
 
 
-def test_marketplace_grok_total_deadline_closes_stream(monkeypatch):
+def test_marketplace_grok_waits_past_the_old_total_deadline(monkeypatch):
     from pylon.tasks.software import monitor
     clock=[0.0];captured={}
     monkeypatch.setattr(monitor.time,'monotonic',lambda:clock[0])
@@ -319,20 +319,25 @@ def test_marketplace_grok_total_deadline_closes_stream(monkeypatch):
         def __enter__(self):return self
         def __exit__(self,*args):captured['closed']=True
         def iter_lines(self):
-            clock[0]=121.0
-            yield 'data: {}'
+            clock[0]=1141.0
+            yield 'data: '+json.dumps({'type':'response.completed','response':{'ok':True}})
+            yield ''
     class Client:
-        def __init__(self,**kwargs):pass
+        def __init__(self,**kwargs):captured['client']=kwargs
         def __enter__(self):return self
         def __exit__(self,*args):pass
         def stream(self,*args,**kwargs):
             captured['payload']=kwargs['json']
             return Response()
     monkeypatch.setattr(monitor.httpx,'Client',Client)
-    with pytest.raises(monitor.GrokDigestError,match='total deadline'):
-        monitor._request_grok_structured('fixture',schema=enrich.SCHEMA,name='marketplace_items',
-                                         timeout=20,total_timeout=120)
+    response, request_id = monitor._request_grok_structured(
+        'fixture', schema=enrich.SCHEMA, name='marketplace_items',
+        timeout=None, total_timeout=None,
+    )
+    assert response == {'ok':True} and request_id
     assert captured['closed']
+    assert captured['payload']['model']=='grok-4.7'
+    assert captured['client']=={'timeout':None,'trust_env':False}
     assert captured['payload']['store'] is False and captured['payload']['tools']==[]
     assert captured['payload']['reasoning']['effort']=='medium'
 

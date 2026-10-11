@@ -11,6 +11,7 @@ def main():
     p.add_argument('command',choices=['digest','migrate','batches','batch','reconcile','retry'])
     p.add_argument('--id');p.add_argument('--status',choices=['processing','fixed','needs_info'])
     p.add_argument('--result-file',type=Path);p.add_argument('--apply',action='store_true')
+    p.add_argument('--unresolved',action='store_true')
     args=p.parse_args();box=Outbox()
     if args.command=='digest':
         from .notifications import digest
@@ -23,9 +24,9 @@ def main():
     else:
         with box.connect() as db:
             store.initialize(db)
-            if args.command=='batches':result=feedback.batches(db)
+            if args.command=='batches':result=feedback.batches(db,unresolved=args.unresolved)
             elif args.command=='batch':
-                result=[{**dict(r),'value':json.loads(r['value'])} for r in db.execute('SELECT * FROM review_feedback WHERE batch_id=?',(args.id,))]
+                result=feedback.results(db,batch_id=args.id)
             elif args.command=='retry':
                 if not args.apply:p.error('retry needs --apply')
                 from pylon.tasks.intelligence.attempts import retry

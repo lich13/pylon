@@ -14,6 +14,7 @@ def configure(tmp_path, monkeypatch):
     monkeypatch.setattr(monitor, 'DATA_ROOT', root / 'data/software_update_monitor')
     monkeypatch.setattr(monitor, 'TRANSLATION_CACHE_FILE', root / 'data/software_update_monitor/translation_cache.json')
     monkeypatch.setattr(monitor, 'ENRICHMENT_CACHE_FILE', root / 'data/software_update_monitor/enrichment_cache.json')
+    monkeypatch.setattr(monitor, 'LOCK_PATH', root / 'cron_state/software_update_monitor.lock')
     monkeypatch.setattr(monitor, 'ITEMS_DIR', root / 'data/software_update_monitor/items')
     monkeypatch.setattr(monitor, 'CUSTOM_SOURCES_FILE', root / 'config/software_update_monitor_sources.json')
     monkeypatch.setattr(monitor, 'TRANSLATION_CONFIG_FILE', root / 'config/software_update_translation.json')
@@ -132,6 +133,34 @@ def test_process_pending_enrichment_publishes_idempotent_message(tmp_path, monke
     assert '高价值' in publish.call_args.args[0]
     saved = monitor.load_state()
     assert saved['pending_events'] == []
+
+
+def test_checkpoint_merge_keeps_request_history_and_rejects_newer_item_version(tmp_path, monkeypatch):
+    configure(tmp_path, monkeypatch)
+    current = event('release:checkpoint')
+    state = monitor.default_state()
+    state['pending_events'] = [current]
+    monitor.save_json(monitor.STATE_FILE, state)
+
+    working = json.loads(json.dumps(current))
+    working['enrichment_requests'] = [
+        {'number': 1, 'status': 'started', 'started_at': '2026-10-11T00:00:00Z'},
+        {'number': 2, 'status': 'failed', 'error': 'GrokDigestError', 'semantic': True},
+    ]
+    working['enrichment_status'] = 'error'
+    assert monitor.merge_enrichment_event(working) is True
+    saved = monitor.load_state()
+    assert saved['pending_events'][0]['enrichment_requests'] == working['enrichment_requests']
+
+    newer = event('release:checkpoint')
+    newer['item']['body'] = 'A newer source revision must remain authoritative.'
+    monitor.save_json(monitor.STATE_FILE, {'pending_events': [newer]})
+    old_result = json.loads(json.dumps(working))
+    old_result['enrichment_status'] = 'ready'
+    old_result['enrichment_result'] = digest()
+    assert monitor.merge_enrichment_event(old_result) is False
+    saved = monitor.load_state()
+    assert saved['pending_events'][0]['item']['body'] == newer['item']['body']
 
 
 def test_pi_news_url_is_canonicalized_and_hermes_is_removed():

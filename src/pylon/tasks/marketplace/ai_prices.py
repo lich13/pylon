@@ -173,11 +173,18 @@ def extract(post,job):
 
 
 def run_pending(store,limit=1):
+    from pylon.shared.model_execution import Execution
+    with Execution(store.box, 'market:prices') as execution:
+        if execution is None: return 0
+        return _run_pending(store,limit=limit,execution=execution)
+
+
+def _run_pending(store,limit,execution):
     count=0
     for _ in range(limit):
         with store.box.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            db.execute("UPDATE market_ai_prices SET status=CASE WHEN attempts>=3 THEN 'error' ELSE 'pending' END,error='interrupted' WHERE status='running' AND started_at<?",(time.time()-390,))
+            db.execute("UPDATE market_ai_prices SET status=CASE WHEN attempts>=3 THEN 'error' ELSE 'pending' END,error='interrupted' WHERE status='running'")
             row=db.execute("""SELECT a.* FROM market_ai_prices a JOIN marketplace_posts p USING(source,source_id)
                 WHERE a.status='pending' AND a.next_attempt<=? AND a.attempts<3 AND p.history=0
                 AND p.status IN ('pending_price','needs_review','queued','ready') ORDER BY a.next_attempt LIMIT 1""",(time.time(),)).fetchone()
@@ -186,6 +193,7 @@ def run_pending(store,limit=1):
             post=dict(db.execute('SELECT * FROM marketplace_posts WHERE source=? AND source_id=?',(job['source'],job['source_id'])).fetchone())
             prices=config(db)
             db.execute("UPDATE market_ai_prices SET status='running',attempts=attempts+1,started_at=? WHERE fingerprint=?",(time.time(),job['fingerprint']))
+        execution.track(post['source'],post['source_id'],job['fingerprint'])
         try:
             extraction=extract(post,job)
             items=offers_to_items(post,extraction,prices)
@@ -223,3 +231,17 @@ def run_pending(store,limit=1):
                             'request_id':getattr(error,'request_id',''),'elapsed':getattr(error,'elapsed',0),
                             'attempts':job['attempts']+1},rule_version=trade.VERSION)
     return count
+
+
+def main():
+    from .store import Store
+    from .pipeline import process
+    store=Store()
+    run_pending(store,limit=1)
+    process(store)
+    print('{"wakeAgent":false}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -229,7 +229,7 @@ event只摘明确新增权益/补货恢复/纠正事实；普通续顶广告、�
             'correction': snapshot.get('analysis_correction', '')}
     started=time.monotonic()
     response, request_id = _request_grok_structured(prompt + json.dumps(data, ensure_ascii=False), schema=COMPACT_SCHEMA,
-                                          name='linuxdo_trade', timeout=45, total_timeout=300)
+                                          name='linuxdo_trade')
     try:return expand_compact(extract_grok_json(response, label='Linux.do trade'))
     except Exception as error:
         error.request_id=request_id;error.elapsed=time.monotonic()-started

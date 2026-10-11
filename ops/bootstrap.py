@@ -54,6 +54,11 @@ PrivateTmp=true
 '''
 
 
+def analysis_override(job):
+    """Only dedicated model jobs opt out of the normal task deadline."""
+    return '[Service]\nTimeoutStartSec=infinity\n' if 'timeout' in job and job['timeout'] is None else ''
+
+
 def install_file(source, target, mode=0o644):
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, target)
@@ -97,6 +102,13 @@ def main():
     catalog = json.loads((ROOT / 'jobs.json').read_text())
     for key, job in catalog.items():
         (UNITS / f'pylon-job-{key}.timer').write_text(timer_text(key, job))
+        for trigger in ('task', 'manual'):
+            override = UNITS / f'pylon-{trigger}@{key}.service.d' / 'model-wait.conf'
+            content = analysis_override(job)
+            if content:
+                override.parent.mkdir(parents=True, exist_ok=True)
+                override.write_text(content)
+            elif override.exists(): override.unlink()
     subprocess.run(['/usr/sbin/visudo', '-cf', str(ROOT / 'ops/pylon.sudoers')], check=True)
     install_file(ROOT / 'ops/pylon.sudoers', Path('/etc/sudoers.d/pylon'), 0o440)
     # A dedicated configuration is installed once, never rewritten by upgrades.

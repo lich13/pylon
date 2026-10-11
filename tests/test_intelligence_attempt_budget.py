@@ -472,7 +472,7 @@ def test_compact_trade_keeps_quote_and_price_validation_bound_to_source_text():
         trade.validate(invalid, snapshot)
 
 
-def test_trade_request_keeps_medium_read_timeout_total_deadline_and_strict_tool_free_schema(
+def test_trade_request_uses_unbounded_wait_and_strict_tool_free_schema(
     monkeypatch,
 ):
     from pylon.tasks.software import monitor
@@ -561,10 +561,10 @@ def test_trade_request_keeps_medium_read_timeout_total_deadline_and_strict_tool_
     _, kwargs = calls[0]
     assert kwargs["name"] == "linuxdo_trade"
     assert kwargs["schema"] is trade.COMPACT_SCHEMA
-    assert kwargs["timeout"] == 45
-    assert kwargs["total_timeout"] == 300
+    assert kwargs.get("timeout") is None
+    assert kwargs.get("total_timeout") is None
 
-    assert captured["client"] == {"timeout": 45, "trust_env": False}
+    assert captured["client"] == {"timeout": None, "trust_env": False}
     payload = captured["payload"]
     assert payload["reasoning"] == {"effort": "medium"}
     assert payload["tools"] == []
