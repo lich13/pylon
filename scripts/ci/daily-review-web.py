@@ -514,6 +514,7 @@ def main():
                     phone.locator("#batches [data-batch]").first.click()
                     expect(phone.locator("#batch-dialog")).to_be_visible()
                     expect(phone.locator("#batch-detail")).to_contain_text("应该推送")
+                    phone.locator("#batch-dialog .close").click()
 
                     submit_filters(phone, restarted_origin, query="<script>")
                     malicious_card = phone.locator(f"article[data-record='{malicious['id']}']")
