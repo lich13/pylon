@@ -386,10 +386,17 @@ def check_navigation(page, origin):
 
 def first_unrelated_row(page, excluded):
     """Choose a visible main-stream row while keeping named fixtures independent."""
-    rows = page.locator("#feed tr.record-row")
-    for index in range(rows.count()):
-        row = rows.nth(index)
-        if row.get_attribute("data-record") not in excluded:
+    candidates = page.locator("#feed tr.record-row").evaluate_all(
+        """nodes => nodes.map(node => {
+            const box = node.getBoundingClientRect();
+            return {id: node.dataset.record, visible: node.offsetParent !== null && box.bottom > 0 && box.top < innerHeight};
+        }).filter(candidate => candidate.visible && candidate.id)"""
+    )
+    for candidate in candidates:
+        record_id = candidate["id"]
+        if record_id not in excluded:
+            row = page.locator(f"#feed tr.record-row[data-record='{record_id}']")
+            row.wait_for(state="visible")
             return row
     raise AssertionError("no unrelated review row available for selection")
 
