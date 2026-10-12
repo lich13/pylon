@@ -72,15 +72,21 @@ def dispatch(source, module, router=False):
     with tempfile.TemporaryDirectory(prefix='pylon-ci-') as temporary:
         archive = Path(temporary) / 'source.tar.gz'
         checksum = bundle(source, archive)
-        gh('release', 'create', tag, str(archive), '--repo', repo['nameWithOwner'], '--draft', '--target', revision,
-           '--title', tag, '--notes', 'Temporary private module input; automatically removed after validation.')
-        release = json.loads(gh('api', 'repos/' + repo['nameWithOwner'] + '/releases/tags/' + tag))
+        endpoint = 'repos/' + repo['nameWithOwner'] + '/releases'
+        # Draft releases are not returned by the REST lookup-by-tag endpoint.
+        # Keep the ID from creation for upload, dispatch and failure cleanup.
+        release = json.loads(gh('api', '--method', 'POST', endpoint,
+                               '-f', 'tag_name=' + tag, '-f', 'target_commitish=' + revision,
+                               '-f', 'name=' + tag, '-F', 'draft=true',
+                               '-f', 'body=Temporary private module input; automatically removed after validation.'))
         try:
+            upload = release['upload_url'].split('{', 1)[0] + '?name=source.tar.gz'
+            gh('api', '--method', 'POST', upload, '--input', str(archive), '-H', 'Content-Type: application/gzip')
             gh('workflow', 'run', 'modules.yml', '--repo', repo['nameWithOwner'], '--ref', 'main',
                '-f', 'job=' + job, '-f', 'release_id=' + str(release['id']), '-f', 'sha256=' + checksum,
                '-f', 'core_sha=' + revision, '-f', 'module=' + module, '-f', 'router=' + str(router).lower())
         except BaseException:
-            gh('release', 'delete', tag, '--repo', repo['nameWithOwner'], '--yes')
+            gh('api', '--method', 'DELETE', endpoint + '/' + str(release['id']))
             raise
     print(json.dumps({'job': job, 'core_sha': revision, 'source_sha256': checksum, 'temporary_release_id': release['id']}))
     return 0
