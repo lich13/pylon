@@ -28,12 +28,11 @@ class Command:
 
 
 CORE_COMMANDS = {item.name: item for item in (
-    Command(**{'name': 'updates', 'description': '查看腾讯云可更新软件、系统包和最近升级结果', 'route': 'updates', 'action': '', 'argument': '[all]', 'example': '/updates\n/updates all', 'detail': '省略参数查看摘要；all 展示全部软件及系统包候选。默认机器人支持勾选多个系统小包、全选、清空和跳过此版本；最后点击“批量更新已选”才会提交安装，关联包必须一起选择。选择会保存，重启后可继续。分阶段发布暂缓时不强行安装，失败或回执不确定不自动重试。检查结果最多缓存 10 分钟并注明时间，APT 使用系统自动刷新的软件源索引。检查失败显示未确认，不会当作最新版。查询不安装软件。每周一北京时间 09:00 向库库干汇总维护事项，无更新且无异常时静默。', 'menu': True, 'order': 1}),
     Command(**{'name': 'ssh_travel', 'description': '查看或切换外地 SSH 放行状态', 'route': 'ssh_travel', 'action': '', 'argument': '[开启|关闭]', 'example': '/ssh_travel\n/ssh_travel 开启\n/ssh_travel 关闭', 'detail': '开启后持续允许所有外部 IPv4 访问 SSH TCP/22，不自动关闭；使用关闭按钮或命令撤销。保留密钥认证、Fail2ban 和北京白名单，不开放其他端口。', 'menu': True, 'order': 5}),
     Command(**{'name': 'agent_codex', 'description': '收集相关信息，使用 sudo Codex 执行任务并自动回报', 'route': 'agent', 'action': 'codex', 'argument': '任务描述', 'example': '/agent_codex 核对 sub2api 实际运行版本及官方最新版，只检查不更新', 'detail': '仅在本人明确发起后执行，按描述完成腾讯云本机任务；修改类要求会实际执行。全程使用 Codex，可回复任务消息补充要求。默认累计执行上限 60 分钟，等待回答 24 小时；结束后自动清理本次线程。', 'menu': True, 'order': 6}),
     Command(**{'name': 'agent_grok', 'description': '收集相关信息，使用 sudo Grok 执行任务并自动回报', 'route': 'agent', 'action': 'grok', 'argument': '任务描述', 'example': '/agent_grok 检查 pylon-bot.service 最近错误并说明原因', 'detail': '仅在本人明确发起后执行，按描述完成腾讯云本机任务；修改类要求会实际执行。全程使用 Grok，不切换到 Codex。支持同一会话续接；默认累计执行 60 分钟、等待回答 24 小时，结束后自动清理线程。', 'menu': True, 'order': 7}),
-    Command(**{'name': 'update_codex', 'description': '使用 sudo 更新腾讯云 Codex CLI，完成后自动回报', 'route': 'software_update', 'action': 'codex', 'argument': '', 'example': '', 'detail': '执行 sudo codex update，使用官方 stable 版本；无需参数。发现对应会话进程占用时不更新，退出会话后可再次点击。后台执行不阻塞机器人，最长 15 分钟；重复请求合并。回报更新前后版本、耗时及失败原因，保留登录、配置与会话。', 'menu': True, 'order': 8}),
-    Command(**{'name': 'update_grok', 'description': '使用 sudo 更新腾讯云 Grok Build，完成后自动回报', 'route': 'software_update', 'action': 'grok', 'argument': '', 'example': '', 'detail': '执行 sudo grok update --stable；无需参数。Grok 原生更新可能重启旧后台，因此发现会话进程占用时不更新，退出会话后可再次点击。后台执行最长 15 分钟；重复请求合并。完成后回报版本和结果，保留登录、配置与会话。', 'menu': True, 'order': 9}),
+    Command(**{'name': 'update_codex', 'description': '检查并更新 Codex CLI，完成后回报版本', 'route': 'software_update', 'action': 'codex', 'argument': '', 'example': '', 'detail': '先回复正在检查，核对已装版本与官方 stable；已是最新时不安装，有更新才执行原生更新，无需参数。发现对应会话进程占用时不更新，退出会话后可再次点击。后台执行不阻塞机器人，最长 15 分钟；重复请求合并。回报更新前后版本及失败原因，保留登录、配置与会话。', 'menu': True, 'order': 8}),
+    Command(**{'name': 'update_grok', 'description': '检查并更新 Grok Build，完成后回报版本', 'route': 'software_update', 'action': 'grok', 'argument': '', 'example': '', 'detail': '先回复正在检查，核对已装版本与官方 stable；已是最新时不安装，有更新才执行原生更新，无需参数。Grok 原生更新可能重启旧后台，因此发现会话进程占用时不更新，退出会话后可再次点击。后台执行最长 15 分钟；重复请求合并。完成后回报版本和结果，保留登录、配置与会话。', 'menu': True, 'order': 9}),
     Command(**{'name': 'help', 'description': '查看全部功能；使用 /help 命令查看详细用法与示例', 'route': 'help', 'action': '', 'argument': '[命令]', 'example': '/help gmail', 'detail': '省略命令时列出全部入口；命令前的 / 可省略。', 'menu': True, 'order': 10}),
     Command(**{'name': 'agent_status', 'description': '查看 Agent 任务、等待回答、结果及线程清理状态', 'route': 'agent', 'action': 'status', 'argument': '[任务编号]', 'example': '/agent_status\n/agent_status 0123456789ab', 'detail': '省略编号查看进行中的任务及最近记录；指定编号查看结果。任务结果、通知投递和线程清理分别记录；没有独立验收条件时显示结果待核验。已结束任务的脱敏结果保留 30 天。', 'menu': False, 'order': 11}),
     Command(**{'name': 'agent_reply', 'description': '补充要求或回答问题，继续原来的 Agent 会话', 'route': 'agent', 'action': 'reply', 'argument': '任务编号 内容', 'example': '/agent_reply 0123456789ab 只检查，不执行更新', 'detail': '也可直接回复对应的机器人任务消息。执行中的补充内容在本轮结束后处理；等待回答时恢复同一会话。不会切换 Agent；已结束并清理的线程不能恢复，请发起新任务。', 'menu': False, 'order': 12}),
@@ -89,6 +88,9 @@ def help_text(name: str = '', profile: str = 'default') -> str:
     name = name.strip().removeprefix('/').split('@', 1)[0]
     if not name:
         return 'pylon 命令\n\n' + '\n'.join(f'/{c.name} — {c.description}' for c in COMMANDS.values() if c.menu and profile in c.profiles) + '\n\n详细用法：/help 命令，例如 /help gmail'
+    if name == 'updates':
+        from .software_retirement import RETIRED_MESSAGE as software_retired
+        return software_retired
     if name in RETIRED:
         return RETIRED_MESSAGE
     if name.startswith('gmail_'):

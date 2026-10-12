@@ -20,7 +20,6 @@ SOFTWARE = {
     'frp': ('FRP', 'github', 'fatedier/frp'),
     'openlist': ('OpenList', 'github', 'OpenListTeam/OpenList'),
     'sing-box': ('sing-box', 'github', 'SagerNet/sing-box'),
-    'easy_proxies': ('easy_proxies', 'github', 'jasonwong1991/easy_proxies'),
     'nexushub': ('NexusHub', 'github', 'lich13/nexushub'),
     'postgres': ('PostgreSQL 18', 'postgres', '18'),
     'redis': ('Redis 8.6', 'redis', '8.6'),
@@ -202,6 +201,6 @@ def render(data: dict, *, full: bool = False) -> str:
     if not full:
         failed = [row for row in data['rows'] if row.get('error')]
         lines += [f"检查未完成：{row['name']}（{row['error']}）" for row in failed]
-        lines.append('\n/updates all 查看全部软件与系统包明细。')
-    lines.append('安装更新：/update_codex 或 /update_grok；其余项目仅检查。')
+        lines.append('\n其余明细保留在只读检查结果中。')
+    lines.append('原生更新：/update_codex 或 /update_grok。')
     return '\n'.join(lines)

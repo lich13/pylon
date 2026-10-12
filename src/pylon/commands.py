@@ -85,11 +85,6 @@ def status_text() -> str:
     counts = box.counts()
     unresolved = sum(counts.get(s, 0) for s in ('pending', 'sending', 'uncertain', 'failed'))
     lines.append(f"待处理通知 {unresolved}；回执不确定 {counts.get('uncertain', 0)}")
-    try:
-        from .software_updates import review_status_text
-        lines.append(review_status_text(box=box))
-    except Exception as exc:
-        lines.append('系统小包更新状态暂不可读：' + redact(str(exc))[:160])
     for mod in extensions.snapshot().values():
         if 'status' in mod.manifest.get('hooks', []):
             try:
@@ -218,6 +213,9 @@ def handle(profile: str, text: str) -> str:
             name = name + '_' + action
         if name in {'chiphell_categories', 'chiphell_silence', 'chiphell_unsilence'}:
             return 'CHH 分类管理入口已移除，推送偏好在维护时统一调整。'
+        if name == 'updates':
+            from .software_retirement import RETIRED_MESSAGE as software_retired
+            return software_retired
         if name in RETIRED:
             return RETIRED_MESSAGE
         item = COMMANDS.get(name)
@@ -233,12 +231,6 @@ def handle(profile: str, text: str) -> str:
             raise ValueError('此操作不接受参数；用法：' + item.usage)
         if item.module:
             return extensions.invoke(item.module, 'command', profile, name=name, argument=argument, command_action=item.action)
-        if item.route == 'updates':
-            if argument not in {'', 'all'}:
-                return help_text(name)
-            from .software_updates import inventory_payload
-            payload = inventory_payload(profile, full=argument == 'all')
-            return encode_response(payload['text'], payload['reply_markup'])
         if item.route == 'software_update':
             from .software_updates import request_update
             return request_update(item.action, profile)

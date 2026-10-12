@@ -1,164 +1,64 @@
-"""Software inventory, guarded updates and Telegram review cards."""
+"""Native Codex/Grok updates and durable completion replies."""
 from __future__ import annotations
 
 import hashlib
-import html
 import hmac
+import html
 import json
 import logging
 import os
-import re
-import time
 import uuid
 
 from . import scheduler
 from .config import profile_env, redact
 from .outbox import Outbox
-from .software_policy import apt_policy
+from .software_retirement import RETIRED_MESSAGE
 
 NAMES = {'codex': 'Codex CLI', 'grok': 'Grok Build'}
 STATES = {
-    'queued': '已提交', 'running': '更新中', 'updated': '更新成功',
-    'current': '无需更新', 'busy': '占用，未更新', 'failed': '更新失败',
-    'uncertain': '结果待核对', 'deferred': '系统暂缓', 'stale': '候选已变化',
-    'skipped': '已跳过', 'pending': '待确认', 'submitting': '提交回执待核对', 'draft': '待确认批次',
+    'queued': '正在检查', 'running': '正在检查或更新', 'updated': '更新成功',
+    'current': '已是最新', 'busy': '暂未更新', 'failed': '更新失败',
+    'uncertain': '结果待核对',
 }
-REVIEW_PREFIX = 'su1'
-REVIEW_ID_RE = re.compile(r'sur-[0-9a-f]{20}')
-REVIEW_REQUEST_PREFIX = 'software-review:'
-
-
-def _review_id(package: str, installed: str, candidate: str, source: str) -> tuple[str, str]:
-    fingerprint = hashlib.sha256(json.dumps(
-        {'package': package, 'installed': installed, 'candidate': candidate, 'source': source},
-        ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-    return 'sur-' + fingerprint[:20], fingerprint
-
-
-def eligible_candidates(snapshot: dict) -> list[dict]:
-    """Return only the exact root-approved APT candidates."""
-    rows = []
-    apt = snapshot.get('apt') if isinstance(snapshot, dict) else None
-    for package in (apt or {}).get('packages') or []:
-        if not isinstance(package, dict):
-            continue
-        name = str(package.get('name') or '')
-        policy = apt_policy(name)
-        installed = str(package.get('installed') or '')
-        candidate = str(package.get('candidate') or '')
-        if not policy or not installed or not candidate or installed == candidate:
-            continue
-        review_id, fingerprint = _review_id(name, installed, candidate, 'Ubuntu APT')
-        rows.append({
-            'id': review_id,
-            'target': 'apt:' + name,
-            'package_name': name,
-            'installed_version': installed,
-            'candidate_version': candidate,
-            'source': 'Ubuntu APT',
-            'risk': policy['risk'],
-            'fingerprint': fingerprint,
-        })
-    return rows
-
-
-def _state_row(box: Outbox, candidate: dict) -> dict:
-    row = box.software_review(candidate['id'])
-    if row:
-        return row
-    return box.upsert_software_review(candidate | {
-        'profile': 'default', 'status': 'pending', 'created_at': time.time(),
-    })
 
 
 def _signature(profile: str, action: str, review_id: str) -> str:
+    """SDK v1 compatibility: daily-review cards share this signing function."""
     secret = str(profile_env(profile).get('TELEGRAM_BOT_TOKEN') or 'pylon').encode()
     return hmac.new(secret, f'{profile}|{action}|{review_id}'.encode(), hashlib.sha256).hexdigest()[:12]
 
 
-def callback_data(profile: str, action: str, review_id: str) -> str:
-    return f'{REVIEW_PREFIX}|{action}|{review_id}|{_signature(profile, action, review_id)}'
-
-
-def _parse_callback(profile: str, value: str) -> tuple[str, str]:
-    parts = str(value or '').split('|')
-    if len(parts) != 4 or parts[0] != REVIEW_PREFIX:
-        raise ValueError('按钮已失效，请重新使用 /updates')
-    action, review_id, signature = parts[1], parts[2], parts[3]
-    if action not in {'approve', 'skip'} or not REVIEW_ID_RE.fullmatch(review_id):
-        raise ValueError('按钮参数无效，请重新使用 /updates')
-    if not hmac.compare_digest(signature, _signature(profile, action, review_id)):
-        raise ValueError('按钮签名无效，请重新使用 /updates')
-    return action, review_id
-
-
-def _authorized_callback(profile: str, payload: dict) -> bool:
-    message = payload.get('message') or {}
-    sender = payload.get('from') or {}
-    owner = str(profile_env(profile).get('TELEGRAM_HOME_CHANNEL') or '')
-    chat = message.get('chat') or {}
-    return bool(owner and chat.get('type') == 'private' and str(chat.get('id')) == owner
-                and str(sender.get('id')) == owner and not sender.get('is_bot'))
-
-
-def _keyboard(profile: str, review_id: str) -> dict:
-    from .software_batch import callback_data as batch_data
-    return {'inline_keyboard': [[
-        {'text': '加入批量', 'callback_data': batch_data(profile, 'select', review_id)},
-        {'text': '跳过此版本', 'callback_data': batch_data(profile, 'skip', review_id)},
-    ]]}
-
-
-def review_text(row: dict) -> str:
-    status = STATES.get(str(row.get('status') or 'pending'), str(row.get('status') or 'pending'))
-    package = html.escape(str(row.get('package_name') or row.get('target') or '未知'))
-    installed = html.escape(str(row.get('installed_version') or '未知'))
-    candidate = html.escape(str(row.get('candidate_version') or '未知'))
-    source = html.escape(str(row.get('source') or ''))
-    risk = html.escape(str(row.get('risk') or ''))
-    lines = [f'系统小包更新：{package}', f'状态：{status}', f'版本：{installed} → {candidate}', f'来源：{source}']
-    if risk:
-        lines.append('风险：' + risk)
-    lines.append('可先加入批量，再在 /updates 勾选其他包并一起确认。不执行 autoremove，不自动重启主机。')
-    if row.get('detail'):
-        lines.append('结果：' + html.escape(redact(str(row['detail']))[-1200:]))
-    return '\n'.join(lines)
-
-
 def result_text(row: dict) -> str:
     target = str(row.get('target') or '')
-    if target.startswith('apt-batch:'):
-        items = json.loads(row.get('item_results') or row.get('items') or '[]')
-        lines = ['系统小包批量更新：' + STATES.get(row.get('status'), str(row.get('status', '未知')))]
-        for item in items:
-            item_status = item.get('status') or row.get('status', 'uncertain')
-            state = STATES.get(item_status, item_status)
-            lines.append(f"{item['package']}：{state}｜实装 {item.get('after') or '待核对'}｜候选 {item['candidate']}")
+    if target not in NAMES:
+        return RETIRED_MESSAGE
+    status = row.get('status', 'uncertain')
+    label = STATES.get(status, '结果待核对')
+    if status == 'current' and row.get('latest_version') and row.get('after_version') != row['latest_version']:
+        label = '无需更新'
+    lines = [f'{NAMES[target]}：{label}']
+    before, after = row.get('before_version'), row.get('after_version')
+    if before and after and before != after:
+        lines.append(f'版本：{before} → {after}')
+    elif after:
+        lines.append('当前版本：' + str(after))
+    elif before:
+        lines.append('更新前：' + str(before))
+        lines.append('当前版本：待核对')
+    if status in {'queued', 'running'}:
+        lines.append('完成后会在这里回报；重复点击不会重复安装。')
+    elif status not in {'updated', 'current'}:
         if row.get('detail'):
-            lines.append(redact(str(row['detail'])))
-        if row.get('status') in {'failed', 'uncertain'}:
-            lines.append('不会自动重复安装；请核对后重新 /updates。')
-        return '\n'.join(lines)
-    if target.startswith('apt:'):
-        package = target.removeprefix('apt:')
-        name = '系统包 ' + package
-    else:
-        name = NAMES.get(target, target)
-    status = STATES.get(row.get('status'), row.get('status', '未知'))
-    lines = [f'{name}：{status}']
-    if row.get('before_version') or row.get('after_version'):
-        lines.append(f"更新前：{row.get('before_version') or '未知'}\n当前实装：{row.get('after_version') or '待核对'}")
-    if row.get('latest_version'):
-        lines.append('检查到的候选版本：' + str(row['latest_version']))
-    if row.get('finished_at'):
-        lines.append(f"耗时：{max(0, round(row['finished_at'] - row['created_at']))} 秒")
-    if row.get('detail'):
-        lines.append(redact(row['detail']))
-    if row.get('status') in {'failed', 'uncertain'}:
-        lines.append('不会自动重复安装；请核对版本和错误后再操作。')
-    if row.get('status') == 'deferred':
-        lines.append('系统仍按 phased updates 策略暂缓，本次没有安装。')
-    return '\n'.join(lines)
+            lines.append(redact(str(row['detail']))[:600])
+        if status == 'busy':
+            lines.append('结束相关会话或等待当前更新完成后，再次点击即可。')
+        elif status == 'failed':
+            lines.append('请根据原因处理后，再次点击更新。')
+        else:
+            lines.append('需先核对实装版本；不会自动重复安装。')
+    elif label == '无需更新':
+        lines.append('当前版本高于 stable，已保留。')
+    return '\n'.join(html.escape(str(line)) for line in lines)
 
 
 def request_update(target, profile='webops'):
@@ -166,174 +66,48 @@ def request_update(target, profile='webops'):
         raise ValueError('不支持的更新目标')
     key = os.environ.get('PYLON_COMMAND_ID') or 'cli:' + uuid.uuid4().hex
     row = json.loads(scheduler.admin('software', 'update', target, profile, key))
-    if row['status'] in {'queued', 'running'}:
-        return (f"{NAMES[target]}：{STATES[row['status']]}\n执行 sudo {target} update"
-                '\n仅使用 stable 版本；发现会话占用时不执行。完成后自动回报结果。')
     return result_text(row)
 
 
-def request_package_update(review_id: str, profile: str = 'default', request_key: str = '') -> str:
-    if profile != 'default':
-        raise ValueError('系统小包确认只允许默认本人会话')
-    box = Outbox()
-    row = box.software_review(review_id)
-    if not row:
-        raise ValueError('更新候选不存在，或已过期')
-    if row['status'] in {'queued', 'running', 'updated', 'current', 'failed', 'uncertain',
-                         'deferred', 'stale', 'skipped'}:
-        return review_text(row)
-    request_id = row.get('request_id') or REVIEW_REQUEST_PREFIX + review_id
-    result = json.loads(scheduler.admin(
-        'software', 'apt-update', row['package_name'], profile, request_id,
-        row['installed_version'], row['candidate_version']))
-    status = str(result.get('status') or 'uncertain')
-    changes = {'status': status, 'request_id': request_id}
-    if result.get('detail'):
-        changes['detail'] = str(result['detail'])[-2000:]
-    row = box.update_software_review(review_id, **changes)
-    if status in {'queued', 'running'}:
-        return '已提交系统包更新，完成后自动回报。\n\n' + review_text(row)
-    return review_text(row)
-
-
-def _current_snapshot(full: bool = False):
-    from .software_inventory import check, render
-    snapshot = check(max_age=0)
-    return snapshot, render(snapshot, full=full)
-
-
-def inventory_payload(profile: str = 'default', *, full: bool = False) -> dict:
-    from . import software_batch
-    snapshot, text = _current_snapshot(full)
-    box = Outbox()
-    software_batch.current_candidates(box, eligible_candidates(snapshot))
-    payload = software_batch.dashboard(box)
-    text += '\n\n' + payload['text']
-    rows = json.loads(scheduler.admin('software', 'status'))
-    if rows:
-        text += '\n\n最近更新：\n' + '\n\n'.join(result_text(row) for row in rows[:3])
-    return {'text': text, 'reply_markup': payload['reply_markup'] if profile == 'default' else None}
+def inventory_payload(profile='default', *, full=False):
+    """Old commands and SDK consumers cannot start an inventory scan."""
+    return {'text': RETIRED_MESSAGE, 'reply_markup': None}
 
 
 def inventory_text(full=False):
-    return inventory_payload('webops', full=full)['text']
+    return RETIRED_MESSAGE
 
 
-def pending_keyboard(profile: str = 'default') -> dict | None:
-    from .software_batch import keyboard
-    return keyboard(Outbox()) if profile == 'default' else None
+def pending_keyboard(profile='default'):
+    return None
 
 
-def publish_candidates(snapshot: dict, box: Outbox | None = None) -> int:
-    """Queue one durable card for each new allowed candidate."""
-    box = box or Outbox()
-    published = 0
-    from .software_batch import current_candidates
-    for row in current_candidates(box, eligible_candidates(snapshot)):
-        if row.get('event_id') or row.get('status') == 'skipped':
-            continue
-        event_id = box.enqueue(
-            profile='default', job_id='software-update-review', kind='text',
-            payload={'text': review_text(row), 'reply_markup': _keyboard('default', row['id'])},
-            key='software-review:' + row['id'])
-        box.update_software_review(row['id'], event_id=event_id, status='pending')
-        published += 1
-    return published
+def publish_candidates(snapshot, box=None):
+    """Pinned older business versions must not publish retired APT cards."""
+    return 0
 
 
-def callback(profile: str, payload: dict, request_key: str = '') -> dict:
-    if str(payload.get('data', '')).startswith('su2|'):
-        from .software_batch import callback as batch_callback
-        return batch_callback(profile, payload, request_key)
-    if profile != 'default' or not _authorized_callback(profile, payload):
-        raise ValueError('只允许本人默认机器人私聊操作')
-    action, review_id = _parse_callback(profile, payload.get('data', ''))
-    box = Outbox()
-    row = box.software_review(review_id)
-    if not row:
-        raise ValueError('更新候选不存在，或已过期')
-    if action == 'skip':
-        if row['status'] != 'pending':
-            return {'text': review_text(row), 'callback_id': str(payload.get('id') or '')}
-        row = box.update_software_review(review_id, status='skipped', selected=0, detail='用户跳过当前版本')
-        return {'text': '已跳过此版本；候选版本变化后会重新提示。', 'callback_id': str(payload.get('id') or '')}
-    text = request_package_update(review_id, profile, request_key)
-    row = box.software_review(review_id) or row
-    markup = _keyboard(profile, review_id) if row['status'] in {'queued', 'running', 'pending'} else None
-    return {'text': text, 'reply_markup': markup, 'callback_id': str(payload.get('id') or '')}
-
-
-def _sync_review_result(box: Outbox, row: dict) -> bool:
-    request_id = str(row.get('request_id') or '')
-    if not request_id.startswith(REVIEW_REQUEST_PREFIX):
-        return False
-    review_id = request_id.removeprefix(REVIEW_REQUEST_PREFIX)
-    if not REVIEW_ID_RE.fullmatch(review_id) or not box.software_review(review_id):
-        return False
-    status = str(row.get('status') or 'uncertain')
-    detail = str(row.get('detail') or '')[-2000:]
-    box.update_software_review(review_id, status=status, request_id=request_id, detail=detail)
-    box.enqueue(profile='default', job_id='software-update', kind='text',
-                payload={'text': result_text(row)}, key='software-update-result:' + str(row['id']))
-    return True
+def callback(profile, payload, request_key=''):
+    from .commands import authorized
+    message = payload.get('message') or {}
+    if not authorized(profile, {'chat': message.get('chat', {}), 'from': payload.get('from', {})}):
+        raise ValueError('只允许本人私聊操作')
+    return {'text': RETIRED_MESSAGE, 'callback_id': str(payload.get('id') or '')}
 
 
 def reconcile(box=None):
-    from .software_inventory import invalidate
     box = box or Outbox()
-    from .software_batch import recover_submissions, sync_result
-    recover_submissions(box)
     rows = json.loads(scheduler.admin('software', 'results'))
+    count = 0
     for row in rows:
-        if sync_result(box, row) or _sync_review_result(box, row):
-            invalidate(box)
-        else:
-            # Root holds execution results. A restart between enqueue and ack
-            # repeats this read, but the persistent event key prevents duplicates.
-            box.enqueue(profile=row['profile'], job_id='software-update', kind='text',
-                        payload={'text': result_text(row)}, key='software-update:' + row['id'])
-            invalidate(box)
+        if row.get('target') not in NAMES:
+            continue
+        # Persist before acknowledging root. Retried delivery never installs.
+        box.enqueue(profile=row['profile'], job_id='software-update', kind='text',
+                    payload={'text': result_text(row)}, key='software-update:' + row['id'])
         scheduler.admin('software', 'ack', row['request_id'])
-    return len(rows)
-
-
-def review_status_text(box: Outbox | None = None) -> str:
-    box = box or Outbox()
-    rows = box.software_reviews(profile='default')
-    counts = {}
-    for row in rows:
-        counts[row['status']] = counts.get(row['status'], 0) + 1
-    pending = counts.get('pending', 0)
-    active = counts.get('queued', 0) + counts.get('running', 0)
-    recent = next((row for row in rows if row['status'] in {'updated', 'current', 'failed', 'uncertain', 'deferred'}), None)
-    line = f'系统小包更新：待确认 {pending}；已选 {len(box.software_selection())}；执行中 {active}'
-    labels = [('skipped', '已跳过'), ('updated', '成功'), ('current', '无需更新'),
-              ('failed', '失败'), ('uncertain', '待核对'), ('deferred', '系统暂缓')]
-    details = [f'{label} {counts[key]}' for key, label in labels if counts.get(key)]
-    if details:
-        line += '；' + '、'.join(details)
-    if recent:
-        line += f"；最近 {recent['package_name']} {STATES.get(recent['status'], recent['status'])}"
-    batches = box.software_batches()
-    latest_batch = next((batch for batch in batches if batch['status'] != 'draft'), None)
-    if latest_batch:
-        line += '；最近批次 ' + latest_batch['id'][:8] + ' ' + STATES.get(latest_batch['status'], latest_batch['status'])
-    return line
-
-
-def review_logs_text(box: Outbox | None = None) -> str:
-    box = box or Outbox()
-    rows = box.software_reviews(profile='default')[:20]
-    if not rows:
-        return '系统小包更新记录：暂无候选。'
-    lines = ['系统小包更新记录：']
-    from .software_batch import batch_text
-    lines.extend(batch_text(batch) for batch in box.software_batches()[:3] if batch['status'] != 'draft')
-    for row in rows:
-        status = STATES.get(row['status'], row['status'])
-        detail = ('：' + redact(str(row['detail']))[-300:]) if row.get('detail') else ''
-        lines.append(f"{row['id']} {row['package_name']} {status}{detail}")
-    return '\n'.join(lines)
+        count += 1
+    return count
 
 
 def synchronize_background(stop):
@@ -347,7 +121,3 @@ def synchronize_background(stop):
             log.warning('software update results: %s', redact(str(exc)))
             delay = min(300, delay * 2)
         stop.wait(delay)
-
-
-# Public callback builder retained beside legacy su1 helpers.
-from .software_batch import callback_data as batch_callback_data

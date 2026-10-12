@@ -40,7 +40,11 @@ def store_updates(box: Outbox, profile: str, updates: list[dict]):
                 db.execute("INSERT OR IGNORE INTO updates(profile,update_id,payload,kind,chat_id,message_id) VALUES(?,?,?,'following_document',?,?)",
                            (profile, update['update_id'], json.dumps(message, ensure_ascii=False),
                             str(message.get('chat', {}).get('id', '')), message.get('message_id')))
-            elif authorized(profile, callback_owner) and isinstance(callback.get('data'), str) and callback_owner.get('date', not_before) >= not_before:
+            elif (authorized(profile, callback_owner) and isinstance(callback.get('data'), str)
+                  and (callback_owner.get('date', not_before) >= not_before
+                       or callback['data'].startswith(('su1|', 'su2|')))):
+                # Retired maintenance buttons only explain the replacement
+                # commands; even an old delivered card deserves a response.
                 db.execute("INSERT OR IGNORE INTO updates(profile,update_id,payload,kind,chat_id,message_id) VALUES(?,?,?,'callback_query',?,?)",
                            (profile, update['update_id'], json.dumps(callback, ensure_ascii=False),
                             str(callback_message.get('chat', {}).get('id', '')), callback_message.get('message_id')))
@@ -158,6 +162,8 @@ def main():
     lock = (home() / 'run/daemon.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     box, stop = Outbox(), threading.Event()
+    from .software_retirement import retire
+    retire(box)
     recover(box)
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())

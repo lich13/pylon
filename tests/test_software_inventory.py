@@ -61,33 +61,6 @@ def test_snapshot_rejects_replaced_binary_still_running_old_inode(monkeypatch):
         admin.container_snapshot('sub2api')
 
 
-def test_easy_proxies_uses_immutable_image_label_only_for_unchanged_program(container, monkeypatch):
-    capture = Mock(side_effect=['C /app\nA /app/logs\n', '3.1.1'])
-    monkeypatch.setattr(admin, 'capture', capture)
-    row = admin.container_version('easy_proxies')
-    assert row == {'version': '3.1.1', 'basis': '镜像标签推定，程序未替换'}
-    assert capture.call_args.args[0][:5] == ['/usr/bin/docker', 'image', 'inspect', 'sha256:' + 'a' * 64, '--format']
-
-
-@pytest.mark.parametrize('changed', ['C /usr/local/bin/easy_proxies', 'A /usr/local/bin', 'D /usr/local/bin/easy_proxies'])
-def test_easy_proxies_does_not_trust_label_after_binary_changes(container, monkeypatch, changed):
-    capture = Mock(return_value=changed)
-    monkeypatch.setattr(admin, 'capture', capture)
-    with pytest.raises(ValueError, match='容器程序已被修改'):
-        admin.container_version('easy_proxies')
-    capture.assert_called_once()
-
-
-@pytest.mark.parametrize('mount', ['/usr', '/usr/local/bin', '/usr/local/bin/easy_proxies'])
-def test_easy_proxies_does_not_trust_label_for_mounted_program(container, monkeypatch, mount):
-    container[1]['Mounts'] = [{'Destination': mount}]
-    capture = Mock()
-    monkeypatch.setattr(admin, 'capture', capture)
-    with pytest.raises(ValueError, match='外部挂载覆盖'):
-        admin.container_version('easy_proxies')
-    capture.assert_not_called()
-
-
 @pytest.mark.parametrize('target,output,expected', [
     ('codex', 'codex-cli 0.159.1', '0.159.1'),
     ('grok', 'grok 1.0.44 (5b807183dd79) [stable]', '1.0.44'),
