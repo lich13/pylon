@@ -22,11 +22,30 @@ FILES = ('src', 'ops', 'jobs.json', 'pyproject.toml', 'requirements.lock', 'READ
 
 
 def command(argv):
-    return subprocess.check_output([str(x) for x in argv], text=True).strip()
+    # pip's editable .pth and dist-info must be readable by the runtime user,
+    # including when this root operation starts with a private service umask.
+    return subprocess.check_output([str(x) for x in argv], text=True, umask=0o022).strip()
 
 
 def active(unit):
     return command(['systemctl', 'show', unit, '-p', 'ActiveState', '--value']) in {'active', 'activating'}
+
+
+def ready_services(services):
+    """A successful start request is not proof that the process stayed alive."""
+    initial = {}
+    for attempt in range(6):
+        for unit in services:
+            output = command(['systemctl', 'show', unit, '-p', 'ActiveState', '-p', 'SubState',
+                              '-p', 'MainPID', '-p', 'NRestarts'])
+            state = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+            if (state.get('ActiveState') != 'active' or state.get('SubState') != 'running'
+                    or not state.get('MainPID') or state['MainPID'] == '0'):
+                raise RuntimeError('service did not stay running: ' + unit)
+            identity = (state['MainPID'], state.get('NRestarts'))
+            if identity != initial.setdefault(unit, identity):
+                raise RuntimeError('service restarted during startup: ' + unit)
+        if services and attempt < 5: time.sleep(1)
 
 
 def query(path, sql):
@@ -160,6 +179,8 @@ def main():
                 linked.append(name)
         command([PYTHON, '-m', 'pip', 'uninstall', '-y', 'pylon-tasks'])
         command([PYTHON, '-m', 'pip', 'install', '--no-deps', '--no-build-isolation', '-e', ROOT])
+        command(['/usr/sbin/runuser', '-u', 'pylon', '--', PYTHON, '-I', '-c',
+                 'import pylon.cli, pylon.sdk'])
         command([PYTHON, '-I', '-m', 'pylon.module_cli', 'install', '--no-services', *args.modules])
         command([PYTHON, ROOT / 'ops/bootstrap.py'])
         if storage_identity() != state['data_before']:
@@ -170,8 +191,7 @@ def main():
         state['phase'] = 'starting'
         save(state_path, state)
         if services: command(['systemctl', 'start', *services])
-        for unit in services:
-            if not active(unit): raise RuntimeError('service did not start: ' + unit)
+        ready_services(services)
         if timers: command(['systemctl', 'start', *timers])
         state['phase'] = 'complete'
         save(state_path, state)

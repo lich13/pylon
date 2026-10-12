@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import stat
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -74,10 +75,24 @@ def cutover(monkeypatch, tmp_path):
     pending_values = []
     query_calls = []
     sleep_calls = []
+    service_checks = []
+    service_states = {
+        unit: {
+            "ActiveState": "active",
+            "SubState": "running",
+            "MainPID": str(1000 + index),
+            "NRestarts": "0",
+        }
+        for index, unit in enumerate(sorted(active_units), start=1)
+    }
 
     def fake_command(argv):
         command = tuple(str(value) for value in argv)
         commands.append(command)
+        if command[:2] == ("systemctl", "show"):
+            unit = command[2]
+            service_checks.append(unit)
+            return "\n".join(f"{key}={value}" for key, value in service_states[unit].items())
         return ""
 
     def fake_active(unit):
@@ -121,6 +136,7 @@ def cutover(monkeypatch, tmp_path):
         "pending": pending_values,
         "query_calls": query_calls,
         "sleep_calls": sleep_calls,
+        "service_checks": service_checks,
         "old_files": old_files,
         "database": root / "data" / "outbox.sqlite3",
     }
@@ -158,7 +174,8 @@ def test_waiting_work_is_drained_without_killing_task_manual_or_model(cutover, m
         for command in cutover["commands"]
         for token in command
     )
-    assert cutover["sleep_calls"] == [5]
+    assert cutover["sleep_calls"] == [5, 1, 1, 1, 1, 1]
+    assert len(cutover["service_checks"]) == 18
     assert not cutover["query_calls"]
 
 
@@ -243,6 +260,85 @@ def test_success_switches_sources_to_stage_and_preserves_data(cutover, monkeypat
     receipt = json.dumps(state["data_before"])
     assert "profile-db-secret" not in receipt
     assert "profile-json-secret" not in receipt
+    runtime_import_index = next(
+        index for index, command in enumerate(cutover["commands"])
+        if command[:4] == ("/usr/sbin/runuser", "-u", "pylon", "--")
+        and "import pylon.cli, pylon.sdk" in command
+    )
+    service_start_index = next(
+        index for index, command in enumerate(cutover["commands"])
+        if command[:2] == ("systemctl", "start")
+        and any(unit in command for unit in (
+            "pylon-bot.service",
+            "pylon-market-web.service",
+            "chiphell-fid26-poller.service",
+        ))
+    )
+    assert runtime_import_index < service_start_index
+
+
+@pytest.mark.parametrize("changed_state", [
+    "ActiveState=active\nSubState=running\nMainPID=100\nNRestarts=1",
+    "ActiveState=active\nSubState=running\nMainPID=200\nNRestarts=0",
+])
+def test_ready_services_rejects_restart_or_pid_change(monkeypatch, changed_state):
+    outputs = iter([
+        "ActiveState=active\nSubState=running\nMainPID=100\nNRestarts=0",
+        changed_state,
+    ])
+    monkeypatch.setattr(gateway, "command", lambda _argv: next(outputs))
+    monkeypatch.setattr(gateway.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="service restarted during startup"):
+        gateway.ready_services(["pylon-bot.service"])
+
+
+def test_ready_services_rejects_auto_restart_with_no_pid(monkeypatch):
+    state = "ActiveState=activating\nSubState=auto-restart\nMainPID=0\nNRestarts=1"
+
+    def fake_command(argv):
+        return "activating" if "--value" in argv else state
+
+    monkeypatch.setattr(gateway, "command", fake_command)
+
+    assert gateway.active("pylon-bot.service")
+    with pytest.raises(RuntimeError, match="service did not stay running"):
+        gateway.ready_services(["pylon-bot.service"])
+
+
+def test_command_umask_keeps_generated_package_paths_and_files_readable(tmp_path):
+    site = tmp_path / "venv" / "lib" / "python3.12" / "site-packages"
+    script = (
+        "from pathlib import Path\n"
+        f"site = Path({str(site)!r})\n"
+        "dist = site / 'pylon_gateway-1.0.dist-info'\n"
+        "package = site / 'pylon'\n"
+        "site.mkdir(parents=True)\n"
+        "dist.mkdir()\n"
+        "package.mkdir()\n"
+        "(site / 'pylon_gateway.pth').write_text('pylon\\n')\n"
+        "(dist / 'METADATA').write_text('Name: pylon-gateway\\n')\n"
+        "(package / '__init__.py').write_text('')\n"
+    )
+
+    previous_umask = os.umask(0o077)
+    try:
+        gateway.command([sys.executable, "-c", script])
+    finally:
+        os.umask(previous_umask)
+
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o755
+        for path in (site, site / "pylon_gateway-1.0.dist-info", site / "pylon")
+    )
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o644
+        for path in (
+            site / "pylon_gateway.pth",
+            site / "pylon_gateway-1.0.dist-info" / "METADATA",
+            site / "pylon" / "__init__.py",
+        )
+    )
 
 
 def test_schedule_failure_restores_registry_before_restarting_old_timer(monkeypatch, tmp_path):
