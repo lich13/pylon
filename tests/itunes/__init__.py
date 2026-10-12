@@ -1,1 +1,0 @@
-"""Chartoo test package."""

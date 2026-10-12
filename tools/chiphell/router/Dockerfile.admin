@@ -1,7 +1,0 @@
-FROM docker:20.10.24-cli@sha256:d1b70e7d1329eef4c9541c6cd36a0ad39cfaf1adc0119a6fb7f6668d93ae0475
-
-COPY admin-entrypoint.sh /usr/local/bin/admin-entrypoint
-RUN chmod 0755 /usr/local/bin/admin-entrypoint
-
-ENTRYPOINT ["/usr/local/bin/admin-entrypoint"]
-CMD ["daemon"]

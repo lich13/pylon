@@ -45,7 +45,12 @@ def main(args=None):
             raise ValueError('unsupported SSH action')
         from .ssh import main as ssh_main
         return ssh_main(args[1:])
+    from ..extensions import registry
     catalog = json.loads(CATALOG.read_text())
+    for mod in registry(CATALOG.parent / 'modules').values():
+        for key, job in mod.manifest.get('jobs', {}).items():
+            if key in catalog: raise ValueError('duplicate task')
+            catalog[key] = job
     if len(args) != 2 or args[0] not in {'pause', 'resume', 'run', 'logs'} or args[1] not in catalog:
         raise ValueError('unsupported action or task')
     action, key = args

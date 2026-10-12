@@ -17,7 +17,7 @@ from urllib.parse import quote
 
 from . import agent_state as state
 from . import software
-from ..tasks.gmail.logic import NODE_SCHEMA, PROGRAM_SCHEMA
+from ..sdk.gmail_contract import NODE_SCHEMA, PROGRAM_SCHEMA
 
 CODEX_HOME = Path('/root/.codex')
 GROK_HOME = Path('/root/.grok')
@@ -230,7 +230,7 @@ def validate_gmail_proposal(proposal):
             if '-is:starred' not in query.split() or re.search(r'(?<!-)\bis:starred\b', query, re.I):
                 raise ValueError('Gmail 规则查询缺少 -is:starred 保护')
             if 'logic' in operation:
-                from pylon.tasks.gmail.logic import validate_program
+                from pylon.sdk.gmail_contract import validate_program
                 validate_program(operation['logic'])
         elif query:
             raise ValueError('停用 Gmail 规则不能包含查询条件')

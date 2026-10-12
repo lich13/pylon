@@ -10,7 +10,7 @@ import threading
 import time
 
 from .commands import authorized
-from .bot_menu import synchronize_background
+from .bot_menu import watch_registration as synchronize_background
 from . import scheduler
 from .config import home, profile_env, redact
 from .outbox import Outbox
@@ -20,7 +20,7 @@ log = logging.getLogger("pylon")
 
 
 def store_updates(box: Outbox, profile: str, updates: list[dict]):
-    from .tasks.linuxdo.following_import import accepts
+    from .extensions import document_module
     not_before = box.get('commands_not_before', 0)
     with box.connect() as db:
         for update in updates:
@@ -36,7 +36,7 @@ def store_updates(box: Outbox, profile: str, updates: list[dict]):
                 db.execute("INSERT OR IGNORE INTO updates(profile,update_id,payload,kind,chat_id,message_id) VALUES(?,?,?,'message',?,?)",
                            (profile, update['update_id'], json.dumps(message, ensure_ascii=False),
                             str(message.get('chat', {}).get('id', '')), message.get('message_id')))
-            elif authorized(profile, message) and accepts(profile, message) and message.get('date', not_before) >= not_before:
+            elif authorized(profile, message) and document_module(profile, message) and message.get('date', not_before) >= not_before:
                 db.execute("INSERT OR IGNORE INTO updates(profile,update_id,payload,kind,chat_id,message_id) VALUES(?,?,?,'following_document',?,?)",
                            (profile, update['update_id'], json.dumps(message, ensure_ascii=False),
                             str(message.get('chat', {}).get('id', '')), message.get('message_id')))
@@ -87,8 +87,10 @@ def command_once(box: Outbox) -> bool:
         if type(reply_id) is int and reply_id > 0:
             env['PYLON_REPLY_MESSAGE_ID'] = str(reply_id)
         if row.get('kind') == 'following_document':
-            from .tasks.linuxdo.following_import import document
-            reply, status = document(row['profile'], message), 'done'
+            from .extensions import document_module, invoke
+            module_id = document_module(row['profile'], message)
+            if not module_id: raise ValueError('document handler unavailable')
+            reply, status = invoke(module_id, 'document', row['profile'], message=message), 'done'
             proc = None
         elif is_callback:
             proc = subprocess.run([str(home() / 'venv/bin/python'), '-m', 'pylon.commands', row['profile'], '--callback'],

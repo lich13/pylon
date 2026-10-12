@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .config import home, profile_root
 from .outbox import Outbox
-from .shared.state_json import save_atomic
+from .sdk.state_json import save_atomic
 
 OLD_XIANBAO = 'xianbao-hermes-poll'
 NEW_XIANBAO = 'xianbao-poll'
@@ -58,19 +58,17 @@ def migrate_profile(root: Path) -> None:
 
 
 def migrate_gmail() -> None:
-    from .tasks.gmail import review, cleanup, store
-    store.migrate([(review.REVIEWS_PATH, {"version": 1, "reviews": {}}),
-                   (review.PROPOSALS_PATH, {"version": 1, "proposals": {}}),
-                   (cleanup.RULE_OVERRIDES_PATH, {"version": 1, "operations": []}),
-                   (cleanup.EXTRA_RULES_PATH, {"version": 1, "rules": []})])
+    from .extensions import invoke
+    invoke('gmail', 'migrate', 'default')
 
 
 def main() -> None:
     migrate_profile(profile_root('default'))
     rename_xianbao(Outbox())
-    migrate_gmail()
-    from .tasks.quotes.health import suppress_legacy_notices
-    suppress_legacy_notices(Outbox())
+    from .extensions import snapshot, invoke
+    for mod in snapshot().values():
+        if 'migrate' in mod.manifest.get('hooks', []):
+            invoke(mod.id, 'migrate', mod.manifest.get('status_profile', 'webops'))
     old_lock = home() / 'run' / (OLD_XIANBAO + '.lock')
     # No process may hold the old lock during the deployment migration.
     old_lock.unlink(missing_ok=True)

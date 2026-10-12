@@ -8,13 +8,13 @@ Group=pylon
 WorkingDirectory=/srv/pylon
 Environment=PYLON_HOME=/srv/pylon
 Environment=TZ=Asia/Shanghai
-ExecStart=/srv/pylon/venv/bin/uvicorn pylon.tasks.marketplace.web:create_app --factory --host 127.0.0.1 --port 8794 --workers 1 --no-access-log --proxy-headers --forwarded-allow-ips 127.0.0.1
+ExecStart=/srv/pylon/venv/bin/python -m pylon.cli modules serve content web
 Restart=on-failure
 RestartSec=5
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/srv/pylon/data
+ReadWritePaths=/srv/pylon/data /srv/pylon/run
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true

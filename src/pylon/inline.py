@@ -27,3 +27,11 @@ def owns_callback(profile, payload, *, box=None):
         if any(button.get('callback_data') == payload.get('data') for line in buttons for button in line):
             return True
     return False
+
+
+def signature(profile: str, action: str, target: str) -> str:
+    """Stable callback signing, independent of any business extension."""
+    import hashlib
+    import hmac
+    secret = str(profile_env(profile).get('TELEGRAM_BOT_TOKEN') or 'pylon').encode()
+    return hmac.new(secret, f'{profile}|{action}|{target}'.encode(), hashlib.sha256).hexdigest()[:12]

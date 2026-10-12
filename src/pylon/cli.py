@@ -9,8 +9,13 @@ from .outbox import Outbox
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'modules':
+        from .module_cli import main as module_main
+        return module_main(sys.argv[2:])
     parser = argparse.ArgumentParser(prog='pylon')
     sub = parser.add_subparsers(dest='command', required=True)
+    modules = sub.add_parser('modules', add_help=False, help='外置模块开发与部署')
+    modules.add_argument('arguments', nargs=argparse.REMAINDER)
     marketplace = sub.add_parser('marketplace', add_help=False, help='二手交易历史分类与离线分析')
     marketplace.add_argument('arguments', nargs=argparse.REMAINDER)
     for name in ('daemon', 'status', 'outbox', 'reconcile'):
@@ -42,9 +47,13 @@ def main():
         if name == 'reply':
             action.add_argument('text', nargs='+')
     args = parser.parse_args()
+    if args.command == 'modules':
+        from .module_cli import main as module_main
+        return module_main(args.arguments)
     if args.command == 'marketplace':
-        from .tasks.marketplace.__main__ import main as marketplace_main
-        return marketplace_main(args.arguments)
+        from .extensions import exec_entry, snapshot
+        mod = next(m for m in snapshot().values() if 'marketplace' in m.manifest.get('cli', {}))
+        return exec_entry(mod.id, mod.manifest['cli']['marketplace'], args.arguments)
     if args.command == 'agent':
         from .agent_tasks import command
         argument = (' '.join(args.text) if args.action == 'run' else

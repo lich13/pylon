@@ -1,0 +1,149 @@
+name: External module checks
+run-name: Modules ${{ inputs.job }}
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Unique temporary input identifier
+        required: true
+      release_id:
+        description: Private draft release containing the source bundle
+        required: true
+      sha256:
+        description: SHA-256 of the source archive
+        required: true
+      core_sha:
+        description: Gateway commit to validate against
+        required: true
+      module:
+        description: Module and its dependants, or all
+        default: all
+        required: true
+      router:
+        description: Build Linux ARM64 router images
+        type: boolean
+        default: false
+permissions: {}
+jobs:
+  input:
+    if: github.event.repository.private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Validate and download private source
+        id: input
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB: ${{ inputs.job }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          SOURCE_SHA: ${{ inputs.sha256 }}
+          CORE_SHA: ${{ inputs.core_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$JOB" =~ ^[a-f0-9]{24}$ && "$RELEASE_ID" =~ ^[0-9]+$ && "$SOURCE_SHA" =~ ^[a-f0-9]{64}$ && "$CORE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/release.json"
+          python - <<'PY'
+          import json,os,subprocess,hashlib
+          from pathlib import Path
+          release=json.loads((Path(os.environ['RUNNER_TEMP'])/'release.json').read_text())
+          assert release['draft'] and release['tag_name']=='pylon-input-'+os.environ['JOB']
+          assert release['target_commitish']==os.environ['CORE_SHA']
+          asset=next(a for a in release['assets'] if a['name']=='source.tar.gz')
+          assert 0 < asset['size'] < 64*1024**2
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output: output.write('owned=true\n')
+          data=subprocess.check_output(['gh','api','-H','Accept: application/octet-stream',f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/assets/{asset['id']}"])
+          assert hashlib.sha256(data).hexdigest()==os.environ['SOURCE_SHA']
+          (Path(os.environ['RUNNER_TEMP'])/'source.tar.gz').write_bytes(data)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-input-${{ inputs.job }}
+          path: ${{ runner.temp }}/source.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+      - name: Delete temporary draft
+        if: always() && steps.input.outputs.owned == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+        run: gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
+  checks:
+    needs: input
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.core_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          name: module-input-${{ inputs.job }}
+          path: ${{ runner.temp }}/input
+      - name: Extract verified modules
+        env:
+          SOURCE_SHA: ${{ inputs.sha256 }}
+          PYTHONPATH: src
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from pylon.module_ci import extract
+          from pylon.extensions import registry
+          source=Path(os.environ['RUNNER_TEMP'])/'pylon-tasks'
+          extract(Path(os.environ['RUNNER_TEMP'])/'input/source.tar.gz',source,os.environ['SOURCE_SHA'])
+          modules=registry(source)
+          with open(os.environ['GITHUB_ENV'],'a') as output:
+              output.write('PYLON_MODULES_DIR='+str(source)+'\n')
+              output.write('PYLON_GATEWAY_ROOT='+os.environ['GITHUB_WORKSPACE']+'\n')
+              output.write('PYTHONPATH='+os.pathsep.join([str(Path.cwd()/'src'),str(source),*(str(m.root/'src') for m in modules.values())])+'\n')
+              output.write('PLAYWRIGHT_BROWSERS_PATH='+os.environ['RUNNER_TEMP']+'/playwright\n')
+          PY
+      - run: python -m pip install --require-hashes -r "$PYLON_MODULES_DIR/requirements.lock"
+      - run: python -m pip install --no-deps -e . && python -m pip install pytest==9.1.1
+      - name: Module regression
+        env:
+          MODULE: ${{ inputs.module }}
+        run: python -m pylon.module_cli check "$MODULE"
+      - name: Browser runtime
+        if: inputs.module == 'all' || inputs.module == 'content' || inputs.module == 'software'
+        run: python -m playwright install --with-deps --only-shell chromium
+      - name: Browser acceptance
+        if: inputs.module == 'all' || inputs.module == 'content' || inputs.module == 'software'
+        run: |
+          python "$PYLON_MODULES_DIR/content/ci/browser-smoke.py"
+          python "$PYLON_MODULES_DIR/content/ci/intelligence-web.py"
+          python "$PYLON_MODULES_DIR/content/ci/daily-review-web.py"
+      - uses: docker/setup-qemu-action@v3
+        if: inputs.router
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+        if: inputs.router
+      - name: Router images
+        if: inputs.router
+        run: bash "$PYLON_MODULES_DIR/content/tools/chiphell/cloud/build-router-images.sh" "$PYLON_MODULES_DIR/content/tools/chiphell" "$RUNNER_TEMP/router-artifacts"
+  cleanup:
+    if: always()
+    needs: [input, checks]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Remove workflow source artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.artifacts[] | select(.name | startswith("module-input-")) | .id' | while read -r id; do
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+          done

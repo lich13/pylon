@@ -91,6 +91,6 @@ def defer_json(path: Path, value) -> bool:
 
 def flush_deferred():
     for path, value in _deferred.items():
-        from .shared.state_json import save_atomic
+        from .sdk.state_json import save_atomic
         save_atomic(path, value)
     _deferred.clear()

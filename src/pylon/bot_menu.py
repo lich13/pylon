@@ -75,6 +75,31 @@ def synchronize_background(stop: threading.Event):
             attempt += 1
 
 
+def registration_stamp():
+    from .extensions import directory
+    root = directory()
+    index = root / 'registry.json'
+    paths = [index] if index.exists() else sorted(root.glob('*/module.json'))
+    result = []
+    for path in paths:
+        try:
+            info = path.stat()
+            result.append((str(path), info.st_ino, info.st_mtime_ns, info.st_size))
+        except FileNotFoundError:
+            return None
+    return tuple(result)
+
+
+def watch_registration(stop: threading.Event):
+    """Refresh changed module menus without restarting the gateway process."""
+    while not stop.is_set():
+        stamp = registration_stamp()
+        synchronize_background(stop)
+        while not stop.wait(5):
+            if registration_stamp() != stamp:
+                break
+
+
 def run(action: str) -> int:
     failed = False
     for profile in PROFILES:

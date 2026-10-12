@@ -129,14 +129,12 @@ def reconcile(box=None):
     rows = invoke('results')
     for event in rows:
         row = json.loads(event['payload'])
-        gmail_review = None
-        try:
-            from .tasks.gmail import review as gmail_review_module
-            gmail_review = gmail_review_module.consume_agent_result(row)
-        except Exception as exc:
-            logging.getLogger('pylon').warning('gmail review result: %s', redact(str(exc)))
-        if gmail_review is not None:
-            row.setdefault('result', {})['gmail_review'] = gmail_review
+        from .extensions import hook
+        # An extension failure keeps the durable result unacknowledged. It
+        # never resubmits the agent task and can safely reconcile later.
+        enriched = hook('agent_result', event['profile'], row=row)
+        if enriched:
+            row.setdefault('result', {}).update(enriched.get('result') or {})
         if row['cleanup'] == 'done':
             text = f"Agent #{row['id'][:12]}：本次线程、原始对话及临时文件已清理。"
         elif row['cleanup'] == 'failed':
@@ -144,19 +142,8 @@ def reconcile(box=None):
         else:
             text = render(row)
         payload = {'text': text, 'agent_task': row['id'], 'agent_state': row['status']}
-        if gmail_review and gmail_review.get('batch_id') and not gmail_review.get('proposal_id') and row['cleanup'] not in {'done', 'failed'}:
-            from .tasks.gmail.batch import dashboard_payload
-            card = dashboard_payload(event['profile'])
-            payload['text'] = card['text']
-            payload['reply_markup'] = card.get('reply_markup')
-        if gmail_review and gmail_review.get('proposal_id'):
-            try:
-                from .tasks.gmail.review import proposal_payload
-                card = proposal_payload(event['profile'], gmail_review['proposal_id'])
-                payload['text'] = card['text']
-                payload['reply_markup'] = card.get('reply_markup')
-            except Exception as exc:
-                logging.getLogger('pylon').warning('gmail proposal card: %s', redact(str(exc)))
+        if enriched and enriched.get('card'):
+            payload.update(enriched['card'])
         box.enqueue(profile=event['profile'], job_id='agent', kind='text',
                     payload=payload,
                     key='agent-event:' + event['id'])

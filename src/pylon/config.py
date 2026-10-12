@@ -34,7 +34,15 @@ def profile_env(profile: str) -> dict[str, str]:
 
 
 def jobs() -> dict[str, dict]:
-    return json.loads((home() / "jobs.json").read_text())
+    from .extensions import snapshot
+    path = home() / "jobs.json"
+    catalog = json.loads(path.read_text()) if path.exists() else {}
+    for mod in snapshot().values():
+        for key, job in mod.manifest.get('jobs', {}).items():
+            if key in catalog:
+                raise ValueError('duplicate task: ' + key)
+            catalog[key] = job
+    return catalog
 
 
 def redact(value: str) -> str:

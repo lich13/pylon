@@ -99,7 +99,8 @@ def main():
         install_file(ROOT / 'ops' / service, UNITS / service)
     (UNITS / 'pylon-task@.service').write_text(task_service('scheduled'))
     (UNITS / 'pylon-manual@.service').write_text(task_service('manual'))
-    catalog = json.loads((ROOT / 'jobs.json').read_text())
+    from pylon.config import jobs
+    catalog = jobs()
     for key, job in catalog.items():
         (UNITS / f'pylon-job-{key}.timer').write_text(timer_text(key, job))
         for trigger in ('task', 'manual'):

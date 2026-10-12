@@ -74,11 +74,9 @@ def start(job_id: str) -> str:
 def logs(job_id: str) -> str:
     unit(job_id)
     result = redact(admin("logs", job_id)) or "暂无日志"
-    from .tasks.quotes.health import JOB_IDS, status_text
-    if job_id=='intelligence-review':
-        from .tasks.intelligence.pipeline import summary
-        return result+'\n'+summary()
-    return result + '\n' + status_text() if job_id in JOB_IDS else result
+    from .extensions import hook
+    extra = hook('logs', job_id=job_id)
+    return result + '\n' + extra if extra else result
 
 
 def ssh(action: str, value: str | None = None) -> dict:

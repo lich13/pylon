@@ -29,7 +29,16 @@ def task_environment(profile: str) -> dict[str, str]:
 
 
 def run(job_id: str, trigger: str = "scheduled") -> int:
-    job = jobs()[job_id]
+    from .extensions import execution
+    with execution() as modules:
+        return _run(job_id, trigger, modules)
+
+
+def _run(job_id, trigger, modules):
+    from .extensions import environment, python
+    # Freeze both descriptor and source roots before starting a process.
+    external = next((mod for mod in modules.values() if job_id in mod.manifest.get('jobs', {})), None)
+    job = external.manifest['jobs'][job_id] if external else jobs()[job_id]
     box = Outbox()
     lockdir = home() / "run"
     lockdir.mkdir(parents=True, exist_ok=True)
@@ -50,12 +59,12 @@ def run(job_id: str, trigger: str = "scheduled") -> int:
             return 0 if previous[0] in {"ok", "no_change"} else 1
         db.execute("INSERT INTO runs(id,job_id,started_at,status) VALUES(?,?,?,'running')", (run_id, job_id, time.time()))
     result_file = lockdir / (uuid.uuid4().hex + ".json")
-    env = task_environment(job["profile"])
+    env = environment(job["profile"], modules) if external else task_environment(job["profile"])
     env.update(PYLON_JOB_ID=job_id, PYLON_RUN_ID=run_id, PYLON_OUTBOX=str(box.path), PYLON_RESULT_FILE=str(result_file), PYLON_TRIGGER=trigger)
     if job.get('admin_action'):
         argv = ['sudo', '-n', '/usr/local/sbin/pylon-admin', 'ssh', job['admin_action']]
     else:
-        argv = [str(home() / "venv/bin/python"), "-m", job["module"], *job.get("args", [])]
+        argv = [python(), "-m", job["module"], *job.get("args", [])]
     started = time.time()
     process = None
     old_handlers = {}

@@ -3,18 +3,13 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pylon-tasks"
-version = "0.3.0"
+name = "pylon-gateway"
+version = "0.4.0"
 requires-python = ">=3.11"
-dependencies = ["httpx==0.28.1", "markdown-it-py==4.2.0", "google-api-python-client>=2.0,<3", "google-auth-oauthlib>=1.2,<2", "playwright==1.63.0", "telethon==1.45.0", "starlette==1.7.0", "uvicorn==0.54.0"]
+dependencies = ["httpx==0.28.1", "markdown-it-py==4.2.0"]
 
 [project.scripts]
 pylon = "pylon.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-"pylon.tasks.daily_review" = ["static/*.html", "static/*.js", "static/*.css"]
-"pylon.tasks.intelligence" = ["static/*.html", "static/*.js"]
-"pylon.tasks.marketplace" = ["static/*.html", "static/*.css", "static/*.js"]

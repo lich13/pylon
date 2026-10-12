@@ -1,7 +1,0 @@
-FROM fatedier/frpc@sha256:f4e8d7981ee3230b0bf2fd216316b4e7494111a7b85659feec3bd6e2d921131d
-
-RUN install -d -m 0755 /config
-
-COPY --chmod=0444 frpc.toml /config/frpc.toml
-
-CMD ["-c", "/config/frpc.toml"]

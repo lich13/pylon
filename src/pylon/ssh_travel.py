@@ -5,7 +5,7 @@ import time
 from . import scheduler
 from .inline import owns_callback
 from .outbox import Outbox
-from .tasks.gmail.review import _signature
+from .inline import signature as _signature
 
 
 def callback_data(profile, action):

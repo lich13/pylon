@@ -24,12 +24,12 @@ IMPORT_TRANSACTION_TMP_PATH = DATA_ROOT / ".cookie-import-transaction.json.tmp"
 HEALTH_PATH = DATA_ROOT / "proxy-health.json"
 QUEUE_PATH = DATA_ROOT / "delivery.sqlite3"
 STATE_PATH = DATA_ROOT / "state.json"
-POLLER = "pylon.tasks.chiphell.poller"
+POLLER = "pylon.cli"
 SERVICE = "chiphell-fid26-poller.service"
 CRON_ID = "63c6ab6c4af3"
 PYLON_PYTHON = "/srv/pylon/venv/bin/python"
 POLL_RECOVERY_TIMEOUT_SECONDS = 120
-from pylon.tasks.chiphell.runtime import (  # noqa: E402
+from pylon.sdk.chiphell_control import (  # noqa: E402
     CHIPHELL_FID,
     CHIPHELL_FORUM_URL,
     CHIPHELL_USER_AGENT,
@@ -92,7 +92,7 @@ def command_status() -> int:
 
 
 def command_test() -> int:
-    run([PYLON_PYTHON, "-m", POLLER, "--once", "--observe"])
+    run([PYLON_PYTHON, "-m", POLLER, "modules", "exec", "content", "pylon_tasks.chiphell.poller", "--once", "--observe"])
     health = json.loads(HEALTH_PATH.read_text()) if HEALTH_PATH.exists() else {}
     return observe_exit_code(health)
 
@@ -109,7 +109,7 @@ def command_baseline() -> int:
     was_active = service_active()
     run(["systemctl", "stop", SERVICE], check=False)
     try:
-        run([PYLON_PYTHON, "-m", POLLER, "--baseline"])
+        run([PYLON_PYTHON, "-m", POLLER, "modules", "exec", "content", "pylon_tasks.chiphell.poller", "--baseline"])
     finally:
         if was_active:
             run(["systemctl", "start", SERVICE])

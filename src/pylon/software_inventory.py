@@ -124,7 +124,7 @@ def check(*, max_age: int = 600, _retries: int = 1) -> dict:
         checks.append({'id': key, 'name': name, 'kind': kind, 'source': source, **current})
     for environment, packages in local.get('python', {}).items():
         for package, installed in packages.items():
-            if package.lower().replace('_', '-') in {'pylon', 'pylon-tasks'}:
+            if package.lower().replace('_', '-') in {'pylon', 'pylon-tasks', 'pylon-gateway'}:
                 continue
             checks.append({'id': environment + ':' + package, 'name': environment + ' / ' + package,
                            'kind': 'pypi', 'source': package, 'version': installed})

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from .config import home, jobs, profile_env, redact
 from .command_catalog import COMMANDS, RETIRED, RETIRED_MESSAGE, help_text
-from . import scheduler
+from . import scheduler, extensions
 from .outbox import Outbox
 from .runner import task_environment
 
@@ -86,43 +86,17 @@ def status_text() -> str:
     unresolved = sum(counts.get(s, 0) for s in ('pending', 'sending', 'uncertain', 'failed'))
     lines.append(f"待处理通知 {unresolved}；回执不确定 {counts.get('uncertain', 0)}")
     try:
-        from .tasks.gmail.review import status_line as gmail_review_status
-        lines.append(gmail_review_status())
-    except Exception as exc:
-        lines.append('Gmail 新类型审查状态暂不可读：' + redact(str(exc))[:160])
-    try:
         from .software_updates import review_status_text
         lines.append(review_status_text(box=box))
     except Exception as exc:
         lines.append('系统小包更新状态暂不可读：' + redact(str(exc))[:160])
-    try:
-        from .tasks.software import monitor as software_monitor
-        state = software_monitor.load_state()
-        pending = state.get('pending_events') if isinstance(state.get('pending_events'), list) else []
-        enrichment = state.get('enrichment') if isinstance(state.get('enrichment'), dict) else {}
-        lines.append(
-            '软件更新提炼：待处理 {}；Grok 成功 {}；降级翻译 {}；原文回退 {}；最近处理 {}'.format(
-                len(pending),
-                int(enrichment.get('grok_successes') or 0),
-                int(enrichment.get('fallback_translations') or 0),
-                int(enrichment.get('original_fallbacks') or 0),
-                enrichment.get('last_provider') or '暂无',
-            )
-        )
-        failed_sources = []
-        for source_id, source_state in (state.get('sources') or {}).items():
-            if int(source_state.get('consecutive_failures') or 0) > 0:
-                failed_sources.append(f"{source_id}：{str(source_state.get('last_failure_error') or source_state.get('last_error') or '未知原因')[:120]}")
-        if failed_sources:
-            lines.append('软件源失败：' + '；'.join(failed_sources[:6]))
-        if enrichment.get('last_error'):
-            lines.append('翻译/提炼最近错误：' + redact(str(enrichment['last_error']))[:180])
-    except Exception as exc:
-        lines.append('软件更新提炼状态暂不可读：' + redact(str(exc))[:160])
-    from .tasks.quotes.health import status_text as quote_status
-    lines.append(quote_status(box=box))
-    from .tasks.intelligence.pipeline import summary as intel_summary
-    lines.append(intel_summary(box))
+    for mod in extensions.snapshot().values():
+        if 'status' in mod.manifest.get('hooks', []):
+            try:
+                value = extensions.invoke(mod.id, 'status', mod.manifest.get('status_profile', 'webops'))
+                if value: lines.append(value)
+            except Exception as exc:
+                lines.append(mod.id + ' 状态暂不可读：' + redact(str(exc))[:160])
     return "\n".join(lines)
 
 
@@ -140,27 +114,6 @@ def locked_command(lock_name: str, args: list[str], profile: str) -> str:
         return result.stdout.strip()
 
 
-def monitor_command(text: str, chat_id: str) -> str | None:
-    os.environ.update(task_environment("webops"))
-    from .tasks.software import commands as module
-    source = SimpleNamespace(platform="telegram", chat_id=chat_id, thread_id=None)
-    parsed = (module.MonitorCommand('list') if text == '/monitors' else
-              module.parse_command(text, has_pending=module.source_key(source) in module.load_pending(module.PENDING_PATH)))
-    if parsed is None:
-        return None
-    (home() / 'run').mkdir(parents=True, exist_ok=True)
-    with (home() / "run/fa27c561ded6.lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return "软件更新检查正在运行，请稍后重试"
-        if parsed.kind == "add":
-            return module.handle_add(parsed.value)
-        if parsed.kind == "remove_list":
-            return module.handle_remove_list(source)
-        if parsed.kind == 'list':
-            return module.handle_list()
-        return module.handle_remove_number(source, parsed.value)
 
 
 def outbox_text() -> str:
@@ -234,26 +187,6 @@ def chiphell_text(action: str, argument: str = '') -> str:
     return 'Chiphell 抓取和定时投递已' + ('暂停' if action == 'pause' else '恢复')
 
 
-def gmail_text(action: str, candidate: str = '') -> str:
-    if action in {'review', 'rules', 'candidate', 'feedback', 'review_status', 'rule_preview', 'rule_apply', 'rule_reject', 'rule_rollback'}:
-        from .tasks.gmail import review
-        profile = os.environ.get('PYLON_COMMAND_PROFILE', 'default')
-        request_key = os.environ.get('PYLON_COMMAND_ID', '')
-        try:
-            return review.command(action, candidate, profile, request_key)
-        except ValueError as exc:
-            return str(exc) + '\n\n' + help_text('gmail_' + action)
-    if action == 'list':
-        from .tasks.gmail import review
-        return review.list_candidates()
-    if action != 'list' and not re.fullmatch(r'gmail-nt-[A-Za-z0-9_-]+', candidate):
-        return '候选 ID 格式不正确，请从 /gmail_candidates 复制完整 ID。\n\n' + help_text('gmail_' + action)
-    arguments = ['--list-candidates'] if action == 'list' else [f'--{action}-candidate', candidate]
-    result = locked_command('b5d6e708bf6e', [str(home() / 'venv/bin/python'),
-                            '-m', 'pylon.tasks.gmail.cleanup', *arguments, '--format', 'text'], 'default')
-    if action == 'accept' and result.startswith('已加入'):
-        result += '\n仅影响后续定时清理，本次未删除邮件。'
-    return result
 
 
 def handle(profile: str, text: str) -> str:
@@ -261,13 +194,8 @@ def handle(profile: str, text: str) -> str:
     value = text.strip()
     reply_id = os.environ.get('PYLON_REPLY_MESSAGE_ID', '')
     if not value.startswith('/'):
-        from .tasks.marketplace import interface as market_interface
-        market_result = market_interface.reply(profile,int(reply_id) if reply_id.isdigit() else 0,value)
-        if market_result is not None:return encode_response(market_result['text'],market_result.get('reply_markup'))
-        from .tasks.gmail import review as gmail_review
-        result = gmail_review.bind_reason(profile, int(reply_id) if reply_id.isdigit() else 0, value)
-        if result is not None:
-            return result
+        result = extensions.hook('text', profile, reply_id=int(reply_id) if reply_id.isdigit() else 0, text=value)
+        if result is not None: return result
         from .agent_tasks import reply_to
         result = reply_to(profile, int(reply_id), value) if reply_id.isdigit() else None
         if result is not None:
@@ -277,18 +205,10 @@ def handle(profile: str, text: str) -> str:
     if value.startswith('/'):
         token, *rest = value.split(maxsplit=1)
         name, argument = token[1:].split('@', 1)[0].lower(), rest[0].strip() if rest else ''
-        if profile=='webops' and name!='market':
-            from .tasks.marketplace.interface import clear_input
-            clear_input(profile)
-        if name == 'linuxdo_following_import':
-            from .tasks.linuxdo.following import import_text
-            return import_text(profile, argument)
+        extensions.hook('before_command', profile, name=name)
         if name == 'start':
-            if argument.startswith('review_'):
-                from .tasks.marketplace.web_auth import login_card
-                result=login_card(profile,workspace='review',day=argument.removeprefix('review_'))
-                return encode_response(result['text'],result.get('reply_markup'))
-            return help_text(profile=profile)
+            result = extensions.hook('start', profile, argument=argument)
+            return result if result is not None else help_text(profile=profile)
         if name.startswith('gmail_') or (name == 'gmail' and argument):
             return 'Gmail 操作已合并，请使用 /gmail'
         if name in {'ssh', 'chiphell'}:
@@ -303,20 +223,16 @@ def handle(profile: str, text: str) -> str:
         item = COMMANDS.get(name)
         if item is None:
             return '没有这个命令。发送 /help 查看可用命令。'
+        if profile not in item.profiles:
+            return item.profile_error
         if item.route == 'help':
             return help_text(argument,profile=profile)
         if item.argument and not item.argument.startswith('[') and not argument:
             return help_text(name)
         if not item.argument and argument:
             raise ValueError('此操作不接受参数；用法：' + item.usage)
-        if item.route == 'intel':
-            from .tasks.marketplace.web_auth import login_card
-            result=login_card(profile,workspace='intel')
-            return encode_response(result['text'],result.get('reply_markup'))
-        if item.route == 'market':
-            from .tasks.marketplace import interface
-            result=interface.command(profile,argument)
-            return encode_response(result['text'],result.get('reply_markup'))
+        if item.module:
+            return extensions.invoke(item.module, 'command', profile, name=name, argument=argument, command_action=item.action)
         if item.route == 'updates':
             if argument not in {'', 'all'}:
                 return help_text(name)
@@ -335,11 +251,7 @@ def handle(profile: str, text: str) -> str:
             return encode_response(result['text'], result.get('reply_markup'))
         if item.route == 'ssh':
             return ssh_text(item.action, argument)
-        if item.route == 'gmail':
-            return gmail_text(item.action, argument)
-        if item.route == 'monitor':
-            value = {'list': '/monitors', 'remove': '移除监控', 'add': '增加监控 ' + argument}[item.action]
-    result = monitor_command(value, profile_env(profile)["TELEGRAM_HOME_CHANNEL"])
+    result = extensions.hook('fallback_text', profile, text=value)
     if result is not None:
         return result
     return '没有识别到命令。发送 /help 查看可用命令。'
@@ -347,18 +259,13 @@ def handle(profile: str, text: str) -> str:
 
 def handle_callback(profile: str, payload: dict) -> str:
     value = str(payload.get('data') or '')
-    if value.startswith('rv1|'):
-        from .tasks.daily_review.notifications import callback
-        result=callback(profile,payload)
-    elif value.startswith('mk1|'):
-        from .tasks.marketplace import interface
-        result=interface.callback(profile,payload)
+    owner = next((mod.id for mod in extensions.snapshot().values()
+                  if any(value.startswith(prefix) for prefix in mod.manifest.get('callbacks', []))), None)
+    if owner:
+        result = extensions.invoke(owner, 'callback', profile, query=payload)
     elif value.startswith('st1|'):
         from . import ssh_travel
         result = ssh_travel.callback(profile, payload)
-    elif value.startswith('g3|'):
-        from .tasks.gmail import batch
-        result = batch.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
     elif value.startswith(('su1|', 'su2|')):
         from . import software_updates
         result = software_updates.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
@@ -368,8 +275,7 @@ def handle_callback(profile: str, payload: dict) -> str:
         from .inline import owns_callback
         if not owns_callback(profile, payload):
             raise ValueError('按钮不属于本人会话或原始机器人消息')
-        from .tasks.gmail import review
-        result = review.callback(profile, payload, os.environ.get('PYLON_COMMAND_ID', ''))
+        raise ValueError('按钮已失效，请重新打开对应入口')
     return encode_response(result.get('text', ''), result.get('reply_markup'))
 
 
