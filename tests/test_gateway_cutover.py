@@ -68,6 +68,8 @@ def cutover(monkeypatch, tmp_path):
     commands = []
     active_units = {
         "pylon-job-fixture.timer",
+        "pylon-job-external-digest.timer",
+        "pylon-job-manual-only.timer",
         "pylon-bot.service",
         "pylon-market-web.service",
         "chiphell-fid26-poller.service",
@@ -112,6 +114,9 @@ def cutover(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gateway, "command", fake_command)
     monkeypatch.setattr(gateway, "active", fake_active)
+    monkeypatch.setattr(gateway, "active_timers", lambda: sorted(
+        unit for unit in active_units if unit.endswith(".timer")
+    ))
     monkeypatch.setattr(gateway, "pending", fake_pending)
     monkeypatch.setattr(gateway, "query", fake_query)
     monkeypatch.setattr(gateway.time, "sleep", lambda seconds: sleep_calls.append(seconds))
@@ -139,6 +144,7 @@ def cutover(monkeypatch, tmp_path):
         "service_checks": service_checks,
         "old_files": old_files,
         "database": root / "data" / "outbox.sqlite3",
+        "active_timers": sorted(unit for unit in active_units if unit.endswith(".timer")),
     }
 
 
@@ -158,6 +164,102 @@ def _busy():
 
 def _quiet():
     return {"commands": 0, "agent_states": [], "services": []}
+
+
+def test_active_timers_enumerates_external_units_and_deduplicates(monkeypatch):
+    calls = []
+
+    def listing(argv):
+        calls.append(tuple(argv))
+        return (
+            "pylon-job-fixture.timer loaded active waiting Fixture timer\n"
+            "  pylon-job-external_digest.timer loaded activating start External timer\n"
+            "\n"
+            "pylon-job-fixture.timer loaded active waiting Fixture timer\n"
+        )
+
+    monkeypatch.setattr(gateway, "command", listing)
+
+    assert gateway.active_timers() == [
+        "pylon-job-external_digest.timer", "pylon-job-fixture.timer"
+    ]
+    assert calls == [(
+        "systemctl", "list-units", "pylon-job-*.timer", "--state=active,activating",
+        "--plain", "--no-legend", "--no-pager",
+    )]
+
+
+@pytest.mark.parametrize("output", ["", "\n  \n\t\n"])
+def test_active_timers_accepts_an_empty_listing(monkeypatch, output):
+    monkeypatch.setattr(gateway, "command", lambda _argv: output)
+
+    assert gateway.active_timers() == []
+
+
+@pytest.mark.parametrize("unit", [
+    "unrelated.timer", "pylon-job-fixture.service", "pylon-job-.timer",
+    "pylon-job-../../fixture.timer", "pylon-job-fixture.timer;true",
+    "pylon-job-fixture@one.timer", "--all", "\u25cf",
+])
+def test_active_timers_rejects_unexpected_unit_names(monkeypatch, unit):
+    monkeypatch.setattr(gateway, "command", lambda _argv: (
+        "pylon-job-valid.timer loaded active waiting Fixture\n"
+        f"{unit} loaded active waiting Invalid fixture\n"
+    ))
+
+    with pytest.raises(ValueError, match="unexpected timer listing"):
+        gateway.active_timers()
+
+
+@pytest.mark.parametrize("outcome", ["success", "quiesce", "install", "startup"])
+def test_cutover_stops_and_restores_all_active_timers_without_enabling_disabled(
+    cutover, monkeypatch, outcome
+):
+    inactive = "pylon-job-disabled.timer"
+    (cutover["root"] / "jobs.json").write_text(json.dumps({"fixture": {}, "disabled": {}}))
+    timers = cutover["active_timers"]
+    assert "pylon-job-external-digest.timer" in timers
+    # A manually active but disabled timer must resume without being enabled.
+    assert "pylon-job-manual-only.timer" in timers
+    cutover["pending"].extend([_quiet(), _busy() if outcome == "quiesce" else _quiet()])
+    command = gateway.command
+    pending = gateway.pending
+    failed = False
+
+    def drain_after_timer_stop():
+        assert ("systemctl", "stop", *timers) in cutover["commands"]
+        return pending()
+
+    def fail_once(argv):
+        nonlocal failed
+        value = tuple(str(arg) for arg in argv)
+        trigger = (
+            outcome == "install" and "pylon.module_cli" in value
+        ) or (
+            outcome == "startup" and value[:2] == ("systemctl", "start")
+        )
+        if trigger and not failed:
+            failed = True
+            raise RuntimeError(f"fixture {outcome} failure")
+        return command(argv)
+
+    monkeypatch.setattr(gateway, "pending", drain_after_timer_stop)
+    monkeypatch.setattr(gateway, "command", fail_once)
+    if outcome == "success":
+        _run(cutover, monkeypatch)
+    else:
+        match = "new work started during quiesce" if outcome == "quiesce" else f"fixture {outcome} failure"
+        with pytest.raises(RuntimeError, match=match):
+            _run(cutover, monkeypatch)
+
+    commands = cutover["commands"]
+    assert commands.count(("systemctl", "stop", *timers)) == 1
+    assert commands.count(("systemctl", "start", *timers)) == 1
+    assert not any(inactive in command for command in commands)
+    assert not any(command[:2] == ("systemctl", "enable") for command in commands)
+    receipt = json.loads((cutover["stage"] / "cutover.json").read_text())
+    assert receipt["timers"] == timers
+    assert receipt["phase"] == ("complete" if outcome == "success" else "failed-old-restored")
 
 
 def test_waiting_work_is_drained_without_killing_task_manual_or_model(cutover, monkeypatch):

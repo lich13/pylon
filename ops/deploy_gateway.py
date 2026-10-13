@@ -31,6 +31,22 @@ def active(unit):
     return command(['systemctl', 'show', unit, '-p', 'ActiveState', '--value']) in {'active', 'activating'}
 
 
+def active_timers():
+    # The gateway catalog contains only core jobs. External modules own most
+    # timers, and all existing trigger sources must stop before draining work.
+    output = command(['systemctl', 'list-units', 'pylon-job-*.timer',
+                      '--state=active,activating', '--plain', '--no-legend', '--no-pager'])
+    units = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        unit = line.split()[0]
+        if not re.fullmatch(r'pylon-job-[A-Za-z0-9_-]+\.timer', unit):
+            raise ValueError('unexpected timer listing')
+        units.append(unit)
+    return sorted(set(units))
+
+
 def ready_services(services):
     """A successful start request is not proof that the process stayed alive."""
     initial = {}
@@ -149,8 +165,7 @@ def main():
     # Prepare the build backend before quiescing production. Installation and
     # rollback must not depend on a package-index request during downtime.
     command([PYTHON, '-c', 'import setuptools; assert int(setuptools.__version__.split(".")[0]) >= 68'])
-    catalog = json.loads((ROOT / 'jobs.json').read_text())
-    timers = [f'pylon-job-{key}.timer' for key in catalog if active(f'pylon-job-{key}.timer')]
+    timers = active_timers()
     services = [unit for unit in ('pylon-bot.service', 'pylon-market-web.service', 'chiphell-fid26-poller.service',
                                  'pylon-gmail-web.service', 'pylon-gmail-worker.service') if active(unit)]
     state = {'revision': args.revision, 'previous': previous_revision, 'phase': 'draining', 'timers': timers, 'services': services}
