@@ -487,17 +487,120 @@ def test_ready_services_rejects_restart_or_pid_change(monkeypatch, changed_state
         gateway.ready_services(["pylon-bot.service"])
 
 
-def test_ready_services_rejects_auto_restart_with_no_pid(monkeypatch):
-    state = "ActiveState=activating\nSubState=auto-restart\nMainPID=0\nNRestarts=1"
+def test_ready_services_waits_for_a_cold_start_to_become_stable(monkeypatch):
+    unit = "pylon-bot.service"
+    starting = "ActiveState=activating\nSubState=start\nMainPID=0\nNRestarts=0"
+    running = "ActiveState=active\nSubState=running\nMainPID=100\nNRestarts=0"
+    outputs = iter([starting, starting, *([running] * 6)])
+    checks = []
+    sleeps = []
 
     def fake_command(argv):
-        return "activating" if "--value" in argv else state
+        checks.append(tuple(argv))
+        return next(outputs)
+
+    monkeypatch.setattr(gateway, "command", fake_command)
+    monkeypatch.setattr(gateway.time, "sleep", sleeps.append)
+
+    gateway.ready_services([unit])
+
+    assert len(checks) == 8
+    assert sleeps == [1] * 7
+
+
+def test_ready_services_waits_for_each_service_to_stabilize(monkeypatch):
+    first = "pylon-bot.service"
+    delayed = "pylon-market-web.service"
+    checks = {first: 0, delayed: 0}
+    sleeps = []
+
+    def fake_command(argv):
+        unit = argv[2]
+        checks[unit] += 1
+        if unit == delayed and checks[unit] <= 7:
+            return "ActiveState=activating\nSubState=start\nMainPID=0\nNRestarts=0"
+        pid = "100" if unit == first else "200"
+        return f"ActiveState=active\nSubState=running\nMainPID={pid}\nNRestarts=0"
+
+    monkeypatch.setattr(gateway, "command", fake_command)
+    monkeypatch.setattr(gateway.time, "sleep", sleeps.append)
+
+    gateway.ready_services([first, delayed])
+
+    # The first service is ready immediately, but the six-round stable window
+    # starts only after the delayed service is also running.
+    assert checks == {first: 13, delayed: 13}
+    assert sleeps == [1] * 12
+
+
+def test_ready_services_timeout_includes_last_observed_service_state(monkeypatch):
+    unit = "pylon-bot.service"
+    state = "ActiveState=activating\nSubState=start\nMainPID=0\nNRestarts=0"
+    checks = []
+    sleeps = []
+
+    def fake_command(argv):
+        checks.append(tuple(argv))
+        return state
+
+    monkeypatch.setattr(gateway, "command", fake_command)
+    monkeypatch.setattr(gateway.time, "sleep", sleeps.append)
+
+    with pytest.raises(RuntimeError, match="service startup did not settle") as error:
+        gateway.ready_services([unit])
+
+    assert len(checks) == 36
+    assert sleeps == [1] * 35
+    assert '"ActiveState": "activating"' in str(error.value)
+    assert '"SubState": "start"' in str(error.value)
+    assert '"MainPID": "0"' in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "ActiveState=failed\nSubState=failed\nMainPID=0\nNRestarts=0",
+        "ActiveState=activating\nSubState=auto-restart\nMainPID=0\nNRestarts=1",
+    ],
+    ids=["failed", "auto-restart"],
+)
+def test_ready_services_rejects_failed_or_auto_restart_state(monkeypatch, state):
+    unit = "pylon-bot.service"
+
+    def fake_command(argv):
+        return state
 
     monkeypatch.setattr(gateway, "command", fake_command)
 
-    assert gateway.active("pylon-bot.service")
+    with pytest.raises(RuntimeError, match="service did not stay running") as error:
+        gateway.ready_services([unit])
+
+    assert unit in str(error.value)
+    for field in state.splitlines():
+        key, value = field.split("=", 1)
+        assert f'"{key}": "{value}"' in str(error.value)
+
+
+def test_ready_services_rejects_a_service_that_drops_after_becoming_healthy(monkeypatch):
+    outputs = iter([
+        "ActiveState=active\nSubState=running\nMainPID=100\nNRestarts=0",
+        "ActiveState=activating\nSubState=start\nMainPID=0\nNRestarts=0",
+    ])
+    checks = []
+    sleeps = []
+
+    def fake_command(argv):
+        checks.append(tuple(argv))
+        return next(outputs)
+
+    monkeypatch.setattr(gateway, "command", fake_command)
+    monkeypatch.setattr(gateway.time, "sleep", sleeps.append)
+
     with pytest.raises(RuntimeError, match="service did not stay running"):
         gateway.ready_services(["pylon-bot.service"])
+
+    assert len(checks) == 2
+    assert sleeps == [1]
 
 
 def test_command_umask_keeps_generated_package_paths_and_files_readable(tmp_path):

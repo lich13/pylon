@@ -49,19 +49,37 @@ def active_timers():
 
 def ready_services(services):
     """A successful start request is not proof that the process stayed alive."""
-    initial = {}
-    for attempt in range(6):
+    initial, restarts, observed = {}, {}, {}
+    stable = 0
+    for attempt in range(36):
+        ready = True
         for unit in services:
             output = command(['systemctl', 'show', unit, '-p', 'ActiveState', '-p', 'SubState',
                               '-p', 'MainPID', '-p', 'NRestarts'])
             state = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
-            if (state.get('ActiveState') != 'active' or state.get('SubState') != 'running'
-                    or not state.get('MainPID') or state['MainPID'] == '0'):
-                raise RuntimeError('service did not stay running: ' + unit)
-            identity = (state['MainPID'], state.get('NRestarts'))
+            observed[unit] = state
+            detail = json.dumps(state, sort_keys=True)
+            if state.get('SubState') == 'auto-restart' or state.get('ActiveState') == 'failed':
+                raise RuntimeError('service did not stay running: ' + unit + ' ' + detail)
+            count = state.get('NRestarts')
+            if count != restarts.setdefault(unit, count):
+                raise RuntimeError('service restarted during startup: ' + unit + ' ' + detail)
+            running = (state.get('ActiveState') == 'active' and state.get('SubState') == 'running'
+                       and state.get('MainPID') not in (None, '', '0'))
+            if not running:
+                if unit in initial:
+                    raise RuntimeError('service did not stay running: ' + unit + ' ' + detail)
+                ready = False
+                continue
+            identity = (state['MainPID'], count)
             if identity != initial.setdefault(unit, identity):
-                raise RuntimeError('service restarted during startup: ' + unit)
-        if services and attempt < 5: time.sleep(1)
+                raise RuntimeError('service restarted during startup: ' + unit + ' ' + detail)
+        stable = stable + 1 if ready else 0
+        if stable == 6 or not services:
+            return
+        if attempt < 35:
+            time.sleep(1)
+    raise RuntimeError('service startup did not settle: ' + json.dumps(observed, sort_keys=True))
 
 
 def query(path, sql):
