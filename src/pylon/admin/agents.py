@@ -157,6 +157,12 @@ def main(args):
             output['launch_error'] = state.clean_text(exc, 500)
     elif action in {'status', 'logs'} and len(args) in {1, 2}:
         output = state.rows(args[1] if len(args) == 2 else '')
+    elif action == 'gmail-request' and len(args) == 3:
+        profile, key = args[1:]
+        state.request_key(key, profile)
+        with state.database() as db:
+            row = db.execute("SELECT tasks.* FROM requests JOIN tasks ON task_id=tasks.id WHERE requests.id=? AND profile=? AND purpose='gmail_review'", (key, profile)).fetchone()
+            output = state.public(row) if row else None
     elif args == ['results']:
         kick()
         output = state.results()

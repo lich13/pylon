@@ -103,7 +103,11 @@ def reply_to(profile, message_id, text, box=None):
         if isinstance(receipts, dict):
             receipts = [receipts]
         if any(r.get('message_id') == message_id and str(r.get('chat_id')) == owner for r in receipts or []):
-            return command('reply', json.loads(row['payload'])['agent_task'] + ' ' + text, profile)
+            task_id = json.loads(row['payload'])['agent_task']
+            tasks = invoke('status', task_id)
+            if tasks and tasks[0].get('purpose') == 'gmail_review':
+                return 'Gmail 审核已移到网页，请使用 /gmail 打开工作台。'
+            return command('reply', task_id + ' ' + text, profile)
     return None
 
 
@@ -144,13 +148,15 @@ def reconcile(box=None):
         payload = {'text': text, 'agent_task': row['id'], 'agent_state': row['status']}
         if enriched and enriched.get('card'):
             payload.update(enriched['card'])
-        box.enqueue(profile=event['profile'], job_id='agent', kind='text',
-                    payload=payload,
-                    key='agent-event:' + event['id'])
+        silent_result = bool(enriched and enriched.get('notification') == 'silent')
+        if not silent_result:
+            box.enqueue(profile=event['profile'], job_id='agent', kind='text',
+                        payload=payload,
+                        key='agent-event:' + event['id'])
         if row['cleanup'] == 'done':
             scrub_inputs(box, {row['id']})
-        # An ack means a durable notification exists, not that Telegram
-        # necessarily received it. Delivery remains the outbox's responsibility.
+        # The hook commits a silent result to its business store before returning.
+        # Otherwise ack requires a durable outbox entry, not actual delivery.
         invoke('ack', event['id'])
     cleaned = invoke('cleaned')
     scrub_inputs(box, set(cleaned['ids']))

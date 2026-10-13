@@ -114,7 +114,7 @@ def main(arguments=None):
     i = sub.add_parser('install'); i.add_argument('archives', nargs='+'); i.add_argument('--destination', type=Path); i.add_argument('--no-services', action='store_true')
     s = sub.add_parser('serve'); s.add_argument('module'); s.add_argument('service'); s.add_argument('--profile', default='webops', choices=['webops', 'default'])
     e = sub.add_parser('exec'); e.add_argument('module'); e.add_argument('entry'); e.add_argument('args', nargs=argparse.REMAINDER)
-    v = sub.add_parser('preview'); v.add_argument('module', choices=['content']); v.add_argument('--port', type=int, default=8795)
+    v = sub.add_parser('preview'); v.add_argument('module', choices=['content', 'gmail']); v.add_argument('--port', type=int, default=8795)
     c = sub.add_parser('ci'); c.add_argument('module', nargs='?', default='all'); c.add_argument('--router', action='store_true')
     args = parser.parse_args(arguments)
     source = args.source.resolve()
@@ -138,7 +138,7 @@ def main(arguments=None):
     elif args.command == 'preview':
         os.environ['PYLON_MODULES_DIR'] = str(source)
         from .module_preview import run
-        return run(args.port)
+        return run(args.port, args.module)
     return 0
 
 

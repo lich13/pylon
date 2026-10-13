@@ -137,13 +137,22 @@ def main():
     previous_revision = (ROOT / 'REVISION').read_text().strip()
     if not re.fullmatch('[0-9a-f]{40}', previous_revision): raise ValueError('invalid previous revision')
     previous = ROOT / 'gateway-releases' / previous_revision
-    if previous.exists(): raise ValueError('previous source snapshot already exists; inspect before cutover')
+    linked_previous = previous.is_dir()
+    if linked_previous:
+        for name in FILES:
+            target = ROOT / name
+            if target.exists() and (not target.is_symlink() or target.resolve() != previous / name):
+                raise ValueError('current gateway is not entirely linked to the recorded revision')
+    original_links = {name: os.readlink(ROOT / name) for name in FILES if (ROOT / name).is_symlink()}
+    registry_path = ROOT / 'modules/registry.json'
+    registry_before = registry_path.read_bytes() if registry_path.exists() else None
     # Prepare the build backend before quiescing production. Installation and
     # rollback must not depend on a package-index request during downtime.
     command([PYTHON, '-c', 'import setuptools; assert int(setuptools.__version__.split(".")[0]) >= 68'])
     catalog = json.loads((ROOT / 'jobs.json').read_text())
     timers = [f'pylon-job-{key}.timer' for key in catalog if active(f'pylon-job-{key}.timer')]
-    services = [unit for unit in ('pylon-bot.service', 'pylon-market-web.service', 'chiphell-fid26-poller.service') if active(unit)]
+    services = [unit for unit in ('pylon-bot.service', 'pylon-market-web.service', 'chiphell-fid26-poller.service',
+                                 'pylon-gmail-web.service', 'pylon-gmail-worker.service') if active(unit)]
     state = {'revision': args.revision, 'previous': previous_revision, 'phase': 'draining', 'timers': timers, 'services': services}
     save(state_path, state)
     moved, linked, switched = [], [], False
@@ -168,10 +177,14 @@ def main():
         state['phase'] = 'installing'
         state['data_before'] = storage_identity()
         save(state_path, state)
-        previous.mkdir(parents=True)
+        if not linked_previous:
+            previous.mkdir(parents=True)
         for name in FILES:
             target = ROOT / name
-            if target.exists():
+            if name in original_links:
+                target.unlink()
+                moved.append(name)
+            elif target.exists():
                 target.rename(previous / name)
                 moved.append(name)
             if (stage / name).exists():
@@ -205,7 +218,15 @@ def main():
             target = ROOT / name
             if target.is_symlink() and target.resolve() == stage / name: target.unlink()
         for name in moved:
-            (previous / name).rename(ROOT / name)
+            if name in original_links:
+                (ROOT / name).symlink_to(original_links[name])
+            else:
+                (previous / name).rename(ROOT / name)
+        if registry_before is not None and registry_path.read_bytes() != registry_before:
+            temporary = registry_path.with_suffix('.rollback')
+            temporary.write_bytes(registry_before)
+            temporary.chmod(0o644)
+            temporary.replace(registry_path)
         if previous.exists() and not any(previous.iterdir()):
             previous.rmdir()
         if moved:

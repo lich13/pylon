@@ -1,0 +1,28 @@
+[Unit]
+Description=pylon owner Gmail workspace
+After=network.target
+
+[Service]
+User=pylon
+Group=pylon
+WorkingDirectory=/srv/pylon
+Environment=PYLON_HOME=/srv/pylon
+Environment=TZ=Asia/Shanghai
+ExecStart=/srv/pylon/venv/bin/python -m pylon.cli modules serve gmail web --profile default
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/pylon/data /srv/pylon/run /srv/pylon/profiles/default/data/gmail_cleanup /srv/pylon/profiles/default/google_token.json
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

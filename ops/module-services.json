@@ -2,5 +2,9 @@
   "content": {
     "web": "pylon-market-web.service",
     "poller": "chiphell-fid26-poller.service"
+  },
+  "gmail": {
+    "web": "pylon-gmail-web.service",
+    "worker": "pylon-gmail-worker.service"
   }
 }

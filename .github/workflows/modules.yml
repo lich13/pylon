@@ -116,7 +116,7 @@ jobs:
           MODULE: ${{ inputs.module }}
         run: python -m pylon.module_cli check "$MODULE"
       - name: Browser runtime
-        if: inputs.module == 'all' || inputs.module == 'content' || inputs.module == 'software'
+        if: inputs.module == 'all' || inputs.module == 'content' || inputs.module == 'software' || inputs.module == 'gmail'
         run: python -m playwright install --with-deps --only-shell chromium
       - name: Browser acceptance
         if: inputs.module == 'all' || inputs.module == 'content' || inputs.module == 'software'
@@ -124,6 +124,9 @@ jobs:
           python "$PYLON_MODULES_DIR/content/ci/browser-smoke.py"
           python "$PYLON_MODULES_DIR/content/ci/intelligence-web.py"
           python "$PYLON_MODULES_DIR/content/ci/daily-review-web.py"
+      - name: Gmail browser acceptance
+        if: inputs.module == 'all' || inputs.module == 'gmail'
+        run: python "$PYLON_MODULES_DIR/gmail/ci/browser.py"
       - uses: docker/setup-qemu-action@v3
         if: inputs.router
         with:

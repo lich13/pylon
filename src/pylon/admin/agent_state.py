@@ -116,6 +116,7 @@ def public(row):
     result = {k: row[k] for k in ('id', 'provider', 'profile', 'status', 'created_at', 'updated_at',
                                  'runtime', 'turns', 'progress', 'cleanup', 'cleanup_error')}
     result['result'] = json.loads(row['result'])
+    result['purpose'] = row.get('purpose', 'general')
     result['settings'] = json.loads(row['settings'])
     if row['status'] == 'running' and row['started_at']:
         result['runtime'] += max(0, time.time() - row['started_at'])
@@ -173,6 +174,8 @@ def reply(task_id, profile, key, text):
         if previous:
             return public(task(db, previous[0]))
         row = task(db, task_id)
+        if row['purpose'] == 'gmail_review':
+            raise ValueError('Gmail 审核已移到网页，请使用 /gmail 打开工作台')
         if row['status'] in TERMINAL or row['cancelled']:
             raise ValueError('任务已结束；线程将自动清理，请用 /agent_codex 或 /agent_grok 发起新任务')
         if row['status'] == 'waiting' and time.time() - row['waiting_since'] >= limits()['waiting_seconds']:

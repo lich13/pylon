@@ -277,6 +277,98 @@ def test_success_switches_sources_to_stage_and_preserves_data(cutover, monkeypat
     assert runtime_import_index < service_start_index
 
 
+def _link_previous_release(cutover, *, relative):
+    root = cutover["root"]
+    previous = root / "gateway-releases" / PREVIOUS
+    previous.mkdir()
+    links = {}
+    for name in gateway.FILES:
+        target = root / name
+        target.rename(previous / name)
+        destination = Path("gateway-releases") / PREVIOUS / name if relative else previous / name
+        target.symlink_to(destination, target_is_directory=(previous / name).is_dir())
+        links[name] = os.readlink(target)
+    registry = root / "modules" / "registry.json"
+    registry.parent.mkdir()
+    original_registry = b'{"version":1,"modules":{"gmail":"releases/gmail/old"},"previous":{"gmail":"releases/gmail/older"}}\n'
+    registry.write_bytes(original_registry)
+    return previous, links, registry, original_registry
+
+
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute-links", "relative-links"])
+def test_linked_previous_release_can_switch_without_changing_its_snapshot(cutover, monkeypatch, relative):
+    previous, _links, registry, _original_registry = _link_previous_release(cutover, relative=relative)
+    cutover["pending"].extend([_quiet(), _quiet()])
+    before = gateway.storage_identity()
+    command = gateway.command
+    installed_registry = b'{"version":1,"modules":{"gmail":"releases/gmail/new"},"previous":{"gmail":"releases/gmail/old"}}\n'
+
+    def install(argv):
+        if "pylon.module_cli" in argv:
+            registry.write_bytes(installed_registry)
+        return command(argv)
+
+    monkeypatch.setattr(gateway, "command", install)
+    _run(cutover, monkeypatch)
+
+    assert registry.read_bytes() == installed_registry
+    assert (cutover["root"] / "REVISION").read_text() == REVISION + "\n"
+    assert gateway.storage_identity() == before
+    for name, content in cutover["old_files"].items():
+        target = previous / name
+        assert (target.read_bytes() if target.is_file() else (target / "marker.txt").read_bytes()) == content
+        assert (cutover["root"] / name).resolve() == cutover["stage"] / name
+    assert json.loads((cutover["stage"] / "cutover.json").read_text())["phase"] == "complete"
+
+
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute-links", "relative-links"])
+@pytest.mark.parametrize("failure", ["install", "startup"])
+def test_linked_previous_failure_restores_exact_links_and_registry_before_services(cutover, monkeypatch, relative, failure):
+    previous, links, registry, original_registry = _link_previous_release(cutover, relative=relative)
+    cutover["pending"].extend([_quiet(), _quiet()])
+    root = cutover["root"]
+    before = gateway.storage_identity()
+    command = gateway.command
+    failed = False
+    restore_starts = []
+
+    def fail_once(argv):
+        nonlocal failed
+        value = tuple(str(arg) for arg in argv)
+        if "pylon.module_cli" in value:
+            registry.write_text('{"modules":{"gmail":"releases/gmail/new"}}\n')
+            if failure == "install":
+                failed = True
+                raise RuntimeError("fixture linked install failed")
+        if value[:2] == ("systemctl", "start"):
+            if failure == "startup" and not failed:
+                assert (root / "REVISION").read_text() == REVISION + "\n"
+                failed = True
+                raise RuntimeError("fixture linked startup failed")
+            if failed:
+                assert registry.read_bytes() == original_registry
+                assert {name: os.readlink(root / name) for name in gateway.FILES} == links
+                assert (root / "REVISION").read_text() == PREVIOUS + "\n"
+                restore_starts.append(value)
+        return command(argv)
+
+    monkeypatch.setattr(gateway, "command", fail_once)
+    with pytest.raises(RuntimeError, match=f"fixture linked {failure} failed"):
+        _run(cutover, monkeypatch)
+
+    assert restore_starts
+    assert registry.read_bytes() == original_registry
+    assert not registry.with_suffix(".rollback").exists()
+    assert gateway.storage_identity() == before
+    for name, content in cutover["old_files"].items():
+        assert (root / name).resolve() == previous / name
+        target = previous / name
+        assert (target.read_bytes() if target.is_file() else (target / "marker.txt").read_bytes()) == content
+    state = json.loads((cutover["stage"] / "cutover.json").read_text())
+    assert state["phase"] == "failed-old-restored"
+    assert state["previous"] == PREVIOUS
+
+
 @pytest.mark.parametrize("changed_state", [
     "ActiveState=active\nSubState=running\nMainPID=100\nNRestarts=1",
     "ActiveState=active\nSubState=running\nMainPID=200\nNRestarts=0",

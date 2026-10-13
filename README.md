@@ -15,6 +15,7 @@ python3.12 -m venv .venv
 .venv/bin/python -m pytest -q tests
 .venv/bin/python -m pylon.module_cli check itunes
 .venv/bin/python -m pylon.module_cli preview content
+.venv/bin/python -m pylon.module_cli preview gmail --port 8797
 ```
 
 模块入口自动发现相邻工作区，也可用 `--source` 或 `PYLON_MODULES_DIR` 指定。预览只绑定回环地址并使用临时样本数据库，退出时删除样本，不读取生产凭据。
@@ -56,4 +57,4 @@ python3.12 -m venv .venv
 
 `ops/bootstrap.py` 安装受控入口与任务单元，不启用调度。首次结构迁移先暂停新触发，等待在途任务结束，保留服务启用状态和 outbox，再安装核心与外置版本、恢复原先服务。日常业务更新使用模块入口，无需重复 bootstrap 或数据库迁移。
 
-现有三处网页地址、登录、反馈与 Grok 配置保持原协议。软件维护仅提供 `/update_codex` 与 `/update_grok`；先检查 stable 与实装版本，有更新才调用原生安装器，并持久化回报。旧 `/updates`、系统包按钮和每周汇总已下线，历史记录保留。所有操作由本人鉴权；不提供外置脚本的 root 执行入口。
+Gmail 通过独立外置 web/worker 提供 `/pylon/gmail/`，与现有三个工作区共用 `pylon.sdk.web_auth` 本人会话。两机器人 `/gmail` 都提供入口；旧编辑卡片停用，正常结果只保存到网页，失败与不确定结果继续提醒。Gmail 模块部署与回退只影响其两个服务。现有网页地址、反馈与 Grok 配置保持原协议。软件维护仅提供 `/update_codex` 与 `/update_grok`；先检查 stable 与实装版本，有更新才调用原生安装器，并持久化回报。旧 `/updates`、系统包按钮和每周汇总已下线，历史记录保留。所有操作由本人鉴权；不提供外置脚本的 root 执行入口。
