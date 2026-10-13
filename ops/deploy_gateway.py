@@ -6,6 +6,7 @@ root ownership. This operation drains existing work without killing it.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -80,6 +81,16 @@ def ready_services(services):
         if attempt < 35:
             time.sleep(1)
     raise RuntimeError('service startup did not settle: ' + json.dumps(observed, sort_keys=True))
+
+
+def control_guard(services):
+    # The bot reconciles the poller with its timer. During cutover a stopped
+    # timer means quiescing, not a user pause. Keep that existing controller
+    # locked until both services and their original timers have been restored.
+    if 'chiphell-fid26-poller.service' in services:
+        from pylon.admin.chiphell import cookie_import_lock
+        return cookie_import_lock()
+    return contextlib.nullcontext()
 
 
 def query(path, sql):
@@ -236,9 +247,10 @@ def main():
         switched = True
         state['phase'] = 'starting'
         save(state_path, state)
-        if services: command(['systemctl', 'start', *services])
-        ready_services(services)
-        if timers: command(['systemctl', 'start', *timers])
+        with control_guard(services):
+            if services: command(['systemctl', 'start', *services])
+            ready_services(services)
+            if timers: command(['systemctl', 'start', *timers])
         state['phase'] = 'complete'
         save(state_path, state)
         print(json.dumps({'phase': 'complete', 'revision': args.revision}), flush=True)
@@ -267,8 +279,9 @@ def main():
             command([PYTHON, '-m', 'pip', 'install', '--no-deps', '--no-build-isolation', '-e', ROOT])
             command([PYTHON, ROOT / 'ops/bootstrap.py'])
             (ROOT / 'REVISION').write_text(previous_revision + '\n')
-        if services: command(['systemctl', 'start', *services])
-        if timers: command(['systemctl', 'start', *timers])
+        with control_guard(services):
+            if services: command(['systemctl', 'start', *services])
+            if timers: command(['systemctl', 'start', *timers])
         state['phase'] = 'failed-old-restored'
         save(state_path, state)
         raise

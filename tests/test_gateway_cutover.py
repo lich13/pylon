@@ -4,12 +4,14 @@ import os
 import sqlite3
 import stat
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from ops import deploy_gateway as gateway
+from pylon.admin import chiphell
 from pylon import bot_menu, module_store, module_units
 
 
@@ -52,6 +54,10 @@ def _write_profile_state(root: Path) -> None:
 def cutover(monkeypatch, tmp_path):
     root = tmp_path / "root"
     root.mkdir()
+    chiphell_data = tmp_path / "chiphell-fid26-data"
+    monkeypatch.setattr(chiphell, "DATA_ROOT", chiphell_data)
+    monkeypatch.setattr(chiphell, "IMPORT_LOCK_PATH", chiphell_data / ".cookie-import.lock")
+    monkeypatch.setattr(chiphell, "IMPORT_TRANSACTION_PATH", chiphell_data / ".cookie-import-transaction.json")
     stage = _write_tree(root, REVISION, "new")
     (root / "REVISION").write_text(PREVIOUS + "\n")
     (root / "jobs.json").write_text(json.dumps({"fixture": {}}) + "\n")
@@ -73,6 +79,7 @@ def cutover(monkeypatch, tmp_path):
         "pylon-bot.service",
         "pylon-market-web.service",
         "chiphell-fid26-poller.service",
+        f"pylon-job-{chiphell.CRON_ID}.timer",
     }
     pending_values = []
     query_calls = []
@@ -260,6 +267,119 @@ def test_cutover_stops_and_restores_all_active_timers_without_enabling_disabled(
     receipt = json.loads((cutover["stage"] / "cutover.json").read_text())
     assert receipt["timers"] == timers
     assert receipt["phase"] == ("complete" if outcome == "success" else "failed-old-restored")
+
+
+@pytest.mark.parametrize("fail_start", [False, True], ids=["success", "rollback"])
+def test_cutover_restores_services_and_timers_under_real_chiphell_lock(
+    cutover, monkeypatch, fail_start
+):
+    cutover["pending"].extend([_quiet(), _quiet()])
+    chiphell_timer = f"pylon-job-{chiphell.CRON_ID}.timer"
+    original_lock = chiphell.cookie_import_lock
+    lock_attempts = []
+    reconciliations = []
+    guarded_service_starts = []
+    guarded_timer_starts = []
+    controller_stop_attempts = []
+    controller_timer_active = True
+    failed = False
+
+    @contextmanager
+    def tracked_real_lock():
+        attempt = {"outcome": "attempting"}
+        lock_attempts.append(attempt)
+        try:
+            with original_lock():
+                attempt["outcome"] = "acquired"
+                yield
+        except chiphell.CookieImportFailure as error:
+            attempt["outcome"] = "busy"
+            attempt["error"] = error.render()
+            raise
+
+    def controller_run(argv, *, check=True, capture=False):
+        command = tuple(str(value) for value in argv)
+        if command == ("systemctl", "is-active", "--quiet", chiphell_timer):
+            return SimpleNamespace(returncode=0 if controller_timer_active else 3)
+        if command == ("systemctl", "is-active", "--quiet", chiphell.SERVICE):
+            return SimpleNamespace(returncode=0)
+        if command == ("systemctl", "stop", chiphell.SERVICE):
+            controller_stop_attempts.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(chiphell, "cookie_import_lock", tracked_real_lock)
+    monkeypatch.setattr(chiphell, "run", controller_run)
+    command = gateway.command
+
+    def systemctl_with_controller(argv):
+        nonlocal controller_timer_active, failed
+        value = tuple(str(item) for item in argv)
+
+        if value[:2] == ("systemctl", "stop") and chiphell_timer in value:
+            controller_timer_active = False
+        if value[:2] == ("systemctl", "start") and chiphell_timer in value:
+            # The cutover guard remains active through timer restoration.
+            with pytest.raises(chiphell.CookieImportFailure, match="REMOTE_VALIDATION_FAILED"):
+                with original_lock():
+                    pass
+            guarded_timer_starts.append(value)
+            controller_timer_active = True
+        if value[:2] == ("systemctl", "start") and "pylon-bot.service" in value:
+            # A separate file descriptor must fail to acquire the real lock
+            # while services are being restored, in both success and rollback.
+            with pytest.raises(chiphell.CookieImportFailure, match="REMOTE_VALIDATION_FAILED"):
+                with original_lock():
+                    pass
+            guarded_service_starts.append(value)
+
+        result = command(argv)
+        if value[:2] == ("systemctl", "start") and "pylon-bot.service" in value:
+            before = len(lock_attempts)
+            chiphell.command_reconcile()
+            assert len(lock_attempts) == before + 1
+            attempt = lock_attempts[-1]
+            assert attempt["outcome"] == "busy"
+            assert "status=BUSY" in attempt["error"]
+            reconciliations.append(value)
+            if fail_start and not failed:
+                failed = True
+                raise RuntimeError("fixture bot startup failure")
+        return result
+
+    monkeypatch.setattr(gateway, "command", systemctl_with_controller)
+    if fail_start:
+        with pytest.raises(RuntimeError, match="fixture bot startup failure"):
+            _run(cutover, monkeypatch)
+    else:
+        _run(cutover, monkeypatch)
+
+    state = json.loads((cutover["stage"] / "cutover.json").read_text())
+    assert state["phase"] == ("failed-old-restored" if fail_start else "complete")
+    assert guarded_service_starts
+    assert guarded_timer_starts
+    assert len(reconciliations) == len(guarded_service_starts)
+    assert controller_stop_attempts == []
+
+    # Reconciliation can acquire the same lock and act normally after exit.
+    controller_timer_active = False
+    chiphell.command_reconcile()
+    assert lock_attempts[-1]["outcome"] == "acquired"
+    assert controller_stop_attempts == [("systemctl", "stop", chiphell.SERVICE)]
+
+
+def test_control_guard_without_poller_does_not_acquire_chiphell_lock(monkeypatch, tmp_path):
+    lock_path = tmp_path / "chiphell-fid26-data" / ".cookie-import.lock"
+    monkeypatch.setattr(chiphell, "DATA_ROOT", lock_path.parent)
+    monkeypatch.setattr(chiphell, "IMPORT_LOCK_PATH", lock_path)
+
+    def unexpected_lock():
+        raise AssertionError("gateway without the Chiphell poller must not acquire its lock")
+
+    monkeypatch.setattr(chiphell, "cookie_import_lock", unexpected_lock)
+    with gateway.control_guard(["pylon-bot.service"]):
+        pass
+
+    assert not lock_path.exists()
 
 
 def test_waiting_work_is_drained_without_killing_task_manual_or_model(cutover, monkeypatch):
