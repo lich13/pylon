@@ -9,12 +9,47 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn open_task_lock(path: &Path) -> Result<File> {
+    // O_CREAT on an existing lock owned by the previous runtime UID is denied
+    // by Linux protected_regular in a shared sticky directory, even for root.
+    // Open the same inode without O_CREAT, and create only when it is absent.
+    for _ in 0..4 {
+        let existing = fs::OpenOptions::new()
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path);
+        let file = match existing {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::OpenOptions::new()
+                    .append(true)
+                    .create_new(true)
+                    .mode(0o660)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(path)
+                {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            file.metadata()?.is_file(),
+            "task lock is not a regular file"
+        );
+        return Ok(file);
+    }
+    anyhow::bail!("task lock changed repeatedly during open")
+}
 
 pub struct Lease {
     _file: File,
@@ -422,14 +457,10 @@ pub async fn execute(config: &Config, id: &str) -> Result<i32> {
     let (catalog, _lease) = snapshot(config)?;
     let (module, job) = catalog.job(id)?;
     fs::create_dir_all(config.home.join("run"))?;
-    let lock =
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(config.home.join("run").join(format!(
-                "{}.lock",
-                if job.lock.is_empty() { id } else { &job.lock }
-            )))?;
+    let lock = open_task_lock(&config.home.join("run").join(format!(
+        "{}.lock",
+        if job.lock.is_empty() { id } else { &job.lock }
+    )))?;
     if lock.try_lock_exclusive().is_err() {
         return Ok(0);
     }
@@ -441,15 +472,11 @@ pub async fn execute(config: &Config, id: &str) -> Result<i32> {
         .unwrap_or(if job.model { 2 } else { 4 });
     let mut quota = None;
     for slot in 0..maximum {
-        let file =
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(config.home.join("run").join(format!(
-                    "quota-{}-{}-{slot}.lock",
-                    job.topic,
-                    if job.model { "model" } else { "process" }
-                )))?;
+        let file = open_task_lock(&config.home.join("run").join(format!(
+            "quota-{}-{}-{slot}.lock",
+            job.topic,
+            if job.model { "model" } else { "process" }
+        )))?;
         if file.try_lock_exclusive().is_ok() {
             quota = Some(file);
             break;

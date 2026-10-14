@@ -28,7 +28,7 @@ jobs:
       - name: Root broker and module deployment
         env:
           PYLON_GATEWAY_BIN: ${{ github.workspace }}/target/release/pylon
-        run: sudo --preserve-env=PYLON_GATEWAY_BIN "$(which python)" -m pytest -q tests/rust_contract/test_gateway_security.py tests/rust_contract/test_module_activation_linux.py
+        run: sudo --preserve-env=PYLON_GATEWAY_BIN "$(which python)" -m pytest -q tests/rust_contract/test_gateway_security.py tests/rust_contract/test_module_activation_linux.py tests/rust_contract/test_legacy_job_locks.py
       - name: Package Linux gateway
         run: |
           mkdir -p dist
