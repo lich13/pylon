@@ -1,60 +1,60 @@
-# Pylon 网关
+# Pylon
 
-Pylon 负责机器人连接、本人鉴权、可靠投递、任务执行、systemd 接入与受限管理操作。业务在相邻普通目录 `pylon-tasks` 独立维护，不纳入此 Git 仓库。
+Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、共享网页登录、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
-## 开发
+## 本机开发
 
-Python 3.12，日常开发与针对性检查在本机执行，不使用 Grok Cloud。
-
-```sh
-python3.12 -m venv .venv
-.venv/bin/python -m pip install --require-hashes -r requirements.lock
-.venv/bin/python -m pip install --no-deps -e .
-.venv/bin/python -m pip install --require-hashes -r ../pylon-tasks/requirements.lock
-.venv/bin/python -m pip install pytest==9.1.1
-.venv/bin/python -m pytest -q tests
-.venv/bin/python -m pylon.module_cli check itunes
-.venv/bin/python -m pylon.module_cli preview content
-.venv/bin/python -m pylon.module_cli preview gmail --port 8797
-```
-
-模块入口自动发现相邻工作区，也可用 `--source` 或 `PYLON_MODULES_DIR` 指定。预览只绑定回环地址并使用临时样本数据库，退出时删除样本，不读取生产凭据。
-
-## 结构与接口
-
-- `src/pylon/`：网关、受限管理与模块生命周期。
-- `src/pylon/sdk/`：版本 1 的路径、事件、状态、锁、事务和模型请求接口。
-- `jobs.json`：只保留受控核心任务。
-- `ops/`：可信 systemd 模板、sudo 边界与服务绑定。
-- 外置 `module.json`：业务任务、定时规则、命令、按钮前缀、依赖与执行入口。
-
-网关校验整个候选注册表，拒绝重复标识、不兼容协议、越界命名空间和特权任务。业务只在普通用户独立进程执行，通过 JSON 交换请求与结果；网关与 root 管理入口不导入外置实现。受限 Cookie 控制所需 Playwright 由业务运行时锁文件安装，root 只导入受控校验代码。
-
-任务启动时固定模块版本和依赖，进程租约保护这些源码，部署不会杀死正在等待模型的任务。保留原数据库位置、表名、任务 ID、去重键与游标；投递不确定记录不会自动重发。
-
-扩展处理器通过 `pylon.sdk.serve(handle)` 接收 `{api_version: 1, action, profile, payload}`，返回 `{api_version: 1, value}`。处理器日志写到 stderr，stdout 只传 JSON。普通命令处理器有 150 秒边界；长任务由清单 `jobs` 交给 runner，保留各任务原有 `timeout`，其中 `null` 表示持续等待。
-
-业务使用 `pylon.sdk.events` 报告结果和投递，使用 `Outbox.connect()` 管理事务，使用 `profile_root()` 与 `sdk.paths` 访问原状态目录。业务之间的依赖写入 `requires`；业务工具放在外置模块中。SDK 的权限校验、回调签名与状态语义变化才需要网关兼容验证。
-
-## 模块更新
+使用 `rust-toolchain.toml` 和 `Cargo.lock` 固定工具链与依赖；日常工作不依赖云端开发环境。
 
 ```sh
-.venv/bin/python -m pylon.module_cli check software
-.venv/bin/python -m pylon.module_cli ci content
-.venv/bin/python -m pylon.module_cli deploy itunes --host tencent-cloud
-.venv/bin/python -m pylon.module_cli rollback itunes --host tencent-cloud
+cargo build --locked
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+.venv/bin/python -m pytest -q tests/rust_contract
 ```
 
-`check` 自动包含反向依赖。普通业务变更不修改网关版本、不要求 Git 提交或正式 Release。源包只包含清单和源码，校验 SHA-256 后进入不可变版本目录；候选在隔离数据下以普通用户检查，注册表原子切换，失败保留旧版本。部署记录内容哈希，保留当前、上一版以及仍被运行任务引用的版本。
+Python 3.12 和测试依赖仅用于黑盒契约测试。正式网关是单一 Rust 可执行文件，不需要 Python 网关包。外置 Python 业务使用自己的锁文件及 `pylon_sdk`。
 
-业务脚本更新不重启网关。服务绑定由网关 `ops/module-services.json` 控制，内容套件更新只重启相应网页和采集服务。任务描述变更拒绝影响仍在运行的任务；数据或协议变化需要专门迁移。
+GitHub Actions 执行完整网关检查与 Linux root 权限测试，产出 `pylon-linux-x86_64`、`SHA256SUMS` 和 `REVISION`。生产使用对应提交的 CI 成品。
 
-私有 `modules.yml` 接收临时源码包与网关提交 SHA，验证哈希后执行受影响测试及必要网页检查，结束后删除临时草稿和输入 artifact。`ci content --router` 额外验证 ARM64 镜像。网关 push 只触发核心测试；接口、权限、调度或投递语义变更还需提交外置兼容 CI。
+## 扩展边界
 
-## 生产
+`module.json` v2 注册命令、回调、生命周期钩子、任务、服务、网页路径、通知主题与权限申请。注册表冲突、依赖循环或配置不兼容时保留上次有效版本。协议见 [扩展协议](docs/extensions.md)。
 
-生产继续由腾讯云 systemd 运行。本机只是开发、预览和部署入口。`/srv/pylon/src`、虚拟环境和模块版本由 root 持有，运行用户只有业务状态写权限；不要将安装目录改归运行用户。
+业务通过 Unix socket 上的 JSON API 调用投递、回执、任务与登录能力，不能连接网关数据库。业务结果及本地待投递记录在同一业务事务中提交，再按事件 ID 幂等转交；结果不确定时只核对，不自动重放。
 
-`ops/bootstrap.py` 安装受控入口与任务单元，不启用调度。首次结构迁移先暂停新触发，等待在途任务结束，保留服务启用状态和 outbox，再安装核心与外置版本、恢复原先服务。日常业务更新使用模块入口，无需重复 bootstrap 或数据库迁移。
+```sh
+target/debug/pylon modules check example --directory ../pylon-tasks
+target/debug/pylon modules preview example --directory ../pylon-tasks --port 8795
+target/debug/pylon modules deploy example --directory ../pylon-tasks --host production-alias
+target/debug/pylon modules ci example --directory ../pylon-tasks --gateway .
+```
 
-Gmail 通过独立外置 web/worker 提供 `/pylon/gmail/`，与现有三个工作区共用 `pylon.sdk.web_auth` 本人会话。两机器人 `/gmail` 都提供入口；旧编辑卡片停用，正常结果只保存到网页，失败与不确定结果继续提醒。Gmail 模块部署与回退只影响其两个服务。现有网页地址、反馈与 Grok 配置保持原协议。软件维护仅提供 `/update_codex` 与 `/update_grok`；先检查 stable 与实装版本，有更新才调用原生安装器，并持久化回报。旧 `/updates`、系统包按钮和每周汇总已下线，历史记录保留。所有操作由本人鉴权；不提供外置脚本的 root 执行入口。
+服务器上 `pylon modules rollback example --activate` 回到上一模块版本。普通部署只重启该模块的服务；网关进程和其他模块保持运行。在途任务固定启动时的源码版本。数据版本变化要求冻结新触发并等待相关任务结束。
+
+外置源码需要 CI 时使用私有仓库的临时哈希校验包，运行后删除输入包，不把业务源码提交回网关仓库。
+
+## 机器人与路由
+
+`config/bots.json` 保存机器人标识、本人 ID、凭据引用、数据工作区、主题路由和资源配额。真实 token 单独保存为 `gateway/secrets/` 下的 0600 文件，仅网关运行用户可读。
+
+```sh
+pylon bots add example --owner 123456 --username example_bot
+pylon bots check --online
+pylon routes topic_example example
+pylon bots reload
+pylon bots disable example
+```
+
+`bots add` 从隐藏的终端输入读取 token，也支持受控标准输入；不要把 token 放入命令参数。重复凭据拒绝注册。配置约五秒内生效，无需编译或重启。新增机器人等待本人先发起私聊后才投递，待发事件保持在队列。
+
+机器人各自保留 Telegram 游标、退避及队列。主题路由变更只影响新事件，旧消息和待发记录仍属于原机器人。网页登录按同一本人共享；机器人归属与业务数据工作区相互独立。
+
+## 运行与迁移
+
+`pylon modules render <目录>` 生成通用 systemd 模板。网关使用专用普通用户；Rust executor 以受控监督进程运行，所有扩展子进程切换到模块各自的普通 UID。root broker 只执行管理员明确授权、root 持有的固定 helper，不接收任意 root 命令。
+
+HTTPS 代理统一转发 `/pylon/` 到回环网关，网页路径由注册表决定；模块网页仅监听回环地址。共享登录、CSRF 和回调签名通过 SDK 访问。
+
+升级前保留生产状态并冻结新触发。一次性 `pylon migrate --source <业务数据库> --mapping <归属映射>` 要求目标为空及在途任务已结束，保留事件 ID、回执、不确定状态、游标和登录会话。业务表留在业务数据库。收到新流量后不能直接恢复旧数据库快照，必须先保留并合并新增状态。

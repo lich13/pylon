@@ -93,28 +93,35 @@ jobs:
       - name: Extract verified modules
         env:
           SOURCE_SHA: ${{ inputs.sha256 }}
-          PYTHONPATH: src
         run: |
           python - <<'PY'
-          import os
+          import os,tarfile,hashlib,json
           from pathlib import Path
-          from pylon.module_ci import extract
-          from pylon.extensions import registry
+          archive=Path(os.environ['RUNNER_TEMP'])/'input/source.tar.gz'
+          assert hashlib.sha256(archive.read_bytes()).hexdigest()==os.environ['SOURCE_SHA']
           source=Path(os.environ['RUNNER_TEMP'])/'pylon-tasks'
-          extract(Path(os.environ['RUNNER_TEMP'])/'input/source.tar.gz',source,os.environ['SOURCE_SHA'])
-          modules=registry(source)
+          seen=set();total=0
+          with tarfile.open(archive) as bundle:
+              for member in bundle:
+                  path=Path(member.name)
+                  assert member.isfile() and not path.is_absolute() and '..' not in path.parts and member.name not in seen
+                  total+=member.size;assert total<128*1024**2
+                  seen.add(member.name);target=source/path;target.parent.mkdir(parents=True,exist_ok=True)
+                  with target.open('xb') as output: output.write(bundle.extractfile(member).read())
+                  target.chmod(0o755 if member.mode&0o111 else 0o644)
+          modules=[p.parent for p in source.glob('*/module.json')]
           with open(os.environ['GITHUB_ENV'],'a') as output:
               output.write('PYLON_MODULES_DIR='+str(source)+'\n')
               output.write('PYLON_GATEWAY_ROOT='+os.environ['GITHUB_WORKSPACE']+'\n')
-              output.write('PYTHONPATH='+os.pathsep.join([str(Path.cwd()/'src'),str(source),*(str(m.root/'src') for m in modules.values())])+'\n')
+              output.write('PYTHONPATH='+os.pathsep.join([str(source/'sdk/src'),str(source/'privileged/src'),str(source),*(str(p/'src') for p in modules)])+'\n')
               output.write('PLAYWRIGHT_BROWSERS_PATH='+os.environ['RUNNER_TEMP']+'/playwright\n')
           PY
       - run: python -m pip install --require-hashes -r "$PYLON_MODULES_DIR/requirements.lock"
-      - run: python -m pip install --no-deps -e . && python -m pip install pytest==9.1.1
+      - run: python -m pip install pytest==9.1.1
       - name: Module regression
         env:
           MODULE: ${{ inputs.module }}
-        run: python -m pylon.module_cli check "$MODULE"
+        run: python -m pylon_sdk.tools check "$MODULE"
       - name: Browser runtime
         if: inputs.module == 'all' || inputs.module == 'content' || inputs.module == 'software' || inputs.module == 'gmail'
         run: python -m playwright install --with-deps --only-shell chromium

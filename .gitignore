@@ -12,4 +12,5 @@ secrets/
 profiles/
 runtime/
 dist/
+target/
 *.tar.gz

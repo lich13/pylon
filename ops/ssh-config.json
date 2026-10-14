@@ -1,5 +1,0 @@
-{
-  "user": "ubuntu",
-  "trusted_fingerprints": ["SHA256:3CJpUYXM+ZnD00g+bOTfZCskIVwH61ePo+sgZ7ERW5k"],
-  "static_cidrs": ["111.201.0.0/16", "124.127.0.0/16", "36.112.0.0/16"]
-}

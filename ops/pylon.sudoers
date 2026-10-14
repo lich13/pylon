@@ -1,1 +1,0 @@
-pylon ALL=(root) NOPASSWD: /usr/local/sbin/pylon-admin *

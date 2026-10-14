@@ -1,4 +1,4 @@
-name: Gateway tests
+name: Rust gateway
 on: [push, pull_request]
 permissions:
   contents: read
@@ -9,9 +9,35 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install --require-hashes -r requirements.lock
-      - run: python -m pip install --no-deps -e . && python -m pip install pytest==9.1.1
-      - run: python -m pytest -q tests
+      - run: python -m pip install pytest==9.1.1 httpx==0.28.1
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+      - name: Gateway contracts
+        env:
+          PYLON_GATEWAY_BIN: ${{ github.workspace }}/target/release/pylon
+        run: python -m pytest -q tests/rust_contract
+      - name: Root broker and module deployment
+        env:
+          PYLON_GATEWAY_BIN: ${{ github.workspace }}/target/release/pylon
+        run: sudo --preserve-env=PYLON_GATEWAY_BIN "$(which python)" -m pytest -q tests/rust_contract/test_gateway_security.py tests/rust_contract/test_module_activation_linux.py
+      - name: Package Linux gateway
+        run: |
+          mkdir -p dist
+          cp target/release/pylon dist/pylon-linux-x86_64
+          sha256sum dist/pylon-linux-x86_64 > dist/SHA256SUMS
+          git rev-parse HEAD > dist/REVISION
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pylon-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
