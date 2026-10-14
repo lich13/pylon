@@ -535,7 +535,7 @@ fn health_candidate(
 ) -> Result<()> {
     use std::{
         io::Write,
-        os::unix::{fs::PermissionsExt, process::CommandExt},
+        os::unix::fs::PermissionsExt,
         process::Stdio,
         time::{Duration, Instant},
     };
@@ -623,19 +623,10 @@ fn health_candidate(
             );
         let output = root.join("health.json");
         cmd.current_dir(&root)
-            .uid(user.uid)
-            .gid(user.gid)
             .stdin(Stdio::piped())
             .stdout(std::fs::File::create(&output)?)
             .stderr(Stdio::null());
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setgroups(0, std::ptr::null()) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        crate::child_identity(&mut cmd, user.uid, user.gid);
         let mut child = cmd.spawn()?;
         child.stdin.take().unwrap().write_all(serde_json::json!({"api_version":2,"action":"health","profile":module.manifest.workspace,"payload":{}}).to_string().as_bytes())?;
         let deadline = Instant::now() + Duration::from_secs(60);

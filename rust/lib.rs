@@ -10,6 +10,23 @@ pub mod modules;
 pub mod runtime;
 pub mod telegram;
 
+pub(crate) fn child_identity(command: &mut std::process::Command, uid: u32, gid: u32) {
+    use std::os::unix::process::CommandExt;
+    // Command's uid/gid setters run before pre_exec. Drop supplementary groups
+    // while still privileged, then permanently change the primary GID and UID.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setgroups(0, std::ptr::null()) != 0
+                || libc::setgid(gid) != 0
+                || libc::setuid(uid) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 pub fn now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

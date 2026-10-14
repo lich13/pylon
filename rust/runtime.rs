@@ -226,15 +226,7 @@ pub async fn process(
             user.uid != 0 && user.gid != 0,
             "business processes cannot run as root"
         );
-        cmd.uid(user.uid).gid(user.gid);
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setgroups(0, std::ptr::null()) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        crate::child_identity(cmd.as_std_mut(), user.uid, user.gid);
     } else {
         ensure!(
             config.offline,
