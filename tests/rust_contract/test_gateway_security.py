@@ -6,6 +6,7 @@ starts the listener without ``--offline`` and disables every fixture bot.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -466,6 +467,7 @@ def _unix_socket_accepts(path: Path) -> bool:
         return False
 
 
+@contextmanager
 def _running_root_broker(home: Path):
     process = subprocess.Popen(
         [str(BIN), "--home", str(home), "broker"],

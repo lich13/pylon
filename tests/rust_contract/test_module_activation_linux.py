@@ -511,10 +511,6 @@ def test_live_activation_and_rollback_restart_only_the_changed_module():
                 gateway_template = gateway_template.replace(
                     readonly_path, f"ReadWritePaths={home}\n", 1
                 )
-                assert module_template.count(readonly_path) == 1
-                module_template = module_template.replace(
-                    readonly_path, f"ReadWritePaths={home}\n", 1
-                )
                 service_section = "[Service]\n"
                 assert gateway_template.count(service_section) == 1
                 gateway_template = gateway_template.replace(
@@ -540,6 +536,11 @@ def test_live_activation_and_rollback_restart_only_the_changed_module():
                 _systemctl("daemon-reload")
                 _systemctl("enable", "--now", GATEWAY_UNIT)
                 gateway_pid = _wait_main_pid(GATEWAY_UNIT)
+                wait_for(
+                    lambda: _gateway_cli(home, "rpc", "health").returncode == 0,
+                    timeout=20.0,
+                    interval=0.1,
+                )
                 assert telegram.method_counts() == {}
                 assert _binary_hash(binary_copy) == _binary_hash(BIN)
 
