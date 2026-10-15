@@ -567,16 +567,24 @@ pub async fn serve_web(app: App, port: u16) -> Result<()> {
 
 /// Public operational summary. Never expose credentials, message payloads, or context tokens.
 pub async fn diagnostics(app: &App) -> Result<Value> {
-    let snapshot = app.snapshot.read().await;
+    let snapshot = app.snapshot.read().await.clone();
+    let app = app.clone();
+    // Historical queries must not occupy Telegram's async workers or the registry lock.
+    tokio::task::spawn_blocking(move || diagnostics_snapshot(&app, &snapshot))
+        .await
+        .context("diagnostics worker failed")?
+}
+
+fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
     let db = app.store.connect()?;
     let mut q = db.prepare("SELECT profile,status,count(*) FROM events GROUP BY profile,status")?;
     let deliveries=q.query_map([],|r|Ok(json!({"bot":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"count":r.get::<_,u64>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     let mut q=db.prepare("SELECT id,job_id,status,finished_at FROM runs WHERE status IN ('failed','uncertain') ORDER BY started_at DESC LIMIT 10")?;
     let failures=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"finished_at":r.get::<_,Option<f64>>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
-    let mut q=db.prepare("SELECT id,job_id,status,finished_at FROM runs r WHERE started_at=(SELECT max(started_at) FROM runs WHERE job_id=r.job_id)")?;
+    let mut q=db.prepare("SELECT r.id,r.job_id,r.status,r.finished_at FROM runs r JOIN (SELECT job_id,max(started_at) AS started_at FROM runs GROUP BY job_id) latest ON r.job_id=latest.job_id AND r.started_at=latest.started_at")?;
     let latest=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"finished_at":r.get::<_,Option<f64>>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     let bots=snapshot.settings.bots.iter().map(|(id,bot)|Ok(json!({"id":id,"enabled":bot.enabled,"connection":app.store.get(&format!("connection:{id}"))?,"menu":app.store.get(&format!("menu-state:{id}"))?}))).collect::<Result<Vec<_>>>()?;
     Ok(
-        json!({"api_version":2,"version":env!("CARGO_PKG_VERSION"),"sampled_at":crate::now(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
+        json!({"api_version":2,"version":env!("CARGO_PKG_VERSION"),"sampled_at":crate::now(),"maintenance":app.config.home.join("run/freeze").exists(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
     )
 }

@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS updates (
 CREATE TABLE IF NOT EXISTS runs (
  id TEXT PRIMARY KEY,job_id TEXT NOT NULL,started_at REAL NOT NULL,finished_at REAL,status TEXT NOT NULL,detail TEXT
 );
+CREATE INDEX IF NOT EXISTS runs_job_started ON runs(job_id,started_at DESC);
+CREATE INDEX IF NOT EXISTS runs_status_started ON runs(status,started_at DESC);
 CREATE TABLE IF NOT EXISTS run_events (run_id TEXT NOT NULL,event_id TEXT NOT NULL,PRIMARY KEY(run_id,event_id));
 CREATE TABLE IF NOT EXISTS web_tokens (
  hash TEXT PRIMARY KEY,owner TEXT NOT NULL,bot TEXT NOT NULL,workspace TEXT NOT NULL,expires_at REAL NOT NULL,used_at REAL
