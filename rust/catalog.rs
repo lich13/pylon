@@ -44,6 +44,8 @@ pub struct Manifest {
     #[serde(default)]
     pub preview: Vec<String>,
     #[serde(default)]
+    pub lifecycle: Vec<String>,
+    #[serde(default)]
     pub cli: BTreeMap<String, Vec<String>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -229,7 +231,9 @@ impl Catalog {
                 "invalid module protocol or identity"
             );
             ensure!(
-                root.starts_with(&base) && valid_entry(&manifest.handler),
+                root.starts_with(&base)
+                    && valid_entry(&manifest.handler)
+                    && (manifest.lifecycle.is_empty() || valid_entry(&manifest.lifecycle)),
                 "invalid module entrypoint"
             );
             for command in &manifest.commands {

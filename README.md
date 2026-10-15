@@ -4,7 +4,7 @@ Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人�
 
 ## 本机开发
 
-使用 `rust-toolchain.toml` 和 `Cargo.lock` 固定工具链与依赖；日常工作不依赖云端开发环境。
+本机 `rust-toolchain.toml` 使用 stable，CI 固定已验证的 Rust 1.99.0；依赖沿用 `Cargo.lock`，日常工作不依赖云端开发环境。
 
 ```sh
 cargo build --locked
@@ -31,7 +31,7 @@ target/debug/pylon modules deploy example --directory ../pylon-tasks --host prod
 target/debug/pylon modules ci example --directory ../pylon-tasks --gateway .
 ```
 
-服务器上 `pylon modules rollback example --activate` 回到上一模块版本。普通部署只重启该模块的服务；网关进程和其他模块保持运行。在途任务固定启动时的源码版本。数据版本变化要求冻结新触发并等待相关任务结束。
+服务器上 `pylon modules rollback example --activate` 回到上一模块版本。普通部署只重启该模块的服务；网关进程和其他模块保持运行。在途任务固定启动时的源码版本。停止准备钩子会等待本模块在途工作；数据版本变化还要求冻结新触发。
 
 外置源码需要 CI 时使用私有仓库的临时哈希校验包，运行后删除输入包，不把业务源码提交回网关仓库。
 
@@ -58,3 +58,5 @@ pylon bots disable example
 HTTPS 代理统一转发 `/pylon/` 到回环网关，网页路径由注册表决定；模块网页仅监听回环地址。共享登录、CSRF 和回调签名通过 SDK 访问。
 
 升级前保留生产状态并冻结新触发。一次性 `pylon migrate --source <业务数据库> --mapping <归属映射>` 要求目标为空及在途任务已结束，保留事件 ID、回执、不确定状态、游标和登录会话。业务表留在业务数据库。收到新流量后不能直接恢复旧数据库快照，必须先保留并合并新增状态。
+
+只读诊断使用 `pylon diagnose`。普通扩展通过 `diagnostics:read` 能力查看运行摘要；任务拥塞、结果续交、停止准备与兼容契约见扩展协议。

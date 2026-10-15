@@ -73,6 +73,9 @@ jobs:
     needs: input
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    strategy:
+      matrix:
+        node: ['22.23.3', '24.21.0']
     permissions:
       contents: read
     steps:
@@ -85,7 +88,7 @@ jobs:
           python-version: '3.12'
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node }}
       - uses: actions/download-artifact@v4
         with:
           name: module-input-${{ inputs.job }}

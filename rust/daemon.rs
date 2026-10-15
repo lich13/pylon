@@ -396,8 +396,8 @@ async fn bot_worker(app: App, id: String, bot: Bot, mut stop: watch::Receiver<bo
                     .as_i64()
                     .unwrap_or(0);
                 match tg.call("getUpdates",&json!({"offset":offset,"timeout":25,"allowed_updates":["message","callback_query"]}),true).await {
-                Ok(value)=>{save_updates(&app,&id,&bot,value.as_array().context("invalid updates")?)?;if pause(&mut stop,if value.as_array().is_some_and(|a|a.is_empty()){1.0}else{0.1}).await{break}},
-                Err(f)=>{if pause(&mut stop,f.delay.max(5.0)).await{break}}
+                Ok(value)=>{app.store.put(&format!("connection:{id}"),&json!({"status":"ok","at":crate::now()}))?;save_updates(&app,&id,&bot,value.as_array().context("invalid updates")?)?;if pause(&mut stop,if value.as_array().is_some_and(|a|a.is_empty()){1.0}else{0.1}).await{break}},
+                Err(f)=>{app.store.put(&format!("connection:{id}"),&json!({"status":"failed","at":crate::now(),"retry_after":f.delay.max(5.0)}))?;if pause(&mut stop,f.delay.max(5.0)).await{break}}
             }
             }
             Ok::<(), anyhow::Error>(())
@@ -433,7 +433,11 @@ async fn bot_worker(app: App, id: String, bot: Bot, mut stop: watch::Receiver<bo
             }
             if crate::now() > metadata_at {
                 metadata_at = crate::now() + 30.0;
-                let _ = synchronize(&app, &id, &bot, &tg).await;
+                let result = synchronize(&app, &id, &bot, &tg).await;
+                app.store.put(
+                    &format!("menu-state:{id}"),
+                    &json!({"status":if result.is_ok(){"ok"}else{"failed"},"at":crate::now()}),
+                )?;
             }
             if bot.require_start && app.store.get(&format!("bot_started:{id}"))? != json!(true) {
                 if pause(&mut stop, 1.0).await {
@@ -500,6 +504,18 @@ pub async fn run(app: App) -> Result<()> {
             if let Some((_, stop, task)) = workers.remove(&id) {
                 let _ = stop.send(true);
                 let _ = task.await;
+                // A failed subloop can leave a claimed send/update with no owner.
+                // Quarantine it without replay, scoped to this bot only.
+                let db = app.store.connect()?;
+                db.execute("UPDATE events SET status='uncertain',error='bot worker stopped before acknowledgement',updated_at=? WHERE profile=? AND status='sending'",params![crate::now(),id])?;
+                db.execute(
+                    "UPDATE updates SET status='uncertain' WHERE profile=? AND status='running'",
+                    [&id],
+                )?;
+                app.store.put(
+                    &format!("connection:{id}"),
+                    &json!({"status":"restarting","at":crate::now()}),
+                )?;
             }
         }
         for (id, hash) in desired {

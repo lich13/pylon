@@ -244,6 +244,7 @@ def _write_shell_module(
     command_name: str,
     web_path: str,
     health_status: str = "ok",
+    lifecycle: bool = False,
 ) -> Path:
     write_module(source, module_id, topic, command_name=command_name)
     manifest_path = source / "module.json"
@@ -261,6 +262,8 @@ def _write_shell_module(
             "upstream": "http://127.0.0.1:18080/",
         }
     }
+    if lifecycle:
+        manifest["lifecycle"] = ["bash", "lifecycle.sh"]
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -283,6 +286,23 @@ def _write_shell_module(
     )
     (source / "handler.sh").chmod(0o755)
     (source / "service.sh").chmod(0o755)
+    if lifecycle:
+        (source / "lifecycle.sh").write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'control="$PYLON_HOME/data/{module_id}"\n'
+            'if [ -e "$control.fail" ]; then\n'
+            '  printf "failed\\n" >> "$control.preparation"\n'
+            '  exit 17\n'
+            'elif [ -e "$control.ready" ]; then\n'
+            '  printf \'{"ready":true}\\n\'\n'
+            '  printf "ready\\n" >> "$control.preparation"\n'
+            'else\n'
+            '  printf \'{"ready":false}\\n\'\n'
+            '  printf "waiting\\n" >> "$control.preparation"\n'
+            'fi\n',
+            encoding="utf-8",
+        )
+        (source / "lifecycle.sh").chmod(0o755)
     return source
 
 
@@ -427,7 +447,7 @@ def _cleanup(
     return errors
 
 
-def test_live_activation_and_rollback_restart_only_the_changed_module():
+def _live_module_activation_contract(*, lifecycle: bool = False):
     _require_linux_root_systemd()
 
     suffix = uuid.uuid4().hex[:10]
@@ -502,8 +522,12 @@ def test_live_activation_and_rollback_restart_only_the_changed_module():
                 gateway_template = (rendered / GATEWAY_UNIT).read_text(encoding="utf-8")
                 module_template = (rendered / MODULE_TEMPLATE).read_text(encoding="utf-8")
                 assert (
-                    "After=pylon-gateway.service\nRequires=pylon-gateway.service\n"
+                    "After=pylon-gateway.service\nWants=pylon-gateway.service\n"
                     in module_template
+                )
+                assert not any(
+                    f"{directive}=pylon-gateway.service" in module_template
+                    for directive in ("Requires", "BindsTo", "PartOf")
                 )
 
                 readonly_path = "ReadWritePaths=/srv/pylon\n"
@@ -562,6 +586,7 @@ def test_live_activation_and_rollback_restart_only_the_changed_module():
                     command_name: str,
                     web_path: str,
                     health_status: str = "ok",
+                    with_lifecycle: bool = False,
                 ) -> tuple[Path, str]:
                     source = fixture_root / f"{module_id}-{version}"
                     _write_shell_module(
@@ -572,6 +597,7 @@ def test_live_activation_and_rollback_restart_only_the_changed_module():
                         command_name=command_name,
                         web_path=web_path,
                         health_status=health_status,
+                        lifecycle=with_lifecycle,
                     )
                     archive = fixture_root / f"{module_id}-{version}.tar.gz"
                     checksum = _pack(home, source, archive)
@@ -585,6 +611,7 @@ def test_live_activation_and_rollback_restart_only_the_changed_module():
                     version="target-v1",
                     command_name=f"a{suffix[:6]}v1",
                     web_path=target_web_path,
+                    with_lifecycle=lifecycle,
                 )
                 target_v1 = _install(home, target_v1_archive, target_v1_sha)
                 assert target_v1["id"] == target_id and target_v1["changed"] is True
@@ -620,14 +647,81 @@ def test_live_activation_and_rollback_restart_only_the_changed_module():
                 assert _main_pid(target_unit) == target_v1_pid
                 assert_gateway_and_source_unchanged()
 
+                if lifecycle:
+                    _systemctl("restart", GATEWAY_UNIT)
+                    gateway_pid = _wait_main_pid(
+                        GATEWAY_UNIT, different_from=gateway_pid
+                    )
+                    wait_for(
+                        lambda: _gateway_cli(home, "rpc", "health").returncode == 0,
+                        timeout=20.0,
+                        interval=0.1,
+                    )
+                    assert _main_pid(target_unit) == target_v1_pid
+                    assert _main_pid(bystander_unit) == bystander_pid
+                    assert_gateway_and_source_unchanged()
+
                 target_v2_archive, target_v2_sha = create_install(
                     target_id,
                     topic_target,
                     version="target-v2",
                     command_name=f"a{suffix[:6]}v2",
                     web_path=target_web_path,
+                    with_lifecycle=lifecycle,
                 )
-                target_v2 = _install(home, target_v2_archive, target_v2_sha)
+                if lifecycle:
+                    preparation = home / "data" / f"{target_id}.preparation"
+                    ready = home / "data" / f"{target_id}.ready"
+                    registry_before_preparation = _read_registry(home)
+                    installing = subprocess.Popen(
+                        [
+                            str(BIN), "--home", str(home), "modules", "install",
+                            str(target_v2_archive), "--sha256", target_v2_sha,
+                            "--activate",
+                        ],
+                        cwd=ROOT,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    try:
+                        def waiting_for_ready():
+                            if installing.poll() is not None:
+                                stdout, stderr = installing.communicate()
+                                raise AssertionError(
+                                    "activation exited before lifecycle was ready: "
+                                    f"{stderr or stdout}"
+                                )
+                            assert _main_pid(target_unit) == target_v1_pid
+                            assert _main_pid(bystander_unit) == bystander_pid
+                            if not preparation.is_file():
+                                return False
+                            waiting = preparation.read_text(encoding="utf-8")
+                            assert _read_registry(home) == registry_before_preparation
+                            return waiting.splitlines().count("waiting") >= 2
+
+                        wait_for(waiting_for_ready, timeout=20.0, interval=0.1)
+                        assert _main_pid(target_unit) == target_v1_pid
+                        assert _read_registry(home) == registry_before_preparation
+                        assert _wait_marker(home, target_id, "target-v1") == (
+                            "target-v1", target_uid,
+                        )
+                        assert (home / "run/drain" / target_id).is_file()
+                        ready.touch()
+                        stdout, stderr = installing.communicate(timeout=30)
+                        assert installing.returncode == 0, stderr or stdout
+                        target_v2 = json.loads(stdout)
+                    finally:
+                        if installing.poll() is None:
+                            installing.terminate()
+                            try:
+                                installing.communicate(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                installing.kill()
+                                installing.communicate(timeout=5)
+                    assert not (home / "run/drain" / target_id).exists()
+                else:
+                    target_v2 = _install(home, target_v2_archive, target_v2_sha)
                 assert target_v2["id"] == target_id and target_v2["changed"] is True
                 target_v2_pid = _wait_main_pid(
                     target_unit, different_from=target_v1_pid
@@ -642,6 +736,33 @@ def test_live_activation_and_rollback_restart_only_the_changed_module():
                 registry_v2 = _read_registry(home)
                 active_v2 = registry_v2["modules"][target_id]
                 assert active_v2.endswith(target_v2["hash"])
+                if lifecycle:
+                    (home / "data" / f"{target_id}.fail").touch()
+                    blocked_archive, blocked_sha = create_install(
+                        target_id,
+                        topic_target,
+                        version="target-v3",
+                        command_name=f"a{suffix[:6]}v3",
+                        web_path=target_web_path,
+                        with_lifecycle=True,
+                    )
+                    blocked = _gateway_cli(
+                        home, "modules", "install", str(blocked_archive),
+                        "--sha256", blocked_sha, "--activate",
+                    )
+                    assert blocked.returncode != 0
+                    assert "module stop preparation failed" in blocked.stderr
+                    assert "failed" in preparation.read_text(encoding="utf-8").splitlines()
+                    assert _read_registry(home) == registry_v2
+                    assert _main_pid(target_unit) == target_v2_pid
+                    assert _wait_marker(home, target_id, "target-v2") == (
+                        "target-v2", target_uid,
+                    )
+                    assert _main_pid(bystander_unit) == bystander_pid
+                    assert not (home / "run/drain" / target_id).exists()
+                    assert_gateway_and_source_unchanged()
+                    assert telegram.method_counts() == {}
+                    return
                 rejected_source = fixture_root / f"{target_id}-target-bad"
                 _write_shell_module(
                     rejected_source,
@@ -717,3 +838,11 @@ def test_live_activation_and_rollback_restart_only_the_changed_module():
                         )
     finally:
         telegram.close()
+
+
+def test_live_activation_and_rollback_restart_only_the_changed_module():
+    _live_module_activation_contract()
+
+
+def test_gateway_restart_and_lifecycle_preparation_preserve_live_services():
+    _live_module_activation_contract(lifecycle=True)

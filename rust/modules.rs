@@ -163,7 +163,8 @@ fn validate_index(base: &Path, value: &serde_json::Value) -> Result<()> {
         let entries = std::iter::once(&module.manifest.handler)
             .chain(module.manifest.jobs.values().map(|j| &j.entry))
             .chain(module.manifest.services.values().map(|s| &s.entry))
-            .chain(module.manifest.cli.values());
+            .chain(module.manifest.cli.values())
+            .chain((!module.manifest.lifecycle.is_empty()).then_some(&module.manifest.lifecycle));
         for entry in entries {
             ensure!(
                 crate::catalog::valid_entry(entry),
@@ -315,9 +316,11 @@ pub fn install(
         if !previous.is_null() && changed {
             registry["previous"][&manifest.id] = previous;
         }
-        crate::config::atomic_json(&base.join("registry.json"), &registry, 0o644)?;
+        if !health {
+            crate::config::atomic_json(&base.join("registry.json"), &registry, 0o644)?;
+        }
         Ok(
-            serde_json::json!({"id":manifest.id,"hash":hash,"services":manifest.services.keys().collect::<Vec<_>>(),"changed":changed}),
+            serde_json::json!({"id":manifest.id,"hash":hash,"services":manifest.services.keys().collect::<Vec<_>>(),"changed":changed,"candidate_registry":registry}),
         )
     })();
     if staging.exists() {
@@ -377,8 +380,10 @@ pub fn rollback(
             id,
         )?;
     }
-    crate::config::atomic_json(&base.join("registry.json"), &registry, 0o644)?;
-    Ok(serde_json::json!({"id":id,"rolled_back":true}))
+    if !health {
+        crate::config::atomic_json(&base.join("registry.json"), &registry, 0o644)?;
+    }
+    Ok(serde_json::json!({"id":id,"rolled_back":true,"candidate_registry":registry}))
 }
 
 fn field(s: &str, min: u32, max: u32) -> Result<String> {
@@ -488,7 +493,7 @@ pub fn render(config: &crate::config::Config, destination: &Path) -> Result<()> 
         let content = format!(
             "[Unit]\nDescription=Pylon {command}\nAfter=network-online.target\n{}[Service]\nType={}\nUser={user}\nGroup={group}\nWorkingDirectory={}\nExecStart={} --home {} {command}\nUMask=0007\nKillMode=control-group\nTimeoutStartSec=infinity\nTimeoutStopSec=30\n{}{}\n[Install]\nWantedBy=multi-user.target\n",
             if user != "pylon-gateway" {
-                "After=pylon-gateway.service\nRequires=pylon-gateway.service\n"
+                "After=pylon-gateway.service\nWants=pylon-gateway.service\n"
             } else {
                 ""
             },
@@ -656,6 +661,123 @@ fn health_candidate(
     remove_tree(&root)?;
     outcome
 }
+struct DrainGuard(std::path::PathBuf);
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+fn prepare_stop(
+    config: &crate::config::Config,
+    catalog: &crate::catalog::Catalog,
+    id: &str,
+) -> Result<DrainGuard> {
+    use fs2::FileExt;
+    use std::process::Stdio;
+    let path = config.home.join("run/drain").join(id);
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    // A previous interrupted deployment intentionally leaves admission frozen for inspection.
+    let marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    marker.sync_all()?;
+    let guard = DrainGuard(path);
+    let Some(module) = catalog.modules.get(id) else {
+        return Ok(guard);
+    };
+    loop {
+        let mut active = false;
+        for (job_id, job) in &module.manifest.jobs {
+            let name = if job.lock.is_empty() {
+                job_id
+            } else {
+                &job.lock
+            };
+            let lock = crate::runtime::open_task_lock(
+                &config.home.join("run").join(format!("{name}.lock")),
+            )?;
+            if lock.try_lock_exclusive().is_err() {
+                active = true;
+                break;
+            }
+        }
+        if !active && !module.manifest.lifecycle.is_empty() {
+            let entry = &module.manifest.lifecycle;
+            let mut command = std::process::Command::new(match entry[0].as_str() {
+                "python" => config.python(),
+                "bash" => "/bin/bash".into(),
+                "node" => "/usr/bin/node".into(),
+                _ => module.root.join(&entry[1]),
+            });
+            if entry[0] == "python" {
+                command.arg("-m").args(&entry[1..]);
+            } else if entry[0] != "native" {
+                command.arg(module.root.join(&entry[1])).args(&entry[2..]);
+            } else {
+                command.args(&entry[2..]);
+            }
+            let env = crate::runtime::environment(
+                config,
+                catalog,
+                module,
+                &module.manifest.workspace,
+                "",
+                "",
+            )?;
+            let users = config.settings()?;
+            let user = users
+                .runtime_users
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("runtime identity missing"))?;
+            crate::child_identity(&mut command, user.uid, user.gid);
+            let output = config
+                .home
+                .join("run")
+                .join(format!(".drain-{}.json", uuid::Uuid::new_v4()));
+            let result = (|| -> Result<bool> {
+                let mut child = command
+                    .env_clear()
+                    .envs(env)
+                    .stdin(Stdio::null())
+                    .stdout(std::fs::File::create(&output)?)
+                    .stderr(Stdio::null())
+                    .spawn()?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    if let Some(status) = child.try_wait()? {
+                        ensure!(status.success(), "module stop preparation failed");
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        child.kill()?;
+                        child.wait()?;
+                        anyhow::bail!(
+                            "module stop preparation did not respond; existing service retained"
+                        )
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                ensure!(
+                    std::fs::metadata(&output)?.len() < 65536,
+                    "invalid stop preparation response"
+                );
+                let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&output)?)?;
+                value["ready"]
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("invalid stop preparation response"))
+            })();
+            if output.exists() {
+                std::fs::remove_file(output)?;
+            }
+            active = !result?;
+        }
+        if !active {
+            return Ok(guard);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
 fn activate(
     config: &crate::config::Config,
     old: &crate::catalog::Catalog,
@@ -758,7 +880,7 @@ pub fn change(
             "live deployment requires the root service manager"
         );
     }
-    let result = if let Some((archive, sha)) = archive {
+    let mut result = if let Some((archive, sha)) = archive {
         install(config, archive, sha, live)?
     } else {
         rollback(
@@ -767,9 +889,21 @@ pub fn change(
             live,
         )?
     };
+    let candidate = result
+        .as_object_mut()
+        .unwrap()
+        .remove("candidate_registry")
+        .unwrap();
     let id = result["id"].as_str().unwrap();
     if live {
-        let next = crate::catalog::Catalog::load(config)?;
+        let next = crate::catalog::Catalog::load_index(base.clone(), Some(candidate.clone()))?;
+        let _drain = match prepare_stop(config, &old, id) {
+            Ok(guard) => guard,
+            Err(error) => {
+                crate::config::atomic_json(&base.join("registry.json"), &original, 0o644)?;
+                return Err(error);
+            }
+        };
         let applied =
             (|| -> Result<()> {
                 if old.modules.get(id).is_some_and(|m| {
@@ -785,6 +919,7 @@ pub fn change(
                         );
                     }
                 }
+                crate::config::atomic_json(&base.join("registry.json"), &candidate, 0o644)?;
                 activate(config, &old, &next, id)
             })();
         if let Err(error) = applied {

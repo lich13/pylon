@@ -73,3 +73,15 @@ manifest 的 `capabilities` 只是申请。管理员还须在独立 root 配置�
 `modules install <包> --sha256 <哈希> --activate` 校验安全路径、完整清单、运行配置与普通 UID 下的健康检查，再发布新注册表并更新该模块服务。失败恢复旧注册表与服务。运行中的任务使用不可变源码快照，版本回收保留当前、上一版以及在途任务引用的版本。
 
 `data_version` 变化需要冻结新触发并等待相关任务结束，禁止用普通热部署跨越不兼容数据变化。切换流量后回退应用版本必须保留新业务状态，不恢复旧数据库快照。
+
+## 可靠执行与兼容（v2 增量）
+
+任务触发在配额竞争前持久化，状态为 queued、running、completing、reporting、completed。每个任务最多保留一轮 queued 触发；相同 invocation 标识始终映射同一请求。执行归属由文件锁确认，失去归属的已启动请求进入待核对，不能自动重放。有限 timeout 同时覆盖输入、执行和管道收尾；null 保留无限等待。
+
+`runtime.complete` 返回 v2 envelope，value.status 必须为 ok、failed 或 uncertain；可附 execution_status、completion_status、notification_status。核心分别记录执行、结束处理、通知状态，失败不能被成功退出码覆盖。回报先保存在监督进程的持久信箱；断线只续交已完成结果，不再次执行完成钩子或任务。
+
+RPC 错误保留字符串 error，新增 error_code 和 retryable，旧客户端仍可解析。永久单事件错误需要处理后明确解除阻塞；不把不确定事件重新提交为新事件。
+
+`diagnostics` 提供脱敏的连接、投递计数、任务概要、最近结果和模块版本。扩展需要 diagnostics:read；无上下文的 CLI 仅允许可信 root 监督者。原始消息、凭据、上下文和业务数据不在响应中。
+
+可选 `lifecycle` 为标准入口 argv，输出 `{"ready":true}` 或 `{"ready":false}`。部署设置只读 drain 标记后等待任务锁和旧模块停止准备钩子，再停止对应服务。旧 v2 清单省略字段仍兼容。准备失败时保留原注册表与运行服务；无限模型等待不得被部署时限强杀。业务服务对网关使用 Wants/After，显式网关重启不传播停止动作。

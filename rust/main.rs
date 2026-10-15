@@ -25,6 +25,11 @@ enum Command {
     Execute {
         id: String,
     },
+    #[command(hide = true)]
+    Resume {
+        id: String,
+    },
+    Diagnose,
     Serve {
         id: String,
     },
@@ -156,6 +161,22 @@ async fn run() -> Result<()> {
                 std::process::exit(code)
             }
             Value::Null
+        }
+        Command::Resume { id } => {
+            let code = pylon::runtime::resume(&config, &id).await?;
+            if code != 0 {
+                std::process::exit(code)
+            }
+            Value::Null
+        }
+        Command::Diagnose => {
+            api::rpc(
+                &config,
+                "diagnostics",
+                json!({}),
+                &std::env::var("PYLON_CONTEXT").unwrap_or_default(),
+            )
+            .await?
         }
         Command::Serve { id } => {
             let code = pylon::runtime::service(&config, &id).await?;

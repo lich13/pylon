@@ -16,7 +16,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn open_task_lock(path: &Path) -> Result<File> {
+pub(crate) fn open_task_lock(path: &Path) -> Result<File> {
     // O_CREAT on an existing lock owned by the previous runtime UID is denied
     // by Linux protected_regular in a shared sticky directory, even for root.
     // Open the same inode without O_CREAT, and create only when it is absent.
@@ -280,11 +280,6 @@ pub async fn process(
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().context("could not start business process")?;
     let pid = child.id().context("missing process id")?;
-    if let Some(value) = input {
-        let mut stdin = child.stdin.take().context("missing process input")?;
-        stdin.write_all(value.to_string().as_bytes()).await?;
-        stdin.shutdown().await?;
-    }
     // Drain both streams concurrently; bounded capture keeps a noisy module from exhausting the gateway.
     async fn capture(mut stream: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<String> {
         let mut bytes = vec![];
@@ -301,36 +296,62 @@ pub async fn process(
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
-    let out = tokio::spawn(capture(child.stdout.take().unwrap()));
-    let err = tokio::spawn(capture(child.stderr.take().unwrap()));
-    let status = if let Some(seconds) = timeout {
-        match tokio::time::timeout(Duration::from_secs(seconds), child.wait()).await {
-            Ok(status) => status?,
-            Err(_) => {
-                unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
-                if tokio::time::timeout(Duration::from_secs(15), child.wait())
-                    .await
-                    .is_err()
-                {
-                    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-                    child.wait().await?;
-                }
-                out.abort();
-                err.abort();
-                anyhow::bail!("business process timed out; result requires reconciliation")
-            }
+    let mut out = tokio::spawn(capture(child.stdout.take().unwrap()));
+    let mut err = tokio::spawn(capture(child.stderr.take().unwrap()));
+    let operation = async {
+        if let Some(value) = input {
+            let mut stdin = child.stdin.take().context("missing process input")?;
+            stdin.write_all(value.to_string().as_bytes()).await?;
+            stdin.shutdown().await?;
+        }
+        let status = child.wait().await?;
+        Ok::<_, anyhow::Error>((
+            status.code().unwrap_or(128),
+            (&mut out).await??,
+            (&mut err).await??,
+        ))
+    };
+    let result = if let Some(seconds) = timeout {
+        match tokio::time::timeout(Duration::from_secs(seconds), operation).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "business process timed out; result requires reconciliation"
+            )),
         }
     } else {
-        child.wait().await?
+        operation.await
     };
-    Ok((status.code().unwrap_or(128), out.await??, err.await??))
+    if result.is_err() {
+        // Kill the whole process group even when its original leader already exited.
+        unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_err()
+        {
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            let _ = child.wait().await;
+        }
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        out.abort();
+        err.abort();
+    }
+    result
 }
+
 pub async fn invoke_local(config: &Config, request: &Value) -> Result<Value> {
     let (catalog, _lease) = snapshot(config)?;
     let module = catalog
         .modules
         .get(request["module"].as_str().unwrap_or(""))
         .context("unknown module")?;
+    ensure!(
+        !config
+            .home
+            .join("run/drain")
+            .join(&module.manifest.id)
+            .exists(),
+        "module deployment in progress; request was not started"
+    );
     let token = request["context"].as_str().context("context required")?;
     let ctx = api::rpc(config, "context.inspect", json!({}), token).await?;
     ensure!(
@@ -441,6 +462,15 @@ pub async fn executor(config: Config) -> Result<()> {
     }
     let listener = tokio::net::UnixListener::bind(&path)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?;
+    let supervisor = config.clone();
+    tokio::spawn(async move {
+        loop {
+            if crate::queue::dispatch(&supervisor).await.is_err() {
+                eprintln!("task queue reconciliation unavailable");
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
     axum::serve(
         listener,
         Router::new()
@@ -451,18 +481,83 @@ pub async fn executor(config: Config) -> Result<()> {
     Ok(())
 }
 pub async fn execute(config: &Config, id: &str) -> Result<i32> {
-    if config.home.join("run/freeze").exists() {
+    let catalog = Catalog::load(config)?;
+    let (module, job) = catalog.job(id)?;
+    let trigger = format!(
+        "{}:{}",
+        id,
+        std::env::var("INVOCATION_ID")
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string())
+    );
+    let run = crate::queue::admit(
+        config,
+        id,
+        &module.manifest.id,
+        &job.topic,
+        job.model,
+        &trigger,
+    )?;
+    let code = resume(config, &run).await?;
+    if crate::queue::state(config, &run)? == "queued" {
+        println!("{}", json!({"task":id,"status":"queued","request_id":run}));
+    }
+    Ok(code)
+}
+pub async fn resume(config: &Config, run: &str) -> Result<i32> {
+    let request_lock = open_task_lock(
+        &config
+            .home
+            .join("run")
+            .join(format!("request-{}.lock", crate::digest(run))),
+    )?;
+    if request_lock.try_lock_exclusive().is_err() {
         return Ok(0);
     }
+    if crate::queue::state(config, run)? != "queued" || config.home.join("run/freeze").exists() {
+        return Ok(0);
+    }
+    let db = crate::queue::connect(config)?;
+    let id: String = db.query_row("SELECT job_id FROM requests WHERE id=?", [run], |r| {
+        r.get(0)
+    })?;
+    let id = id.as_str();
     let (catalog, _lease) = snapshot(config)?;
     let (module, job) = catalog.job(id)?;
-    fs::create_dir_all(config.home.join("run"))?;
+    if config
+        .home
+        .join("run/drain")
+        .join(&module.manifest.id)
+        .exists()
+    {
+        return Ok(0);
+    }
     let lock = open_task_lock(&config.home.join("run").join(format!(
         "{}.lock",
         if job.lock.is_empty() { id } else { &job.lock }
     )))?;
     if lock.try_lock_exclusive().is_err() {
         return Ok(0);
+    }
+    // Preserve FIFO among requests that can acquire their task lock, within a quota group.
+    let older = {
+        let mut q=db.prepare("SELECT job_id FROM requests WHERE state='queued' AND topic=? AND model=? AND created_at<(SELECT created_at FROM requests WHERE id=?) ORDER BY created_at,id")?;
+        q.query_map(rusqlite::params![job.topic, job.model, run], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for prior in older {
+        if let Ok((_, prior_job)) = catalog.job(&prior) {
+            let name = if prior_job.lock.is_empty() {
+                &prior
+            } else {
+                &prior_job.lock
+            };
+            let prior_lock = open_task_lock(&config.home.join("run").join(format!("{name}.lock")))?;
+            if prior_lock.try_lock_exclusive().is_ok() {
+                return Ok(0);
+            }
+        }
     }
     let settings = config.settings()?;
     let maximum = settings
@@ -483,6 +578,8 @@ pub async fn execute(config: &Config, id: &str) -> Result<i32> {
         }
     }
     let Some(_quota) = quota else { return Ok(0) };
+    // A waiting request may only take a quota slot after older requests in its group.
+    // The dispatcher visits creation order; the lock also serializes direct triggers.
     let context = api::rpc(
         config,
         "context.open",
@@ -491,27 +588,6 @@ pub async fn execute(config: &Config, id: &str) -> Result<i32> {
     )
     .await?;
     let token = context["token"].as_str().context("context missing")?;
-    let run = format!(
-        "{}:{}",
-        id,
-        std::env::var("INVOCATION_ID")
-            .unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string())
-    );
-    // An invocation marker is durable before spawning; the same systemd invocation never replays.
-    let marker = config
-        .home
-        .join("run/invocations")
-        .join(crate::digest(&run));
-    fs::create_dir_all(marker.parent().unwrap())?;
-    if marker.exists() {
-        let _ = api::rpc(config, "context.close", json!({}), token).await;
-        return Ok(0);
-    }
-    fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&marker)?
-        .sync_all()?;
     let output_dir = config.home.join("run/work").join(&module.manifest.id);
     fs::create_dir_all(&output_dir)?;
     if unsafe { libc::geteuid() } == 0 {
@@ -551,7 +627,7 @@ pub async fn execute(config: &Config, id: &str) -> Result<i32> {
     }
     for (k, v) in [
         ("PYLON_JOB_ID", id.to_owned()),
-        ("PYLON_RUN_ID", run.clone()),
+        ("PYLON_RUN_ID", run.to_owned()),
         (
             "PYLON_RESULT_FILE",
             result_file.to_string_lossy().into_owned(),
@@ -562,6 +638,8 @@ pub async fn execute(config: &Config, id: &str) -> Result<i32> {
         env.insert(k.into(), v);
     }
     api::rpc(config, "run.start", json!({"id":run}), token).await?;
+    db.execute("UPDATE requests SET state='running',token=?,owner=?,updated_at=? WHERE id=? AND state='queued'",rusqlite::params![token,std::process::id(),crate::now(),run])?;
+    crate::queue::summary(config)?;
     let output = process(config, module, &job.entry, &env, None, job.timeout).await;
     let (status, stdout, stderr) = match output {
         Ok((0, out, err)) => ("ok", out, err),
@@ -572,14 +650,40 @@ pub async fn execute(config: &Config, id: &str) -> Result<i32> {
             "任务进程中断或超时，需先核对结果。".into(),
         ),
     };
-    let result: Value = if result_file.is_file() {
-        serde_json::from_slice(&fs::read(&result_file)?)
-            .unwrap_or_else(|_| json!({"status":"uncertain"}))
-    } else {
-        json!({})
+    let result: Value = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&result_file)
+    {
+        Ok(mut file) => {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata()?;
+            let uid = if unsafe { libc::geteuid() } == 0 {
+                config.settings()?.runtime_users[&module.manifest.id].uid
+            } else {
+                unsafe { libc::geteuid() }
+            };
+            if metadata.is_file() && metadata.uid() == uid && metadata.len() <= 8 * 1024 * 1024 {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut std::io::Read::take(&mut file, 8 * 1024 * 1024 + 1),
+                    &mut bytes,
+                )?;
+                serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({"status":"uncertain"}))
+            } else {
+                json!({"status":"uncertain"})
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(_) => json!({"status":"uncertain"}),
     };
     let payload = json!({"job_id":id,"run_id":run,"job":job,"status":status,"stdout":stdout,"stderr":stderr,"result":result});
     let input = json!({"api_version":2,"action":"runtime.complete","profile":job.workspace,"bot_id":context["bot"],"payload":payload});
+    db.execute(
+        "UPDATE requests SET state='completing',execution_status=?,completion_input=?,updated_at=? WHERE id=?",
+        rusqlite::params![status, input.to_string(), crate::now(), run],
+    )?;
+    crate::queue::summary(config)?;
     let completed = process(
         config,
         module,
@@ -589,14 +693,49 @@ pub async fn execute(config: &Config, id: &str) -> Result<i32> {
         Some(150),
     )
     .await;
-    let final_status = if completed.as_ref().is_ok_and(|(code, _, _)| *code == 0) {
-        status
-    } else {
-        "uncertain"
-    };
-    api::rpc(config,"run.finish",json!({"id":run,"status":final_status,"detail":if final_status=="uncertain"{"task or completion requires reconciliation"}else{""}}),token).await?;
-    let _ = api::rpc(config, "context.close", json!({}), token).await;
-    if result_file.exists() {
+    let mut finish = json!({"id":run,"status":"uncertain","execution_status":status,"completion_status":"failed","notification_status":"unknown","detail":"completion response unavailable or invalid; reconcile without replay"});
+    if let Ok((0, out, _)) = completed
+        && let Ok(response) = serde_json::from_str::<Value>(&out)
+    {
+        let value = &response["value"];
+        if response["api_version"] == 2
+            && matches!(
+                value["status"].as_str(),
+                Some("ok" | "failed" | "uncertain")
+            )
+        {
+            finish["status"] = value["status"].clone();
+            // A completion callback cannot turn a failed execution into success.
+            if status != "ok" {
+                finish["status"] = json!(status);
+            }
+            finish["completion_status"] = value
+                .get("completion_status")
+                .cloned()
+                .unwrap_or(json!("ok"));
+            finish["notification_status"] = value
+                .get("notification_status")
+                .cloned()
+                .unwrap_or(json!("unknown"));
+            finish["detail"] = json!(
+                if value["hook_error"].as_str().is_some_and(|v| !v.is_empty()) {
+                    "completion hook failed; inspect module completion record"
+                } else if finish["status"] != "ok" {
+                    "task reported failure or uncertainty"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    if matches!(result["status"].as_str(), Some("failed" | "uncertain")) {
+        finish["status"] = result["status"].clone();
+        finish["execution_status"] = result["status"].clone();
+    }
+    let final_status = finish["status"].as_str().unwrap().to_owned();
+    crate::queue::report(config, run, token, &finish)?;
+    let _ = crate::queue::flush(config, run).await;
+    if fs::symlink_metadata(&result_file).is_ok() {
         fs::remove_file(result_file)?;
     }
     println!("{}", json!({"task":id,"status":final_status}));

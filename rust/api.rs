@@ -79,6 +79,9 @@ pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
             json!({"version":env!("CARGO_PKG_VERSION"),"api_version":2,"catalog":app.snapshot.read().await.catalog.hash}),
         );
     }
+    if method == "diagnostics" && r["context"].as_str().unwrap_or("").is_empty() {
+        return diagnostics(app).await;
+    }
     if method == "admin.reload" {
         app.reload().await?;
         return Ok(json!({"ok":true}));
@@ -137,6 +140,15 @@ pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
         return crate::auth::request(app, &ctx, method, p).await;
     }
     match method {
+        "diagnostics" => {
+            ensure!(
+                ctx["capabilities"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|v| v == "diagnostics:read")),
+                "diagnostics capability required"
+            );
+            diagnostics(app).await
+        }
         "context.close" => {
             crate::auth::revoke(&app.store, token)?;
             Ok(Value::Null)
@@ -333,6 +345,11 @@ pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
         }
         "task.status" => {
             let id = p["job_id"].as_str().context("task id required")?;
+            let snapshot = app.snapshot.read().await;
+            ensure!(
+                snapshot.catalog.job(id)?.0.manifest.id == module,
+                "task belongs to another module"
+            );
             let db = app.store.connect()?;
             let mut s=db.prepare("SELECT id,status,started_at,finished_at FROM runs WHERE job_id=? ORDER BY started_at DESC LIMIT 10")?;
             let rows=s.query_map([id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"started_at":r.get::<_,f64>(2)?,"finished_at":r.get::<_,Option<f64>>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
@@ -345,7 +362,7 @@ pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
                 .and_then(|s| s.strip_prefix("job:"))
                 .context("task context required")?;
             app.store.connect()?.execute(
-                "INSERT OR IGNORE INTO runs VALUES(?,?,?,NULL,'running',NULL)",
+                "INSERT OR IGNORE INTO runs(id,job_id,started_at,finished_at,status,detail) VALUES(?,?,?,NULL,'running',NULL)",
                 rusqlite::params![id, job, crate::now()],
             )?;
             Ok(Value::Null)
@@ -357,16 +374,39 @@ pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
                     .is_some_and(|s| s.starts_with("job:")),
                 "task context required"
             );
-            app.store.connect()?.execute(
-                "UPDATE runs SET status=?,finished_at=?,detail=? WHERE id=? AND job_id=?",
-                rusqlite::params![
-                    p["status"].as_str().unwrap_or("failed"),
-                    crate::now(),
-                    p["detail"].as_str().unwrap_or(""),
-                    p["id"].as_str().unwrap_or(""),
-                    ctx["origin"].as_str().unwrap().trim_start_matches("job:")
-                ],
-            )?;
+            ensure!(
+                matches!(p["status"].as_str(), Some("ok" | "failed" | "uncertain")),
+                "invalid run status"
+            );
+            let id = p["id"].as_str().context("run id required")?;
+            let job = ctx["origin"].as_str().unwrap().trim_start_matches("job:");
+            let mut db = app.store.connect()?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let (old, finished): (String, Option<f64>) = tx
+                .query_row(
+                    "SELECT status,finished_at FROM runs WHERE id=? AND job_id=?",
+                    rusqlite::params![id, job],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .context("unknown task run")?;
+            ensure!(
+                finished.is_none() || p["status"] == old,
+                "completed run already has a different result"
+            );
+            if finished.is_none() {
+                tx.execute(
+                    "UPDATE runs SET status=?,finished_at=?,detail=? WHERE id=? AND job_id=?",
+                    rusqlite::params![
+                        p["status"].as_str().unwrap(),
+                        crate::now(),
+                        p["detail"].as_str().unwrap_or(""),
+                        id,
+                        job
+                    ],
+                )?;
+                tx.execute("INSERT INTO kv VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![format!("run-result:{id}"),json!({"execution_status":p["execution_status"],"completion_status":p["completion_status"],"notification_status":p["notification_status"]}).to_string()])?;
+            }
+            tx.commit()?;
             Ok(Value::Null)
         }
         _ => anyhow::bail!("unknown gateway method"),
@@ -388,7 +428,8 @@ async fn handler(
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<Peer>,
     Json(r): Json<Value>,
 ) -> Json<Value> {
-    if matches!(r["method"].as_str(), Some("context.open" | "admin.reload"))
+    if (matches!(r["method"].as_str(), Some("context.open" | "admin.reload"))
+        || (r["method"] == "diagnostics" && r["context"].as_str().unwrap_or("").is_empty()))
         && !app.config.offline
         && peer.0 != 0
     {
@@ -398,7 +439,20 @@ async fn handler(
     }
     match dispatch(&app, &r).await {
         Ok(value) => Json(json!({"ok":true,"api_version":2,"value":value})),
-        Err(e) => Json(json!({"ok":false,"api_version":2,"error":e.to_string()})),
+        Err(e) => {
+            let transient = e.chain().any(|c| {
+                c.is::<reqwest::Error>()
+                    || c.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                        !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                        )
+                    })
+            }) || e.to_string().contains("database is locked");
+            Json(
+                json!({"ok":false,"api_version":2,"error":e.to_string(),"error_code":if transient {"unavailable"} else {"rejected"},"retryable":transient}),
+            )
+        }
     }
 }
 pub async fn serve_socket(app: App) -> Result<()> {
@@ -438,12 +492,24 @@ async fn proxy(State(app): State<App>, request: Request) -> Response {
             .and_then(|s| s.split('/').next())
             .context("unknown workspace")?;
         let snapshot = app.snapshot.read().await;
-        let web = snapshot
+        let (module, web) = snapshot
             .catalog
             .modules
             .values()
-            .find_map(|m| m.manifest.web.get(route))
+            .find_map(|m| m.manifest.web.get(route).map(|w| (m, w)))
             .context("unknown workspace")?;
+        if app
+            .config
+            .home
+            .join("run/drain")
+            .join(&module.manifest.id)
+            .exists()
+        {
+            return Ok(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::from("工作区正在切换，请稍后重试。"))
+                .unwrap());
+        }
         let url = format!(
             "{}{}",
             web.upstream.trim_end_matches('/'),
@@ -497,4 +563,20 @@ pub async fn serve_web(app: App, port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     axum::serve(listener, Router::new().fallback(proxy).with_state(app)).await?;
     Ok(())
+}
+
+/// Public operational summary. Never expose credentials, message payloads, or context tokens.
+pub async fn diagnostics(app: &App) -> Result<Value> {
+    let snapshot = app.snapshot.read().await;
+    let db = app.store.connect()?;
+    let mut q = db.prepare("SELECT profile,status,count(*) FROM events GROUP BY profile,status")?;
+    let deliveries=q.query_map([],|r|Ok(json!({"bot":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"count":r.get::<_,u64>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    let mut q=db.prepare("SELECT id,job_id,status,finished_at FROM runs WHERE status IN ('failed','uncertain') ORDER BY started_at DESC LIMIT 10")?;
+    let failures=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"finished_at":r.get::<_,Option<f64>>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    let mut q=db.prepare("SELECT id,job_id,status,finished_at FROM runs r WHERE started_at=(SELECT max(started_at) FROM runs WHERE job_id=r.job_id)")?;
+    let latest=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"finished_at":r.get::<_,Option<f64>>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    let bots=snapshot.settings.bots.iter().map(|(id,bot)|Ok(json!({"id":id,"enabled":bot.enabled,"connection":app.store.get(&format!("connection:{id}"))?,"menu":app.store.get(&format!("menu-state:{id}"))?}))).collect::<Result<Vec<_>>>()?;
+    Ok(
+        json!({"api_version":2,"version":env!("CARGO_PKG_VERSION"),"sampled_at":crate::now(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
+    )
 }

@@ -164,10 +164,17 @@ def write_module(
     (module_dir / "module.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    (module_dir / "handler.sh").write_text(
-        "#!/bin/sh\ncat >/dev/null\nprintf '{\"api_version\":2,\"value\":null}\\n'\n",
-        encoding="utf-8",
-    )
+    handler = "#!/bin/sh\ncat >/dev/null\nprintf '{\"api_version\":2,\"value\":null}\\n'\n"
+    if job_id:
+        handler = (
+            '#!/bin/bash\ninput="$(cat)"\n'
+            'if [[ "$input" =~ \\"action\\"[[:space:]]*:[[:space:]]*\\"runtime[.]complete\\" ]]; then\n'
+            "  printf '{\"api_version\":2,\"value\":{\"status\":\"ok\"}}\\n'\n"
+            "else\n"
+            "  printf '{\"api_version\":2,\"value\":null}\\n'\n"
+            "fi\n"
+        )
+    (module_dir / "handler.sh").write_text(handler, encoding="utf-8")
     (module_dir / "job.sh").write_text(
         "#!/bin/sh\nset -eu\n"
         "mkdir -p \"$PYLON_HOME/data\"\n"
