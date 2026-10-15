@@ -194,6 +194,14 @@ def _run_statuses(home: Path) -> list[tuple[str]]:
         ).fetchall()
 
 
+def _request_states(home: Path) -> list[tuple[str, str, str]]:
+    with sqlite3.connect(home / "supervisor/task-state.sqlite3", timeout=3) as database:
+        return database.execute(
+            "SELECT id, job_id, state FROM requests WHERE job_id=? ORDER BY rowid",
+            (JOB_ID,),
+        ).fetchall()
+
+
 def _legacy_symlink_snapshot(path: Path) -> tuple[int, int, int, int, int, str]:
     metadata = path.lstat()
     return (
@@ -253,7 +261,16 @@ def test_root_execute_opens_legacy_job_lock_and_prevents_overlap(
             wait_for(started, timeout=8.0)
             duplicate = _execute(home, telegram, "legacy-lock-duplicate")
             assert duplicate.returncode == 0, duplicate.stderr or duplicate.stdout
-            assert duplicate.stdout.strip() == ""
+            duplicate_id = f"{JOB_ID}:legacy-lock-duplicate"
+            assert json.loads(duplicate.stdout.strip()) == {
+                "task": JOB_ID,
+                "status": "queued",
+                "request_id": duplicate_id,
+            }
+            assert _request_states(home) == [
+                (f"{JOB_ID}:legacy-lock-first", JOB_ID, "running"),
+                (duplicate_id, JOB_ID, "queued"),
+            ]
             assert marker.read_text(encoding="utf-8").splitlines() == ["started"]
 
             release.touch()
@@ -262,6 +279,10 @@ def test_root_execute_opens_legacy_job_lock_and_prevents_overlap(
             assert json.loads(stdout.strip()) == {"task": JOB_ID, "status": "ok"}
             assert marker.read_text(encoding="utf-8").splitlines() == ["started"]
             assert _run_statuses(home) == [("ok",)]
+            assert _request_states(home) == [
+                (f"{JOB_ID}:legacy-lock-first", JOB_ID, "completed"),
+                (duplicate_id, JOB_ID, "queued"),
+            ]
         finally:
             if first.poll() is None:
                 release.touch(exist_ok=True)

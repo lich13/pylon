@@ -753,13 +753,39 @@ pub async fn service(config: &Config, id: &str) -> Result<i32> {
     while !service.passive && config.home.join("run/freeze").is_file() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    let context = api::rpc(
+    // Persist the service identity in supervisor-only storage so an independently
+    // restarted observer can record a gateway outage without requiring that gateway.
+    let _ = crate::queue::connect(config)?;
+    let cached = config
+        .home
+        .join("supervisor")
+        .join(format!("service-{module_id}--{service_id}.json"));
+    let previous = fs::read(&cached)
+        .ok()
+        .and_then(|v| serde_json::from_slice::<Value>(&v).ok());
+    let opened = api::rpc(
         config,
         "context.open",
         json!({"module":module_id,"subject":format!("service:{service_id}")}),
         "",
     )
-    .await?;
+    .await;
+    let context = match opened {
+        Ok(mut value) => {
+            value["module_hash"] = json!(module.hash);
+            crate::config::atomic_json(&cached, &value, 0o600)?;
+            if let Some(old) = &previous
+                && let Some(token) = old["token"].as_str()
+            {
+                let _ = api::rpc(config, "context.close", json!({}), token).await;
+            }
+            value
+        }
+        Err(error) => match previous {
+            Some(value) if value["module_hash"] == module.hash => value,
+            _ => return Err(error),
+        },
+    };
     let token = context["token"].as_str().context("context missing")?;
     let env = environment(
         config,
@@ -769,8 +795,9 @@ pub async fn service(config: &Config, id: &str) -> Result<i32> {
         context["bot"].as_str().unwrap(),
         token,
     )?;
+    // This context remains valid for this service across disconnected restarts.
+    // Its next successful context.open replaces and revokes it.
     let result = process(config, module, &service.entry, &env, None, None).await;
-    let _ = api::rpc(config, "context.close", json!({}), token).await;
     Ok(result?.0)
 }
 
