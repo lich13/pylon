@@ -334,15 +334,7 @@ pub async fn deliver(store: &Store, telegram: &Telegram, bot: &Bot, event: &Valu
                 Ok(json!(receipt))
             },
             "document"=>{let sent=telegram.document(&bot.owner,payload).await?;Ok(json!({"message_id":sent["message_id"],"chat_id":sent["chat"]["id"],"document":sent["document"]}))},
-            "bark"=>{
-                let base=payload["api_base"].as_str().context("Bark endpoint missing")?;
-                let response=telegram.http.post(format!("{}/push",base.trim_end_matches('/'))).json(&payload["body"]).send().await.map_err(|e|Failure{status:if e.is_connect(){"pending"}else{"uncertain"},reason:"Bark network error".into(),delay:30.0})?;
-                let status=response.status().as_u16();
-                if status==429{return Err(Failure{status:"pending",reason:"Bark rate limit".into(),delay:60.0}.into())}
-                let value:Value=response.json().await.map_err(|_|Failure{status:"uncertain",reason:"Bark response invalid".into(),delay:0.0})?;
-                if !(200..300).contains(&status)||(!value["code"].is_null()&&!matches!(value["code"].as_i64(),Some(0|200))&&value["code"]!="200"){return Err(Failure{status:if status>=500{"uncertain"}else{"failed"},reason:format!("Bark HTTP {status}"),delay:0.0}.into())}
-                Ok(json!({"http_status":status,"code":value["code"]}))
-            },
+            "bark"=>crate::bark::send(payload).await,
             _=>anyhow::bail!("unsupported delivery kind")
         }
     }.await;

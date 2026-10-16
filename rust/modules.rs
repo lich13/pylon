@@ -560,7 +560,13 @@ fn health_candidate(
             std::fs::create_dir_all(root.join(name))?;
         }
         for workspace in users.workspaces.values() {
-            std::fs::create_dir_all(root.join(&workspace.root))?;
+            let sandbox = crate::config::Config::new(root.clone());
+            let path = sandbox.contained(&workspace.root)?;
+            std::fs::create_dir_all(&path)?;
+            ensure!(
+                sandbox.contained(&workspace.root)? == path,
+                "workspace changed during creation"
+            );
         }
         std::fs::create_dir_all(root.join("profiles").join(&module.manifest.workspace))?;
         fn own(path: &Path, uid: u32, gid: u32) -> Result<()> {

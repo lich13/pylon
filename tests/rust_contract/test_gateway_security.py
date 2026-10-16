@@ -7,10 +7,13 @@ starts the listener without ``--offline`` and disables every fixture bot.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import pwd
+import re
 import shlex
 import signal
 import socket
@@ -29,6 +32,7 @@ from test_gateway_contract import (
     ROOT,
     FakeTelegram,
     Gateway as OfflineGateway,
+    assert_rpc_rejected,
     open_context,
     rpc,
     rpc_value,
@@ -265,8 +269,7 @@ def test_callback_and_lookup_are_scoped_to_the_context_bot_owner(workdir, telegr
         assert same_owner_other_bot["value"] is False
 
         different_owner_bot = _auth_callback(home, alpha, query, bot="bot_two")
-        assert different_owner_bot["ok"] is False
-        assert "owner mismatch" in different_owner_bot["error"]
+        assert_rpc_rejected(different_owner_bot)
 
         beta_lookup = rpc_value(home, "delivery.lookup", {"message_id": 4501}, beta)
         assert beta_lookup == []
@@ -274,7 +277,7 @@ def test_callback_and_lookup_are_scoped_to_the_context_bot_owner(workdir, telegr
 
 def test_auth_sign_is_stable_and_isolated_by_bot_credential(workdir, telegram):
     home = workdir / "home"
-    _seed_security_home(home, telegram)
+    tokens = _seed_security_home(home, telegram)
 
     with OfflineGateway(home, telegram):
         context = open_context(home, "alpha", "job_alpha")["token"]
@@ -285,13 +288,25 @@ def test_auth_sign_is_stable_and_isolated_by_bot_credential(workdir, telegram):
             home, "auth.sign", {**params, "bot": "bot_peer"}, context
         )
 
+        expected_legacy = hmac.new(
+            tokens["bot_one"].encode(),
+            b"bot_one|open|market",
+            hashlib.sha256,
+        ).hexdigest()[:12]
+        expected_peer_legacy = hmac.new(
+            tokens["bot_peer"].encode(),
+            b"bot_peer|open|market",
+            hashlib.sha256,
+        ).hexdigest()[:12]
         assert first == repeated
-        assert len(first) == 12 and all(char in "0123456789abcdef" for char in first)
-        assert len(peer_bot) == 12 and peer_bot != first
+        assert re.fullmatch(r"[0-9a-f]{32}", first)
+        assert re.fullmatch(r"[0-9a-f]{32}", peer_bot)
+        assert first[:12] == expected_legacy
+        assert peer_bot[:12] == expected_peer_legacy
+        assert peer_bot != first
 
         different_owner = rpc(home, "auth.sign", {**params, "bot": "bot_two"}, context)
-        assert different_owner["ok"] is False
-        assert "owner mismatch" in different_owner["error"]
+        assert_rpc_rejected(different_owner)
 
 
 class _ProductionGateway(OfflineGateway):
@@ -412,8 +427,7 @@ def test_production_context_open_rejects_an_ordinary_unix_peer(
             before = database.execute("SELECT COUNT(*) FROM contexts").fetchone()[0]
 
         response = _run_context_open_as(uid, gid, home)
-        assert response["ok"] is False
-        assert "only the trusted supervisor can issue execution contexts" in response["error"]
+        assert_rpc_rejected(response)
 
         with sqlite3.connect(home / "gateway/state.sqlite3", timeout=3) as database:
             after = database.execute("SELECT COUNT(*) FROM contexts").fetchone()[0]
@@ -617,3 +631,83 @@ def test_root_broker_uses_trusted_helper_and_module_uid_cannot_write_protected_f
 
     assert helper.read_bytes() == helper_before
     assert secret.read_bytes() == secret_before
+
+
+@pytest.mark.parametrize(
+    "behavior",
+    ["invalid_json", "nonzero_exit"],
+    ids=["invalid-json", "nonzero-exit"],
+)
+def test_root_broker_redacts_helper_failures_and_runs_helper_once(
+    root_broker_workdir, telegram, behavior
+):
+    home = root_broker_workdir / "home"
+    helper = home / "gateway/fixture-failing-helper.sh"
+    proof = home / "gateway/fixture-failing-helper-ran"
+    sensitive_output = "fixture-root-helper-sensitive-output"
+    seed_home(
+        home,
+        telegram,
+        [("bot_one", "101")],
+        [{"id": "alpha", "topic": "topic_alpha", "job_id": "job_alpha"}],
+        {"topic_alpha": "bot_one"},
+    )
+
+    helper_output = (
+        f'{{"detail":"{sensitive_output}",'
+        if behavior == "invalid_json"
+        else sensitive_output
+    )
+    helper_script = (
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "cat >/dev/null\n"
+        f"printf 'broker-ran\\n' >> {shlex.quote(str(proof))}\n"
+        f"printf '%s\\n' {shlex.quote(helper_output)}\n"
+    )
+    if behavior == "nonzero_exit":
+        helper_script += "exit 23\n"
+    helper.write_text(helper_script, encoding="utf-8")
+    helper.chmod(0o755)
+    proof.write_bytes(b"")
+    proof.chmod(0o600)
+
+    manifest_path = home / "modules/alpha/module.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["capabilities"] = ["fixture.write"]
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    grant = {
+        "fixture.write": {
+            "modules": ["alpha"],
+            "origins": ["job:job_alpha"],
+            "argv": ["/bin/sh", str(helper)],
+            "trusted_paths": [str(helper)],
+            "timeout": 5,
+        }
+    }
+    capability_path = home / "config/capabilities.json"
+    capability_path.write_text(json.dumps(grant, indent=2), encoding="utf-8")
+    capability_path.chmod(0o600)
+
+    with OfflineGateway(home, telegram):
+        (home / "run").chmod(0o755)
+        with _running_root_broker(home):
+            context = open_context(home, "alpha", "job_alpha")["token"]
+            response = rpc(
+                home,
+                "capability.invoke",
+                {"capability": "fixture.write", "params": {}},
+                context,
+            )
+
+            assert response.get("ok") is False, response
+            assert response.get("error_code") == "rejected", response
+            assert response.get("retryable") is False, response
+            expected_error = (
+                "operation result uncertain; inspect retained state"
+                if behavior == "invalid_json"
+                else "request rejected"
+            )
+            assert response.get("error") == expected_error, response
+            assert sensitive_output not in json.dumps(response)
+            assert proof.read_text(encoding="utf-8").splitlines() == ["broker-ran"]

@@ -4,7 +4,7 @@ Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人�
 
 ## 本机开发
 
-本机 `rust-toolchain.toml` 使用 stable，CI 固定已验证的 Rust 1.99.0；依赖沿用 `Cargo.lock`，日常工作不依赖云端开发环境。
+本机 `rust-toolchain.toml`、最低支持版本与 CI 均固定为 Rust 1.99.0，edition 为 2024；依赖沿用 `Cargo.lock`，日常工作不依赖云端开发环境。
 
 ```sh
 cargo build --locked
@@ -15,6 +15,8 @@ cargo test --locked
 ```
 
 Python 3.12 和测试依赖仅用于黑盒契约测试。正式网关是单一 Rust 可执行文件，不需要 Python 网关包。外置 Python 业务使用自己的锁文件及 `pylon_sdk`。
+
+首次准备契约测试环境时运行 `.venv/bin/python -m pip install --require-hashes -r tests/rust_contract/requirements.lock`。CI 使用相同锁文件，并用固定版本的 cargo-audit 检查 Cargo.lock。
 
 GitHub Actions 执行完整网关检查与 Linux root 权限测试，产出 `pylon-linux-x86_64`、`SHA256SUMS` 和 `REVISION`。生产使用对应提交的 CI 成品。
 

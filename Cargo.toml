@@ -1,8 +1,8 @@
 [package]
 name = "pylon"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.99.0"
 
 [lib]
 path = "rust/lib.rs"

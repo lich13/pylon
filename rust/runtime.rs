@@ -251,6 +251,11 @@ pub async fn process(
     timeout: Option<u64>,
 ) -> Result<(i32, String, String)> {
     let mut cmd = command(config, module, entry)?;
+    let home = config.home.canonicalize()?;
+    let root = Path::new(&env["PYLON_PROFILE_ROOT"]);
+    let relative = root.strip_prefix(&home).context("workspace escapes home")?;
+    let checked_root = config.contained(relative.to_str().context("invalid workspace path")?)?;
+    ensure!(checked_root == root, "workspace changed before execution");
     if unsafe { libc::geteuid() } == 0 {
         let settings = config.settings()?;
         let user = settings
@@ -270,7 +275,7 @@ pub async fn process(
     }
     cmd.env_clear()
         .envs(env)
-        .current_dir(&env["PYLON_PROFILE_ROOT"])
+        .current_dir(&checked_root)
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {

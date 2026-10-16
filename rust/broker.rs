@@ -31,14 +31,25 @@ pub async fn invoke(config: &Config, token: &str, params: &Value) -> Result<Valu
         .json(&json!({"context":token,"request":params}))
         .send()
         .await
-        .context("privileged broker unavailable")?
+        .map_err(|error| {
+            if error.is_connect() {
+                anyhow::Error::from(error).context("privileged broker unavailable")
+            } else {
+                anyhow::Error::from(error).context(crate::errors::ReconcileRequired)
+            }
+        })?
         .json()
-        .await?;
-    ensure!(
-        result["ok"] == true,
-        "{}",
-        result["error"].as_str().unwrap_or("capability rejected")
-    );
+        .await
+        .context(crate::errors::ReconcileRequired)?;
+    if result["ok"] != true {
+        if result["error"] == "operation result uncertain; inspect retained state" {
+            return Err(crate::errors::ReconcileRequired.into());
+        }
+        return Err(crate::errors::RemoteFailure {
+            retryable: result["retryable"].as_bool().unwrap_or(false),
+        }
+        .into());
+    }
     Ok(result["value"].clone())
 }
 pub async fn dispatch(config: &Config, request: &Value) -> Result<Value> {
@@ -102,21 +113,31 @@ pub async fn dispatch(config: &Config, request: &Value) -> Result<Value> {
         .kill_on_drop(true)
         .spawn()?;
     use tokio::io::AsyncWriteExt;
-    let mut stdin = child.stdin.take().context("helper input missing")?;
-    stdin.write_all(input.to_string().as_bytes()).await?;
-    stdin.shutdown().await?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context(crate::errors::ReconcileRequired)?;
+    stdin
+        .write_all(input.to_string().as_bytes())
+        .await
+        .context(crate::errors::ReconcileRequired)?;
+    stdin
+        .shutdown()
+        .await
+        .context(crate::errors::ReconcileRequired)?;
     drop(stdin);
     let output = tokio::time::timeout(
         Duration::from_secs(grant["timeout"].as_u64().unwrap_or(150)),
         child.wait_with_output(),
     )
     .await
-    .context("privileged result uncertain; inspect state before retry")??;
+    .context(crate::errors::ReconcileRequired)?
+    .context(crate::errors::ReconcileRequired)?;
     ensure!(
         output.status.success(),
         "privileged helper rejected or failed; inspect retained state"
     );
-    serde_json::from_slice(&output.stdout).context("invalid helper result; inspect retained state")
+    serde_json::from_slice(&output.stdout).context(crate::errors::ReconcileRequired)
 }
 pub async fn serve(config: Config) -> Result<()> {
     use axum::{Json, Router, extract::State, routing::post};
@@ -124,7 +145,10 @@ pub async fn serve(config: Config) -> Result<()> {
     async fn handle(State(config): State<Config>, Json(request): Json<Value>) -> Json<Value> {
         match dispatch(&config, &request).await {
             Ok(value) => Json(json!({"ok":true,"value":value})),
-            Err(e) => Json(json!({"ok":false,"error":e.to_string()})),
+            Err(e) => {
+                crate::errors::log("broker", &e);
+                Json(crate::errors::public(&e))
+            }
         }
     }
     let path = config.home.join("run/broker.sock");

@@ -10,7 +10,7 @@ import subprocess
 
 import pytest
 
-from test_gateway_contract import BIN, ROOT, rpc, rpc_value
+from test_gateway_contract import BIN, ROOT, assert_rpc_rejected, rpc, rpc_value
 from test_runtime_reliability import runtime_case
 
 
@@ -112,7 +112,7 @@ printf '%s,%s,%s,%s\\n' "$context" "$bot_token" "$test_endpoint" "$PYLON_MODULE_
     assert reconnected.returncode == 0, reconnected.stderr or reconnected.stdout
     replacement = json.loads(cached_path.read_text(encoding="utf-8"))
     assert replacement["module_hash"] != old_module_hash
-    assert rpc(case.home, "context.inspect", context=old_token)["ok"] is False
+    assert_rpc_rejected(rpc(case.home, "context.inspect", context=old_token))
     replacement_context = rpc_value(
         case.home, "context.inspect", context=replacement["token"]
     )

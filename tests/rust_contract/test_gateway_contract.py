@@ -67,6 +67,20 @@ def rpc_value(home: Path, method: str, params=None, context: str = ""):
     return response["value"]
 
 
+def assert_rpc_rejected(response: dict) -> None:
+    assert response.get("ok") is False, response
+    assert response.get("error") == "request rejected", response
+    assert response.get("error_code") == "rejected", response
+    assert response.get("retryable") is False, response
+
+
+def assert_rpc_unavailable(response: dict) -> None:
+    assert response.get("ok") is False, response
+    assert response.get("error") == "service temporarily unavailable", response
+    assert response.get("error_code") == "unavailable", response
+    assert response.get("retryable") is True, response
+
+
 def wait_for(predicate, timeout: float = 6.0, interval: float = 0.05):
     deadline = time.monotonic() + timeout
     last_error = None
@@ -542,8 +556,7 @@ def test_delivery_receipts_are_isolated_between_modules(workdir, telegram):
         assert owned["module"] == "alpha"
         assert owned["receipt"] == delivered["receipt"]
         rejected_get = rpc(home, "delivery.get", {"id": "alpha-event-1"}, beta)
-        assert rejected_get["ok"] is False
-        assert "another module" in rejected_get["error"]
+        assert_rpc_rejected(rejected_get)
         rejected_duplicate = rpc(
             home,
             "delivery.submit",
@@ -556,8 +569,7 @@ def test_delivery_receipts_are_isolated_between_modules(workdir, telegram):
             },
             beta,
         )
-        assert rejected_duplicate["ok"] is False
-        assert "another module" in rejected_duplicate["error"]
+        assert_rpc_rejected(rejected_duplicate)
         assert telegram.count(tokens["bot_one"], "sendMessage") == 1
 
 
@@ -591,12 +603,10 @@ def test_delivery_submit_and_cancel_are_idempotent_and_module_scoped(workdir, te
 
         changed = dict(params, payload={"text": "different content"})
         rejected = rpc(home, "delivery.submit", changed, alpha)
-        assert rejected["ok"] is False
-        assert "different content" in rejected["error"]
+        assert_rpc_rejected(rejected)
 
         rejected_cancel = rpc(home, "delivery.cancel", {"id": "cancel-event-1"}, beta)
-        assert rejected_cancel["ok"] is False
-        assert "another module" in rejected_cancel["error"]
+        assert_rpc_rejected(rejected_cancel)
         assert event_row(home, "cancel-event-1")["status"] == "pending"
 
         cancelled = rpc_value(home, "delivery.cancel", {"id": "cancel-event-1"}, alpha)
@@ -657,8 +667,7 @@ def test_cancel_before_delayed_submit_creates_non_deliverable_tombstone(workdir,
             },
             beta,
         )
-        assert cross_module["ok"] is False
-        assert "another module" in cross_module["error"]
+        assert_rpc_rejected(cross_module)
         time.sleep(0.2)
         assert event_row(home, "late-submit-event")["status"] == "suppressed"
         assert event_row(home, "late-submit-event")["attempts"] == 0
@@ -847,8 +856,7 @@ def test_web_login_is_single_use_and_bound_to_the_authenticated_owner(workdir, t
         alpha = open_context(home, "alpha", "job_alpha")["token"]
         beta = open_context(home, "beta", "job_beta")["token"]
         blocked = rpc(home, "auth.issue", {"workspace": "market"}, alpha)
-        assert blocked["ok"] is False
-        assert "authenticated owner request" in blocked["error"]
+        assert_rpc_rejected(blocked)
 
         context_hash = hashlib.sha256(alpha.encode()).hexdigest()
         with sqlite3.connect(home / "gateway/state.sqlite3", timeout=3) as database:
@@ -859,8 +867,7 @@ def test_web_login_is_single_use_and_bound_to_the_authenticated_owner(workdir, t
 
         token = rpc_value(home, "auth.issue", {"workspace": "market"}, alpha)
         rejected_owner = rpc(home, "auth.redeem", {"token": token}, beta)
-        assert rejected_owner["ok"] is False
-        assert "owner changed" in rejected_owner["error"]
+        assert_rpc_rejected(rejected_owner)
         with sqlite3.connect(home / "gateway/state.sqlite3", timeout=3) as database:
             token_row = database.execute(
                 "SELECT hash,used_at FROM web_tokens"
@@ -892,8 +899,7 @@ def test_web_login_is_single_use_and_bound_to_the_authenticated_owner(workdir, t
             beta,
         ) is None
         repeated = rpc(home, "auth.redeem", {"token": token}, alpha)
-        assert repeated["ok"] is False
-        assert "already used" in repeated["error"]
+        assert_rpc_rejected(repeated)
 
 
 def test_capability_rpc_requires_valid_context_and_fails_closed_without_broker(workdir, telegram):
@@ -913,18 +919,19 @@ def test_capability_rpc_requires_valid_context_and_fails_closed_without_broker(w
             {"capability": "fixture.write", "params": {}},
             "not-a-context-token",
         )
-        assert invalid_context["ok"] is False
-        assert "invalid execution context" in invalid_context["error"]
+        assert_rpc_rejected(invalid_context)
 
         context = open_context(home, "alpha", "job_alpha")["token"]
+        # No broker socket exists, so the request fails before the privileged
+        # operation is received and remains safe to retry.
+        assert not (home / "run/broker.sock").exists()
         denied = rpc(
             home,
             "capability.invoke",
             {"capability": "fixture.write", "params": {}},
             context,
         )
-        assert denied["ok"] is False
-        assert "privileged broker unavailable" in denied["error"]
+        assert_rpc_unavailable(denied)
 
 
 def test_duplicate_bot_credentials_are_rejected_without_partial_registration(workdir, telegram):
@@ -1124,20 +1131,57 @@ def test_fourth_bot_and_module_reload_without_replacing_gateway_or_binary(workdi
             "context.open",
             {"module": "intruder", "subject": "job:job_intruder"},
         )
-        assert unavailable["ok"] is False
-        assert "unknown module" in unavailable["error"]
+        assert_rpc_rejected(unavailable)
         assert gateway.proc.pid == pid_before
         assert hashlib.sha256(BIN.read_bytes()).hexdigest() == binary_before
 
 
 def _read_stderr_line(process: subprocess.Popen | None, fragment: str):
-    if process is None or process.stderr is None or process.poll() is not None:
+    if process is None or process.stderr is None:
         return None
-    ready, _, _ = select.select([process.stderr], [], [], 0)
+
+    # select() observes the pipe fd, while TextIOWrapper.readline() can prefetch
+    # several lines into its own buffer. Read from the fd directly so a buffered
+    # line cannot become invisible to later select() calls.
+    buffer = getattr(process, "_gateway_contract_stderr_buffer", None)
+    if buffer is None:
+        buffer = bytearray()
+        process._gateway_contract_stderr_buffer = buffer
+
+    def take_matching_line():
+        while True:
+            newline = buffer.find(b"\n")
+            if newline < 0:
+                return None
+            raw_line = bytes(buffer[: newline + 1])
+            del buffer[: newline + 1]
+            line = raw_line.decode("utf-8", errors="replace")
+            if fragment in line:
+                return line
+
+    line = take_matching_line()
+    if line is not None:
+        return line
+
+    fd = process.stderr.fileno()
+    ready, _, _ = select.select([fd], [], [], 0)
     if not ready:
         return None
-    line = process.stderr.readline()
-    return line if fragment in line else None
+
+    try:
+        chunk = os.read(fd, 8192)
+    except OSError:
+        return None
+    if chunk:
+        buffer.extend(chunk)
+        return take_matching_line()
+
+    # A final diagnostic line may not end in a newline when the process exits.
+    if buffer:
+        line = bytes(buffer).decode("utf-8", errors="replace")
+        buffer.clear()
+        return line if fragment in line else None
+    return None
 
 
 def _wait_stderr_line(process: subprocess.Popen | None, fragment: str, timeout: float = 8.0):

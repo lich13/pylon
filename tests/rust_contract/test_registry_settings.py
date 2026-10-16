@@ -11,6 +11,7 @@ import pytest
 
 from test_gateway_contract import (
     FakeTelegram,
+    assert_rpc_rejected,
     _wait_stderr_line,
     rpc,
     rpc_value,
@@ -97,8 +98,7 @@ def test_hot_reload_rejects_unconfigured_job_reference_and_keeps_old_catalog(
             "context.open",
             {"module": "candidate", "subject": "job:job_candidate"},
         )
-        assert unavailable["ok"] is False
-        assert "unknown module" in unavailable["error"]
+        assert_rpc_rejected(unavailable)
 
 
 def test_fixture_job_runs_when_workspace_env_is_omitted(workdir, telegram):

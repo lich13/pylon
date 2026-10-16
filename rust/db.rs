@@ -63,6 +63,13 @@ impl Store {
         }
         Ok(())
     }
+    pub fn has_event(&self, id: &str) -> Result<bool> {
+        Ok(self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE id=?)",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
     pub fn submit(&self, module: &str, value: &Value, bot: &str) -> Result<Value> {
         let id = value["id"].as_str().context("event id required")?;
         ensure!(crate::identifier(id) && id.len() <= 64, "invalid event id");

@@ -198,6 +198,8 @@ pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
                 snapshot.settings.bots[bot].owner == snapshot.settings.bots[fallback].owner,
                 "delivery owner mismatch"
             );
+            let bot = bot.to_owned();
+            drop(snapshot);
             if p["kind"] == "document" {
                 let path = std::path::Path::new(
                     p["payload"]["path"]
@@ -212,19 +214,18 @@ pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
                 );
             }
             if p["kind"] == "bark" {
-                let url = reqwest::Url::parse(
+                // Reconcile an already persisted event without depending on today's DNS.
+                if app.store.has_event(p["id"].as_str().unwrap_or(""))? {
+                    return app.store.submit(module, p, &bot);
+                }
+                crate::bark::validate(
                     p["payload"]["api_base"]
                         .as_str()
                         .context("Bark endpoint missing")?,
-                )?;
-                ensure!(
-                    url.scheme() == "https"
-                        && url.username().is_empty()
-                        && url.password().is_none(),
-                    "invalid Bark endpoint"
                 )
+                .await?;
             }
-            app.store.submit(module, p, bot)
+            app.store.submit(module, p, &bot)
         }
         "delivery.get" | "delivery.cancel" => {
             let id = p["id"].as_str().context("event id required")?;
@@ -434,24 +435,16 @@ async fn handler(
         && peer.0 != 0
     {
         return Json(
-            json!({"ok":false,"api_version":2,"error":"only the trusted supervisor can issue execution contexts"}),
+            json!({"ok":false,"api_version":2,"error":"request rejected","error_code":"rejected","retryable":false}),
         );
     }
     match dispatch(&app, &r).await {
         Ok(value) => Json(json!({"ok":true,"api_version":2,"value":value})),
         Err(e) => {
-            let transient = e.chain().any(|c| {
-                c.is::<reqwest::Error>()
-                    || c.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                        !matches!(
-                            e.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                        )
-                    })
-            }) || e.to_string().contains("database is locked");
-            Json(
-                json!({"ok":false,"api_version":2,"error":e.to_string(),"error_code":if transient {"unavailable"} else {"rejected"},"retryable":transient}),
-            )
+            crate::errors::log("rpc", &e);
+            let mut result = crate::errors::public(&e);
+            result["api_version"] = json!(2);
+            Json(result)
         }
     }
 }

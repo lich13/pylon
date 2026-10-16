@@ -71,7 +71,7 @@ pub async fn request(app: &App, ctx: &Value, method: &str, p: &Value) -> Result<
                 .as_bytes(),
             );
             Ok(json!(
-                hex::encode(mac.finalize().into_bytes())[..12].to_owned()
+                hex::encode(mac.finalize().into_bytes())[..32].to_owned()
             ))
         }
         "auth.callback" => {

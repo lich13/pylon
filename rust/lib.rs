@@ -1,10 +1,12 @@
 pub mod api;
 pub mod auth;
+pub mod bark;
 pub mod broker;
 pub mod catalog;
 pub mod config;
 pub mod daemon;
 pub mod db;
+pub mod errors;
 pub mod migration;
 pub mod modules;
 pub mod queue;

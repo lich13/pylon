@@ -153,14 +153,19 @@ impl Config {
                     .all(|c| matches!(c, std::path::Component::Normal(_))),
             "unsafe relative path"
         );
-        let result = self.home.join(p);
-        if result.exists() {
-            ensure!(
-                result
-                    .canonicalize()?
-                    .starts_with(self.home.canonicalize()?),
-                "path escapes home"
-            );
+        let home = self.home.canonicalize()?;
+        let mut result = home.clone();
+        for part in p.components() {
+            result.push(part);
+            match fs::symlink_metadata(&result) {
+                Ok(_) => {
+                    // canonicalize also rejects dangling links. Path::exists would hide them.
+                    result = result.canonicalize()?;
+                    ensure!(result.starts_with(&home), "path escapes home");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(result)
     }

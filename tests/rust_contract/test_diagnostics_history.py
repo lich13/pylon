@@ -12,7 +12,15 @@ from pathlib import Path
 
 import pytest
 
-from test_gateway_contract import Gateway, FakeTelegram, open_context, rpc, rpc_value, seed_home
+from test_gateway_contract import (
+    Gateway,
+    FakeTelegram,
+    assert_rpc_rejected,
+    open_context,
+    rpc,
+    rpc_value,
+    seed_home,
+)
 
 
 @pytest.fixture
@@ -141,8 +149,7 @@ def test_diagnostics_handles_large_history_and_keeps_gateway_workers_available(w
 
             ordinary = open_context(home, "ordinary", "job_ordinary")["token"]
             denied = rpc(home, "diagnostics", context=ordinary)
-            assert denied["ok"] is False
-            assert "diagnostics capability required" in denied["error"]
+            assert_rpc_rejected(denied)
 
             observer = open_context(home, "observer", "job_observer")["token"]
             allowed = rpc(home, "diagnostics", context=observer)

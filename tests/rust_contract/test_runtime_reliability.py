@@ -22,6 +22,7 @@ from test_gateway_contract import (
     ROOT,
     FakeTelegram,
     Gateway,
+    assert_rpc_rejected,
     rpc,
     rpc_value,
     seed_home,
@@ -285,7 +286,7 @@ def test_completion_failure_overrides_successful_business_exit(runtime_case):
             "detail": "duplicate fixture must not replace the recorded result",
         }
         rejected = rpc(case.home, "run.finish", replacement, context)
-        assert rejected["ok"] is False
+        assert_rpc_rejected(rejected)
         replacement["status"] = "failed"
         rpc_value(case.home, "run.finish", replacement, context)
         assert case.runs() == recorded_runs
