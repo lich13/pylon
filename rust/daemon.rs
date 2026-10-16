@@ -36,7 +36,8 @@ pub fn menu(snapshot: &Snapshot, bot: &str) -> Vec<Value> {
 async fn synchronize(app: &App, id: &str, bot: &Bot, tg: &Telegram) -> Result<()> {
     let wanted = menu(&*app.snapshot.read().await, id);
     let hash = crate::digest(serde_json::to_vec(&wanted)?);
-    if app.store.get(&format!("menu:{id}"))? == hash {
+    let key = format!("menu:{id}");
+    if app.store.blocking(move |store| store.get(&key)).await? == hash {
         return Ok(());
     }
     for scope in [
@@ -63,7 +64,10 @@ async fn synchronize(app: &App, id: &str, bot: &Bot, tg: &Telegram) -> Result<()
             tg.call("setChatMenuButton", &query, true).await?;
         }
     }
-    app.store.put(&format!("menu:{id}"), &json!(hash))?;
+    let key = format!("menu:{id}");
+    app.store
+        .blocking(move |store| store.put(&key, &json!(hash)))
+        .await?;
     Ok(())
 }
 pub fn save_updates(app: &App, id: &str, bot: &Bot, updates: &[Value]) -> Result<()> {
@@ -120,21 +124,35 @@ pub fn save_updates(app: &App, id: &str, bot: &Bot, updates: &[Value]) -> Result
 }
 async fn invoke(
     app: &App,
+    contexts: &mut Vec<String>,
     module: &Module,
     bot: &str,
     action: &str,
     payload: Value,
-    request_id: &str,
-    reply_id: Option<i64>,
+    request: (&str, Option<i64>),
 ) -> Result<Value> {
+    let (request_id, reply_id) = request;
     let origin = if matches!(action, "text" | "start" | "before_command") {
         "command"
     } else {
         action
     };
-    let token = crate::auth::context(&app.store, module, bot, &module.manifest.workspace, origin)?;
+    let (owned_module, owned_bot, owned_origin) =
+        (module.clone(), bot.to_owned(), origin.to_owned());
+    let token = app
+        .store
+        .blocking(move |store| {
+            crate::auth::context(
+                &store,
+                &owned_module,
+                &owned_bot,
+                &owned_module.manifest.workspace,
+                &owned_origin,
+            )
+        })
+        .await?;
+    contexts.push(token.clone());
     let result=crate::runtime::request_executor(&app.config,&json!({"module":module.manifest.id,"context":token,"action":action,"payload":payload,"request_id":request_id,"reply_id":reply_id})).await;
-    crate::auth::revoke(&app.store, &token)?;
     result.map(|v| {
         let mut v = card(v);
         if v.is_object() {
@@ -156,6 +174,7 @@ fn card(value: Value) -> Value {
 }
 async fn route(
     app: &App,
+    contexts: &mut Vec<String>,
     id: &str,
     kind: &str,
     message: &Value,
@@ -173,12 +192,12 @@ async fn route(
             .context("此按钮已停用，请使用 /help 打开当前入口")?;
         return invoke(
             app,
+            contexts,
             module,
             id,
             "callback",
             json!({"query":message}),
-            request_id,
-            message["message"]["message_id"].as_i64(),
+            (request_id, message["message"]["message_id"].as_i64()),
         )
         .await
         .map(card);
@@ -204,12 +223,12 @@ async fn route(
             .context("未注册此文件的处理入口")?;
         return invoke(
             app,
+            contexts,
             module,
             id,
             "document",
             json!({"message":message}),
-            request_id,
-            reply_id,
+            (request_id, reply_id),
         )
         .await
         .map(card);
@@ -229,12 +248,12 @@ async fn route(
                 {
                     let value = invoke(
                         app,
+                        contexts,
                         module,
                         id,
                         "start",
                         json!({"argument":argument}),
-                        request_id,
-                        reply_id,
+                        (request_id, reply_id),
                     )
                     .await?;
                     if !value.is_null() {
@@ -261,12 +280,12 @@ async fn route(
         {
             invoke(
                 app,
+                contexts,
                 hook,
                 id,
                 "before_command",
                 json!({"name":name,"argument":argument}),
-                request_id,
-                reply_id,
+                (request_id, reply_id),
             )
             .await?;
         }
@@ -277,19 +296,23 @@ async fn route(
             && let Some(target) = snapshot.settings.routes.get(&command.topic)
             && target != id
         {
-            let bot = &snapshot.settings.bots[target];
+            let bot = snapshot
+                .settings
+                .bots
+                .get(target)
+                .context("route bot missing")?;
             return Ok(
                 json!({"text":format!("此功能已迁至 @{}，请在那里使用 /{}。",bot.username,command.name)}),
             );
         }
         invoke(
             app,
+            contexts,
             module,
             id,
             "command",
             json!({"name":name,"argument":argument,"command_action":command.action}),
-            request_id,
-            reply_id,
+            (request_id, reply_id),
         )
         .await
         .map(card)
@@ -302,12 +325,12 @@ async fn route(
         {
             let value = invoke(
                 app,
+                contexts,
                 module,
                 id,
                 "text",
                 json!({"text":text,"message":message,"reply_id":reply_id}),
-                request_id,
-                reply_id,
+                (request_id, reply_id),
             )
             .await?;
             if !value.is_null() {
@@ -318,8 +341,10 @@ async fn route(
     }
 }
 pub async fn command_once(app: &App, id: &str, tg: &Telegram) -> Result<bool> {
-    let row = {
-        let mut db = app.store.connect()?;
+    let bot_id = id.to_owned();
+    let row = app.store.blocking(move |store| {
+        let id = bot_id.as_str();
+        let mut db = store.connect()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let row:Option<(i64,String,String)>=tx.query_row("SELECT update_id,kind,payload FROM updates WHERE profile=? AND status='pending' ORDER BY update_id LIMIT 1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         if let Some((uid, _, _)) = &row {
@@ -329,8 +354,8 @@ pub async fn command_once(app: &App, id: &str, tg: &Telegram) -> Result<bool> {
             )?;
         }
         tx.commit()?;
-        row
-    };
+        Ok(row)
+    }).await?;
     let Some((uid, kind, payload)) = row else {
         return Ok(false);
     };
@@ -344,17 +369,29 @@ pub async fn command_once(app: &App, id: &str, tg: &Telegram) -> Result<bool> {
             )
             .await;
     }
+    let mut contexts = Vec::new();
     let result = if message.is_null() {
         Err(anyhow::anyhow!("stored update is invalid"))
     } else {
-        route(app, id, &kind, &message, &format!("telegram:{id}:{uid}")).await
+        route(
+            app,
+            &mut contexts,
+            id,
+            &kind,
+            &message,
+            &format!("telegram:{id}:{uid}"),
+        )
+        .await
     };
     let (mut reply, status) = match result {
         Ok(value) => (value, "done"),
-        Err(_) => (
-            json!({"text":"操作未完成或结果待核对。请打开对应入口查看记录；没有自动重复执行。"}),
-            "uncertain",
-        ),
+        Err(error) => {
+            crate::errors::log("command-execution", &error);
+            (
+                json!({"text":"操作未完成或结果待核对。请打开对应入口查看记录；没有自动重复执行。"}),
+                "uncertain",
+            )
+        }
     };
     let owner = reply
         .as_object_mut()
@@ -365,7 +402,19 @@ pub async fn command_once(app: &App, id: &str, tg: &Telegram) -> Result<bool> {
         reply["expires_at"] = json!(crate::now() + 600.0);
     }
     loop {
-        match app.store.complete_update(id, uid, &owner, &reply, status) {
+        let (id, owner, reply, contexts) = (
+            id.to_owned(),
+            owner.clone(),
+            reply.clone(),
+            contexts.clone(),
+        );
+        match app
+            .store
+            .blocking(move |store| {
+                store.complete_update(&id, uid, &owner, &reply, status, &contexts)
+            })
+            .await
+        {
             Ok(()) => break,
             Err(error) => {
                 crate::errors::log("command-result-persistence", &error);
@@ -378,6 +427,120 @@ pub async fn command_once(app: &App, id: &str, tg: &Telegram) -> Result<bool> {
 async fn pause(stop: &mut watch::Receiver<bool>, seconds: f64) -> bool {
     tokio::select! {_=stop.changed()=>true,_=tokio::time::sleep(Duration::from_secs_f64(seconds))=>*stop.borrow()}
 }
+async fn lane_once(
+    app: App,
+    id: String,
+    bot: Bot,
+    tg: Telegram,
+    lane: &'static str,
+    mut stop: watch::Receiver<bool>,
+) -> Result<f64> {
+    if *stop.borrow() {
+        return Ok(0.0);
+    }
+    match lane {
+        "poll" => {
+            let key = format!("offset:{id}");
+            let offset = app
+                .store
+                .blocking(move |s| s.get(&key))
+                .await?
+                .as_i64()
+                .unwrap_or(0);
+            let query = json!({"offset":offset,"timeout":25,"allowed_updates":["message","callback_query"]});
+            let result = tokio::select! {
+                biased;
+                _ = stop.changed() => return Ok(0.0),
+                result = tg.call("getUpdates", &query, true) => result,
+            };
+            match result {
+                Ok(value) => {
+                    let updates = value.as_array().context("invalid updates")?.clone();
+                    let empty = updates.is_empty();
+                    let work = app.clone();
+                    app.store
+                        .blocking(move |s| {
+                            save_updates(&work, &id, &bot, &updates)?;
+                            s.put(
+                                &format!("connection:{id}"),
+                                &json!({"status":"ok","at":crate::now()}),
+                            )
+                        })
+                        .await?;
+                    Ok(if empty { 1.0 } else { 0.1 })
+                }
+                Err(failure) => {
+                    let delay = failure.delay.max(5.0);
+                    app.store
+                        .blocking(move |s| {
+                            s.put(
+                                &format!("connection:{id}"),
+                                &json!({"status":"failed","at":crate::now(),"retry_after":delay}),
+                            )
+                        })
+                        .await?;
+                    Ok(delay)
+                }
+            }
+        }
+        "command" => Ok(if command_once(&app, &id, &tg).await? {
+            0.0
+        } else {
+            0.5
+        }),
+        "menu" => {
+            let result = tokio::select! {
+                biased;
+                _ = stop.changed() => return Ok(0.0),
+                result = synchronize(&app, &id, &bot, &tg) => result,
+            };
+            let ok = result.is_ok();
+            app.store
+                .blocking(move |s| {
+                    s.put(
+                        &format!("menu-state:{id}"),
+                        &json!({"status":if ok {"ok"} else {"failed"},"at":crate::now()}),
+                    )
+                })
+                .await?;
+            result?;
+            Ok(30.0)
+        }
+        _ => {
+            if bot.require_start {
+                let key = format!("bot_started:{id}");
+                if app.store.blocking(move |s| s.get(&key)).await? != json!(true) {
+                    return Ok(1.0);
+                }
+            }
+            let claimed_bot = id.clone();
+            let event = app
+                .store
+                .blocking(move |s| s.claim_lane(&claimed_bot, Some(lane == "bark")))
+                .await?;
+            if let Some(event) = event {
+                let started = crate::now();
+                let delay = crate::telegram::deliver(&app.store, &tg, &bot, &event).await?;
+                // Metrics cannot change an already persisted delivery result.
+                if let Err(error) = app
+                    .store
+                    .blocking(move |s| {
+                        s.put(
+                            &format!("delivery-timing:{id}:{lane}"),
+                            &json!({"seconds":crate::now()-started,"at":crate::now()}),
+                        )
+                    })
+                    .await
+                {
+                    crate::errors::log("delivery-metrics", &error);
+                }
+                Ok(delay)
+            } else {
+                Ok(0.5)
+            }
+        }
+    }
+}
 async fn bot_worker(app: App, id: String, bot: Bot, stop: watch::Receiver<bool>) -> Result<()> {
     let family = app
         .snapshot
@@ -387,7 +550,16 @@ async fn bot_worker(app: App, id: String, bot: Bot, stop: watch::Receiver<bool>)
         .telegram_ip_family
         .clone();
     let tg = Telegram::with_family(&app.config, &bot, &family)?;
-    let mut lanes = Vec::new();
+    bot_worker_client(app, id, bot, tg, stop).await
+}
+async fn bot_worker_client(
+    app: App,
+    id: String,
+    bot: Bot,
+    tg: Telegram,
+    stop: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut lanes = tokio::task::JoinSet::new();
     for lane in ["poll", "command", "telegram", "bark", "menu"] {
         let (app, id, bot, tg, mut stop) = (
             app.clone(),
@@ -396,79 +568,84 @@ async fn bot_worker(app: App, id: String, bot: Bot, stop: watch::Receiver<bool>)
             tg.clone(),
             stop.clone(),
         );
-        lanes.push(tokio::spawn(async move {
-            let mut failures=0_u32;
+        lanes.spawn(async move {
+            let mut failures = 0_u32;
             while !*stop.borrow() {
                 if app.config.home.join("run/freeze").exists() {
-                    if pause(&mut stop,1.0).await {break;}
+                    if pause(&mut stop, 1.0).await { break; }
                     continue;
                 }
-                let (work,bot_id,identity,client)=(app.clone(),id.clone(),bot.clone(),tg.clone());
-                let result=crate::isolated(async move {
-                    match lane {
-                        "poll"=>{
-                            let offset=work.store.get(&format!("offset:{bot_id}"))?.as_i64().unwrap_or(0);
-                            match client.call("getUpdates",&json!({"offset":offset,"timeout":25,"allowed_updates":["message","callback_query"]}),true).await {
-                                Ok(value)=>{
-                                    save_updates(&work,&bot_id,&identity,value.as_array().context("invalid updates")?)?;
-                                    work.store.put(&format!("connection:{bot_id}"),&json!({"status":"ok","at":crate::now()}))?;
-                                    Ok(if value.as_array().is_some_and(|v|v.is_empty()){1.0}else{0.1})
-                                },
-                                Err(f)=>{
-                                    work.store.put(&format!("connection:{bot_id}"),&json!({"status":"failed","at":crate::now(),"retry_after":f.delay.max(5.0)}))?;
-                                    Ok(f.delay.max(5.0))
-                                }
-                            }
-                        },
-                        "command"=>Ok(if command_once(&work,&bot_id,&client).await?{0.0}else{0.5}),
-                        "menu"=>{
-                            let result=synchronize(&work,&bot_id,&identity,&client).await;
-                            work.store.put(&format!("menu-state:{bot_id}"),&json!({"status":if result.is_ok(){"ok"}else{"failed"},"at":crate::now()}))?;
-                            result?;
-                            Ok(30.0)
-                        },
-                        _=>{
-                            if identity.require_start && work.store.get(&format!("bot_started:{bot_id}"))?!=json!(true){return Ok(1.0)}
-                            if let Some(event)=work.store.claim_lane(&bot_id,Some(lane=="bark"))? {
-                                let started=crate::now();
-                                let delay=crate::telegram::deliver(&work.store,&client,&identity,&event).await?;
-                                work.store.put(&format!("delivery-timing:{bot_id}:{lane}"),&json!({"seconds":crate::now()-started,"at":crate::now()}))?;
-                                Ok(delay)
-                            }else{Ok(0.5)}
-                        }
-                    }
-                }).await;
-                let delay=match result {
-                    Ok(delay)=>{failures=0;delay},
-                    Err(error)=>{
-                        failures=failures.saturating_add(1);
-                        crate::errors::log(lane,&error);
-                        let store=app.store.clone();let key=format!("worker:{id}:{lane}");
-                        if let Err(error)=store.blocking(move |s|{
-                            let count=s.get(&key)?["restarts"].as_u64().unwrap_or(0)+1;
-                            s.put(&key,&json!({"restarts":count,"consecutive_failures":failures,"at":crate::now(),"status":"retrying"}))
-                        }).await{crate::errors::log("worker-status",&error)}
-                        // Only the failed lane's abandoned claims become uncertain; other lanes retain ownership.
+                // The child boundary catches a panic without cancelling another lane.
+                let result = tokio::spawn(lane_once(app.clone(), id.clone(), bot.clone(), tg.clone(), lane, stop.clone()))
+                    .await.unwrap_or_else(|_| Err(crate::errors::ReconcileRequired.into()));
+                let recovering = failures > 0;
+                let delay = match &result {
+                    Ok(delay) => { failures = 0; *delay }
+                    Err(error) => {
+                        failures = failures.saturating_add(1);
+                        crate::errors::log(lane, error);
                         if error.is::<crate::errors::ReconcileRequired>() {
-                            let bot_id=id.clone();
-                            if let Err(error)=store.blocking(move |s| {
-                                let db=s.connect()?;
-                                if lane=="command" {db.execute("UPDATE updates SET status='uncertain' WHERE profile=? AND status='running'",[&bot_id])?;}
-                                if matches!(lane,"telegram"|"bark") {db.execute("UPDATE events SET status='uncertain',error='delivery worker interrupted',updated_at=? WHERE profile=? AND status='sending' AND (kind='bark')=?",params![crate::now(),bot_id,lane=="bark"])?;}
+                            let bot_id = id.clone();
+                            if let Err(error) = app.store.blocking(move |s| {
+                                let db = s.connect()?;
+                                if lane == "command" { db.execute("UPDATE updates SET status='uncertain' WHERE profile=? AND status='running'", [&bot_id])?; }
+                                if matches!(lane, "telegram" | "bark") { db.execute("UPDATE events SET status='uncertain',error='delivery worker interrupted',updated_at=? WHERE profile=? AND status='sending' AND (kind='bark')=?", params![crate::now(),bot_id,lane=="bark"])?; }
                                 Ok(())
-                            }).await{crate::errors::log("worker-reconcile",&error)}
+                            }).await { crate::errors::log("worker-reconcile", &error); }
                         }
-                        (5.0*2_f64.powi(failures.min(4) as i32-1)).min(60.0)
+                        (5.0 * 2_f64.powi(failures.min(5) as i32 - 1)).min(60.0)
                     }
                 };
-                if pause(&mut stop,delay).await{break;}
+                if result.is_err() || recovering {
+                    let key = format!("worker:{id}:{lane}");
+                    if let Err(error) = app.store.blocking(move |s| {
+                        let old = s.get(&key)?;
+                        let count = old["restarts"].as_u64().unwrap_or(0) + u64::from(failures > 0);
+                        s.put(&key, &json!({"restarts":count,"consecutive_failures":failures,"at":crate::now(),"status":if failures==0 {"ok"} else {"retrying"}}))
+                    }).await { crate::errors::log("worker-status", &error); }
+                }
+                if pause(&mut stop, delay).await { break; }
             }
-        }));
+        });
     }
-    for lane in lanes {
-        lane.await.context("bot lane task failed")?;
+    while let Some(result) = lanes.join_next().await {
+        if let Err(error) = result {
+            crate::errors::log("lane-supervisor", &error.into());
+        }
     }
     Ok(())
+}
+fn configuration_fingerprint(config: &crate::config::Config) -> String {
+    let mut bytes = std::fs::read(config.home.join("config/bots.json")).unwrap_or_default();
+    let registry = config.home.join("modules/registry.json");
+    let index = std::fs::read(&registry).unwrap_or_default();
+    bytes.extend(&index);
+    let mut roots = std::collections::BTreeSet::new();
+    if registry.exists() {
+        if let Ok(value) = serde_json::from_slice::<Value>(&index)
+            && let Some(modules) = value["modules"].as_object()
+        {
+            roots.extend(
+                modules
+                    .values()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned),
+            );
+        }
+    } else if let Ok(base) = config.contained("modules")
+        && let Ok(entries) = std::fs::read_dir(base)
+    {
+        for entry in entries.flatten() {
+            roots.insert(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    for relative in roots {
+        bytes.extend(relative.as_bytes());
+        if let Ok(path) = config.contained(&format!("modules/{relative}/module.json")) {
+            bytes.extend(std::fs::read(path).unwrap_or_default());
+        }
+    }
+    crate::digest(bytes)
 }
 pub async fn run(app: App) -> Result<()> {
     use fs2::FileExt;
@@ -496,42 +673,56 @@ pub async fn run(app: App) -> Result<()> {
     );
     let mut workers: BTreeMap<String, BotWorker> = BTreeMap::new();
     let mut shutdown = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut rejected = String::new();
+    let mut rejected = app
+        .store
+        .blocking(|s| s.get("configuration-rejected"))
+        .await?["fingerprint"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    let mut logged_rejected = String::new();
     let mut retrying: BTreeMap<String, (u32, f64)> = BTreeMap::new();
+    let mut next_digest = crate::now() + 60.0;
     loop {
         // A malformed replacement keeps the entire last valid configuration active.
         if let Err(error) = app.reload().await {
-            let mut rejected_bytes =
-                std::fs::read(app.config.home.join("config/bots.json")).unwrap_or_default();
-            rejected_bytes.extend(
-                std::fs::read(app.config.home.join("modules/registry.json")).unwrap_or_default(),
-            );
-            let fingerprint = crate::digest(rejected_bytes);
+            let config = app.config.clone();
+            let fingerprint =
+                crate::blocking(move || Ok(configuration_fingerprint(&config))).await?;
             if fingerprint != rejected {
-                crate::errors::log("configuration rejected", &error);
-                rejected = fingerprint;
-                let hash = rejected.clone();
-                if let Err(e) = app
+                if logged_rejected != fingerprint {
+                    crate::errors::log("configuration rejected", &error);
+                    logged_rejected = fingerprint.clone();
+                }
+                let hash = fingerprint.clone();
+                let target = app
+                    .snapshot
+                    .read()
+                    .await
+                    .settings
+                    .routes
+                    .get("personal")
+                    .cloned();
+                match app
                     .store
-                    .blocking(move |s| {
-                        s.put(
-                            "configuration-rejected",
-                            &json!({"fingerprint":hash,"at":crate::now()}),
-                        )
-                    })
+                    .blocking(move |s| s.configuration_rejected(&hash, target.as_deref()))
                     .await
                 {
-                    crate::errors::log("configuration-status", &e)
+                    Ok(()) => rejected = fingerprint,
+                    Err(error) => crate::errors::log("configuration-status", &error),
                 }
             }
         } else if !rejected.is_empty() {
-            rejected.clear();
-            if let Err(e) = app
+            match app
                 .store
                 .blocking(|s| s.put("configuration-rejected", &Value::Null))
                 .await
             {
-                crate::errors::log("configuration-status", &e)
+                Ok(()) => {
+                    rejected.clear();
+                    logged_rejected.clear();
+                }
+                Err(error) => crate::errors::log("configuration-status", &error),
             }
         }
         let snapshot = app.snapshot.read().await.clone();
@@ -563,6 +754,12 @@ pub async fn run(app: App) -> Result<()> {
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for id in remove {
+            if let Some((_, stop, task)) = workers.get(&id) {
+                let _ = stop.send(true);
+                if !task.is_finished() {
+                    continue;
+                }
+            }
             if let Some((hash, stop, task)) = workers.remove(&id) {
                 let changed = desired.get(&id) != Some(&hash);
                 let _ = stop.send(true);
@@ -609,7 +806,10 @@ pub async fn run(app: App) -> Result<()> {
                 (hash, tx, task)
             });
         }
-        if let Some(target) = snapshot.settings.routes.get("personal") {
+        if let Some(target) = snapshot.settings.routes.get("personal")
+            && crate::now() >= next_digest
+        {
+            next_digest = crate::now() + 60.0;
             let target = target.clone();
             if let Err(error) = app
                 .store
@@ -629,11 +829,152 @@ pub async fn run(app: App) -> Result<()> {
         }
         tokio::select! {_=shutdown.recv()=>break,_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(Duration::from_secs(5))=>{}}
     }
-    for (_, (_, stop, task)) in workers {
+    for (_, stop, _) in workers.values() {
         let _ = stop.send(true);
+    }
+    for (_, (_, _, task)) in workers {
         let _ = task.await;
     }
     rpc.abort();
     web.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, extract::State, routing::post};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::sync::Semaphore;
+
+    #[test]
+    fn configuration_fingerprint_covers_indexed_and_discovered_manifests() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::new(temp.path().to_path_buf());
+        let root = config.home.join("modules/fixture");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("module.json"), b"invalid one").unwrap();
+        let first = configuration_fingerprint(&config);
+        assert_eq!(first, configuration_fingerprint(&config));
+        std::fs::write(root.join("module.json"), b"invalid two").unwrap();
+        assert_ne!(first, configuration_fingerprint(&config));
+        std::fs::write(
+            config.home.join("modules/registry.json"),
+            br#"{"api_version":2,"modules":{"fixture":"fixture"}}"#,
+        )
+        .unwrap();
+        let indexed = configuration_fingerprint(&config);
+        std::fs::write(root.join("module.json"), b"invalid three").unwrap();
+        assert_ne!(indexed, configuration_fingerprint(&config));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_bot_lanes_deliver_telegram_while_bark_waits() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::new(temp.path().to_path_buf());
+        let store = crate::db::Store::new(&config.db()).unwrap();
+        let bot = Bot {
+            require_start: false,
+            owner: "101".into(),
+            credential: "fixture".into(),
+            username: String::new(),
+            enabled: true,
+            menus: vec![],
+        };
+        let app = App {
+            config,
+            store: store.clone(),
+            snapshot: Arc::new(tokio::sync::RwLock::new(Snapshot {
+                settings: crate::config::Settings::default(),
+                catalog: crate::catalog::Catalog::default(),
+            })),
+        };
+        let wanted = menu(&*app.snapshot.read().await, "fixture");
+        store
+            .put(
+                "menu:fixture",
+                &json!(crate::digest(serde_json::to_vec(&wanted).unwrap())),
+            )
+            .unwrap();
+        let accepted = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        async fn bark(
+            State((accepted, release)): State<(Arc<Semaphore>, Arc<Semaphore>)>,
+        ) -> Json<Value> {
+            accepted.add_permits(1);
+            let _permit = release.acquire().await.unwrap();
+            Json(json!({"code":200}))
+        }
+        let router = Router::new()
+            .route("/push", post(bark))
+            .with_state((accepted.clone(), release.clone()));
+        let bark_server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let sends = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let telegram_url = format!("http://{}", listener.local_addr().unwrap());
+        async fn telegram(
+            axum::extract::Path(method): axum::extract::Path<String>,
+            State(sends): State<Arc<AtomicUsize>>,
+        ) -> Json<Value> {
+            let result = if method == "sendMessage" {
+                sends.fetch_add(1, Ordering::Relaxed);
+                json!({"message_id":1,"chat":{"id":101}})
+            } else {
+                json!([])
+            };
+            Json(json!({"ok":true,"result":result}))
+        }
+        let router = Router::new()
+            .route("/botfixture/{method}", post(telegram))
+            .with_state(sends.clone());
+        let telegram_server =
+            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        store.submit("fixture", &json!({"id":"bark-held","kind":"bark","payload":{"fixture_transport":format!("http://{address}/push"),"body":{}}}), "fixture").unwrap();
+        let (stop, receiver) = watch::channel(false);
+        let worker = tokio::spawn(bot_worker_client(
+            app,
+            "fixture".into(),
+            bot,
+            Telegram::fixture(telegram_url),
+            receiver,
+        ));
+        let started = tokio::time::timeout(Duration::from_secs(3), accepted.acquire())
+            .await
+            .is_ok();
+        store
+            .submit(
+                "fixture",
+                &json!({"id":"telegram-free","kind":"text","payload":{"text":"fixture"}}),
+                "fixture",
+            )
+            .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if store.event("telegram-free").unwrap()["status"] == "delivered" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let held = store.event("bark-held").unwrap()["status"] == "sending";
+        release.add_permits(1);
+        stop.send(true).unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        bark_server.abort();
+        telegram_server.abort();
+        stopped.unwrap();
+        assert!(started && delivered && held);
+        assert_eq!(sends.load(Ordering::Relaxed), 1);
+        assert_eq!(store.event("bark-held").unwrap()["status"], "delivered");
+    }
 }

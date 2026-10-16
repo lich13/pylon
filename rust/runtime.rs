@@ -286,6 +286,37 @@ pub async fn process(
     input: Option<&Value>,
     timeout: Option<u64>,
 ) -> Result<(i32, String, String)> {
+    let identity = execution_identity(config, module)?;
+    process_as(config, module, entry, env, input, timeout, identity).await
+}
+fn execution_identity(config: &Config, module: &Module) -> Result<crate::config::RuntimeUser> {
+    if unsafe { libc::geteuid() } == 0 {
+        config
+            .settings()?
+            .runtime_users
+            .get(&module.manifest.id)
+            .cloned()
+            .context("module has no unprivileged runtime identity")
+    } else {
+        ensure!(
+            config.offline,
+            "production business execution requires the trusted supervisor"
+        );
+        Ok(crate::config::RuntimeUser {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        })
+    }
+}
+async fn process_as(
+    config: &Config,
+    module: &Module,
+    entry: &[String],
+    env: &BTreeMap<String, String>,
+    input: Option<&Value>,
+    timeout: Option<u64>,
+    identity: crate::config::RuntimeUser,
+) -> Result<(i32, String, String)> {
     let mut cmd = command(config, module, entry)?;
     let home = config.home.canonicalize()?;
     let root = Path::new(&env["PYLON_PROFILE_ROOT"]);
@@ -293,21 +324,11 @@ pub async fn process(
     let checked_root = config.contained(relative.to_str().context("invalid workspace path")?)?;
     ensure!(checked_root == root, "workspace changed before execution");
     if unsafe { libc::geteuid() } == 0 {
-        let settings = config.settings()?;
-        let user = settings
-            .runtime_users
-            .get(&module.manifest.id)
-            .context("module has no unprivileged runtime identity")?;
         ensure!(
-            user.uid != 0 && user.gid != 0,
+            identity.uid != 0 && identity.gid != 0,
             "business processes cannot run as root"
         );
-        crate::child_identity(cmd.as_std_mut(), user.uid, user.gid);
-    } else {
-        ensure!(
-            config.offline,
-            "production business execution requires the trusted supervisor"
-        )
+        crate::child_identity(cmd.as_std_mut(), identity.uid, identity.gid);
     }
     cmd.env_clear()
         .envs(env)
@@ -551,8 +572,22 @@ pub async fn executor(config: Config) -> Result<()> {
     }
     let listener = tokio::net::UnixListener::bind(&path)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?;
+    let summary_config = config.clone();
+    let summary_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let summary = summary_config.clone();
+            if let Err(error) =
+                crate::blocking(move || crate::queue::summary_refresh(&summary)).await
+            {
+                crate::errors::log("summary-refresh", &error);
+            }
+        }
+    });
     let supervisor = config.clone();
-    tokio::spawn(async move {
+    let dispatch_task = tokio::spawn(async move {
         loop {
             if let Err(error) = crate::queue::dispatch(&supervisor).await {
                 crate::errors::log("queue-reconcile", &error);
@@ -578,6 +613,8 @@ pub async fn executor(config: Config) -> Result<()> {
         }
     })
     .await?;
+    summary_task.abort();
+    dispatch_task.abort();
     Ok(())
 }
 pub async fn execute(config: &Config, id: &str) -> Result<i32> {
@@ -688,15 +725,11 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
     )
     .await?;
     let token = context["token"].as_str().context("context missing")?;
+    let identity = execution_identity(config, module)?;
     let output_dir = config.home.join("run/work").join(&module.manifest.id);
     fs::create_dir_all(&output_dir)?;
     if unsafe { libc::geteuid() } == 0 {
-        let users = config.settings()?;
-        let user = users
-            .runtime_users
-            .get(&module.manifest.id)
-            .context("runtime identity missing")?;
-        std::os::unix::fs::chown(&output_dir, Some(user.uid), Some(user.gid))?;
+        std::os::unix::fs::chown(&output_dir, Some(identity.uid), Some(identity.gid))?;
         fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700))?;
     }
     let result_file = output_dir.join(format!("{}.result.json", uuid::Uuid::new_v4()));
@@ -740,7 +773,16 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
     api::rpc(config, "run.start", json!({"id":run}), token).await?;
     db.execute("UPDATE requests SET state='running',token=?,owner=?,updated_at=? WHERE id=? AND state='queued'",rusqlite::params![token,std::process::id(),crate::now(),run])?;
     crate::queue::summary(config)?;
-    let output = process(config, module, &job.entry, &env, None, job.timeout).await;
+    let output = process_as(
+        config,
+        module,
+        &job.entry,
+        &env,
+        None,
+        job.timeout,
+        identity.clone(),
+    )
+    .await;
     let (status, stdout, stderr) = match output {
         Ok((0, out, err)) => ("ok", out, err),
         Ok((_, out, err)) => ("failed", out, err),
@@ -758,11 +800,7 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
         Ok(mut file) => {
             use std::os::unix::fs::MetadataExt;
             let metadata = file.metadata()?;
-            let uid = if unsafe { libc::geteuid() } == 0 {
-                config.settings()?.runtime_users[&module.manifest.id].uid
-            } else {
-                unsafe { libc::geteuid() }
-            };
+            let uid = identity.uid;
             if metadata.is_file() && metadata.uid() == uid && metadata.len() <= 8 * 1024 * 1024 {
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(
@@ -784,13 +822,14 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
         rusqlite::params![status, input.to_string(), crate::now(), run],
     )?;
     crate::queue::summary(config)?;
-    let completed = process(
+    let completed = process_as(
         config,
         module,
         &module.manifest.handler,
         &env,
         Some(&input),
         Some(150),
+        identity,
     )
     .await;
     let mut finish = json!({"id":run,"status":"uncertain","execution_status":status,"completion_status":"failed","notification_status":"unknown","detail":"completion response unavailable or invalid; reconcile without replay"});

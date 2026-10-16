@@ -46,7 +46,7 @@ pub fn revoke(store: &Store, token: &str) -> Result<()> {
 }
 
 pub async fn request(app: &App, ctx: &Value, method: &str, p: &Value) -> Result<Value> {
-    let snapshot = app.snapshot.read().await;
+    let snapshot = app.snapshot.read().await.clone();
     let bot_id = ctx["bot"].as_str().context("bot missing")?;
     let bot = snapshot.settings.bots.get(bot_id).context("bot removed")?;
     let workspace = p["workspace"].as_str().unwrap_or("");

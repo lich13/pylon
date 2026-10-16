@@ -10,9 +10,21 @@ use std::{
     collections::BTreeMap,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::PathBuf,
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
+static REPORT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static SPAWN_FAILURES: AtomicU64 = AtomicU64::new(0);
+static CHILD_FAILURES: AtomicU64 = AtomicU64::new(0);
+static SUMMARY_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub fn metrics() -> Value {
+    json!({"result_transfer_failures":REPORT_FAILURES.load(Ordering::Relaxed),
+        "spawn_failures":SPAWN_FAILURES.load(Ordering::Relaxed),"child_failures":CHILD_FAILURES.load(Ordering::Relaxed),
+        "summary_failures":SUMMARY_FAILURES.load(Ordering::Relaxed),"sqlite_busy":crate::db::busy_count()})
+}
 pub fn connect(config: &Config) -> Result<crate::db::PooledConnection> {
     if !config.home.join("run").is_dir() {
         std::fs::create_dir_all(config.home.join("run"))?;
@@ -117,12 +129,23 @@ pub fn state(config: &Config, id: &str) -> Result<String> {
     Ok(connect(config)?.query_row("SELECT state FROM requests WHERE id=?", [id], |r| r.get(0))?)
 }
 pub fn summary(config: &Config) -> Result<()> {
-    summary_inner(config, false)
+    let result = summary_inner(config, false, None);
+    if result.is_err() {
+        SUMMARY_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+    result
 }
 pub fn summary_flush(config: &Config) -> Result<()> {
-    summary_inner(config, true)
+    summary_inner(config, true, None).inspect_err(|_| {
+        SUMMARY_FAILURES.fetch_add(1, Ordering::Relaxed);
+    })
 }
-fn summary_inner(config: &Config, force: bool) -> Result<()> {
+pub fn summary_refresh(config: &Config) -> Result<()> {
+    summary_inner(config, false, Some(metrics())).inspect_err(|_| {
+        SUMMARY_FAILURES.fetch_add(1, Ordering::Relaxed);
+    })
+}
+fn summary_inner(config: &Config, force: bool, metrics: Option<Value>) -> Result<()> {
     let db = connect(config)?;
     let lock = crate::runtime::open_task_lock(&config.home.join("supervisor/summary.lock"))?;
     fs2::FileExt::lock_exclusive(&lock)?;
@@ -132,13 +155,24 @@ fn summary_inner(config: &Config, force: bool) -> Result<()> {
     }
     let mut q=db.prepare("SELECT id,job_id,module,state,created_at,updated_at,execution_status,completion_status,owner FROM requests WHERE state!='completed' OR updated_at>? ORDER BY created_at DESC LIMIT 200")?;
     let rows=q.query_map([now()-86400.0], |r| Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"module":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"created_at":r.get::<_,f64>(4)?,"updated_at":r.get::<_,f64>(5)?,"execution_status":r.get::<_,Option<String>>(6)?,"completion_status":r.get::<_,Option<String>>(7)?,"owner":r.get::<_,Option<u32>>(8)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
-    if previous["updated_at"].is_number() && previous["requests"] == json!(rows) {
+    let (queued, oldest): (u64, Option<f64>) = db.query_row(
+        "SELECT count(*),min(created_at) FROM requests WHERE state='queued'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let totals = json!({"queued_count":queued,"oldest_queued_at":oldest});
+    let metrics = metrics.unwrap_or_else(|| previous["metrics"].clone());
+    if previous["updated_at"].is_number()
+        && previous["requests"] == json!(rows)
+        && previous["metrics"] == metrics
+        && previous["totals"] == totals
+    {
         return Ok(());
     }
     // This contains no payload, context token, credential, path or user data.
     atomic_json(
         &config.home.join("run/task-summary.json"),
-        &json!({"updated_at":now(),"requests":rows}),
+        &json!({"updated_at":now(),"requests":rows,"metrics":metrics,"totals":totals}),
         0o644,
     )
 }
@@ -220,6 +254,7 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
         }
         if state == "reporting" {
             if let Err(error) = flush(config, &id).await {
+                REPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
                 crate::errors::log("queue-report", &error);
             }
         } else if state == "queued" {
@@ -248,7 +283,10 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
-                .spawn()?;
+                .spawn()
+                .inspect_err(|_| {
+                    SPAWN_FAILURES.fetch_add(1, Ordering::Relaxed);
+                })?;
             let supervisor = config.clone();
             let identity = crate::digest(&job);
             tokio::spawn(async move {
@@ -274,6 +312,7 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
                 let status = child.wait().await;
                 let tail = capture.await.unwrap_or_default();
                 if !status.as_ref().is_ok_and(|s| s.success()) {
+                    CHILD_FAILURES.fetch_add(1, Ordering::Relaxed);
                     let path = supervisor
                         .home
                         .join("supervisor")

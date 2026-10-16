@@ -4,9 +4,27 @@ use serde_json::{Value, json};
 use std::{
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
+
+static BUSY: AtomicU64 = AtomicU64::new(0);
+pub fn busy_count() -> u64 {
+    BUSY.load(Ordering::Relaxed)
+}
+fn wait_for_writer(attempt: i32) -> bool {
+    if attempt == 0 {
+        BUSY.fetch_add(1, Ordering::Relaxed);
+    }
+    if attempt >= 100 {
+        return false;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    true
+}
 
 #[derive(Clone)]
 pub struct Store {
@@ -20,21 +38,27 @@ impl Store {
             path: path.to_path_buf(),
             pool: Arc::new(Mutex::new(Vec::new())),
         };
-        store.connect()?.execute_batch(include_str!("schema.sql"))?;
+        {
+            let db = store.connect()?;
+            db.execute_batch(include_str!("schema.sql"))?;
+            crate::migration::internal_state(&db)?;
+        }
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(store)
     }
     pub fn connect(&self) -> Result<PooledConnection> {
-        let mut pool = self
+        let cached = self
             .pool
             .lock()
-            .map_err(|_| anyhow::anyhow!("database pool unavailable"))?;
-        let db = if let Some(db) = pool.pop() {
+            .map_err(|_| anyhow::anyhow!("database pool unavailable"))?
+            .pop();
+        // Opening and SQLite waits must not serialize other borrowers of this pool.
+        let db = if let Some(db) = cached {
             db
         } else {
             let db = Connection::open(&self.path)?;
-            db.busy_timeout(Duration::from_millis(500))?;
+            db.busy_handler(Some(wait_for_writer))?;
             db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
             db
         };
@@ -97,50 +121,70 @@ impl Store {
         Ok(())
     }
     pub fn uncertain_digest(&self, target: &str) -> Result<()> {
-        let mut db = self.connect()?;
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let known: Option<String> = tx
-            .query_row(
-                "SELECT value FROM kv WHERE key='uncertain:watermark'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let current: Vec<String> = {
-            let mut q = tx.prepare(
-                "SELECT id FROM events WHERE status='uncertain' AND job_id<>'uncertain-summary'",
-            )?;
-            q.query_map([], |r| r.get(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        let Some(known) = known else {
-            tx.execute(
-                "INSERT INTO kv VALUES('uncertain:watermark',?)",
-                [json!(current).to_string()],
-            )?;
-            tx.commit()?;
-            return Ok(());
-        };
-        let mut seen: std::collections::BTreeSet<String> = serde_json::from_str(&known)?;
-        let new: Vec<_> = current.iter().filter(|id| !seen.contains(*id)).collect();
         let day = chrono::Utc::now()
             .with_timezone(&chrono_tz::Asia::Taipei)
             .format("%Y-%m-%d")
             .to_string();
+        self.uncertain_digest_day(target, &day)
+    }
+    pub fn uncertain_digest_day(&self, target: &str, day: &str) -> Result<()> {
+        let mut db = self.connect()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let counter: Option<String> = tx
+            .query_row(
+                "SELECT value FROM kv WHERE key='uncertain:counter:v2'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut counter: Value = if let Some(value) = counter {
+            serde_json::from_str(&value)?
+        } else {
+            // Convert the old watermark once, preserving only genuinely unsummarized events.
+            let old: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM kv WHERE key='uncertain:watermark'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let pending = if let Some(old) = old {
+                let seen: std::collections::BTreeSet<String> = serde_json::from_str(&old)?;
+                let mut query = tx.prepare("SELECT id FROM events WHERE status='uncertain' AND job_id<>'uncertain-summary'")?;
+                let ids = query
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                ids.iter().filter(|id| !seen.contains(*id)).count()
+            } else {
+                0
+            };
+            json!({"version":2,"pending":pending,"last_day":""})
+        };
         let key = format!("uncertain:summary:{day}");
         let sent: bool =
             tx.query_row("SELECT EXISTS(SELECT 1 FROM kv WHERE key=?)", [&key], |r| {
                 r.get(0)
             })?;
-        if !new.is_empty() && !sent {
-            let payload = json!({"text":format!("Pylon 有 {} 条新增投递结果待核对。原消息未自动重发，可在状态页查看。",new.len()),"expires_at":crate::now()+600.0});
+        let pending = counter["pending"].as_u64().unwrap_or(0);
+        if pending > 0 && counter["last_day"] != day && !sent {
+            let payload = json!({"text":format!("Pylon 有 {pending} 条新增投递结果待核对。原消息未自动重发，可在状态页查看。"),"expires_at":crate::now()+600.0});
             tx.execute("INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'uncertain-summary','text',?,'pending',0,0,?,?,'gateway')",params![&crate::digest(&key)[..32],target,payload.to_string(),crate::now(),crate::now()])?;
-            seen.extend(current);
-            tx.execute("INSERT INTO kv VALUES(?, 'true')", [key])?;
-            tx.execute(
-                "UPDATE kv SET value=? WHERE key='uncertain:watermark'",
-                [json!(seen).to_string()],
-            )?;
+            counter["pending"] = json!(0);
+            counter["last_day"] = json!(day);
+        }
+        tx.execute("INSERT INTO kv VALUES('uncertain:counter:v2',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [counter.to_string()])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn configuration_rejected(&self, fingerprint: &str, target: Option<&str>) -> Result<()> {
+        let mut db = self.connect()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let value = json!({"fingerprint":fingerprint,"at":crate::now()});
+        tx.execute("INSERT INTO kv VALUES('configuration-rejected',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [value.to_string()])?;
+        if let Some(target) = target {
+            let id = crate::digest(format!("configuration-rejected:{fingerprint}"));
+            let payload = json!({"text":"Pylon 配置未能加载，继续使用上一有效配置。可在状态页查看诊断。","expires_at":crate::now()+600.0});
+            tx.execute("INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'system','text',?,'pending',0,0,?,?,'gateway')",params![&id[..32],target,payload.to_string(),crate::now(),crate::now()])?;
         }
         tx.commit()?;
         Ok(())
@@ -152,6 +196,7 @@ impl Store {
         owner: &str,
         reply: &Value,
         status: &str,
+        contexts: &[String],
     ) -> Result<()> {
         let mut db = self.connect()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -163,6 +208,9 @@ impl Store {
             "UPDATE updates SET status=? WHERE profile=? AND update_id=?",
             params![status, bot, update],
         )?;
+        for token in contexts {
+            tx.execute("DELETE FROM contexts WHERE hash=?", [crate::digest(token)])?;
+        }
         tx.commit()?;
         Ok(())
     }

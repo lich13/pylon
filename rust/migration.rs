@@ -99,3 +99,18 @@ pub fn import(config: &Config, source: &Path, mapping: &Path) -> Result<Value> {
     tx.commit()?;
     Ok(counts)
 }
+
+/// Idempotent internal diagnostics migration; public tables and IDs stay unchanged.
+pub fn internal_state(db: &rusqlite::Connection) -> Result<()> {
+    db.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS uncertain_count_update_v2 AFTER UPDATE OF status ON events
+             WHEN NEW.status='uncertain' AND OLD.status<>'uncertain' AND NEW.job_id<>'uncertain-summary'
+             BEGIN UPDATE kv SET value=json_set(value,'$.pending',json_extract(value,'$.pending')+1)
+               WHERE key='uncertain:counter:v2'; END;
+             CREATE TRIGGER IF NOT EXISTS uncertain_count_insert_v2 AFTER INSERT ON events
+             WHEN NEW.status='uncertain' AND NEW.job_id<>'uncertain-summary'
+             BEGIN UPDATE kv SET value=json_set(value,'$.pending',json_extract(value,'$.pending')+1)
+               WHERE key='uncertain:counter:v2'; END;"
+        )?;
+    Ok(())
+}

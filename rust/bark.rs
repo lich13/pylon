@@ -166,6 +166,28 @@ async fn response(response: reqwest::Response) -> Result<Value> {
 }
 
 pub async fn send(payload: &Value) -> Result<Value> {
+    // Compiled only into unit tests; the shipped gateway has no bypass or test setting.
+    #[cfg(test)]
+    if let Some(endpoint) = payload["fixture_transport"].as_str() {
+        let url = Url::parse(endpoint)?;
+        ensure!(
+            url.scheme() == "http" && url.host_str() == Some("127.0.0.1"),
+            "invalid fixture transport"
+        );
+        return response(
+            Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(4))
+                .build()?
+                .post(url)
+                .json(&payload["body"])
+                .send()
+                .await
+                .map_err(network_failure)?,
+        )
+        .await;
+    }
     let base = payload["api_base"]
         .as_str()
         .context("Bark endpoint missing")?;

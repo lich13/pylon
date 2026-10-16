@@ -43,6 +43,22 @@ pub struct Telegram {
     base: String,
 }
 impl Telegram {
+    #[cfg(test)]
+    pub(crate) fn fixture(base: String) -> Self {
+        assert_eq!(
+            reqwest::Url::parse(&base).unwrap().host_str(),
+            Some("127.0.0.1")
+        );
+        Self {
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(4))
+                .build()
+                .unwrap(),
+            token: "fixture".into(),
+            base,
+        }
+    }
     pub fn new(config: &Config, bot: &Bot) -> Result<Self> {
         Self::with_family(config, bot, &config.settings()?.telegram_ip_family)
     }
@@ -102,8 +118,16 @@ impl Telegram {
             .json()
             .await
             .map_err(|_| uncertain(format!("Telegram HTTP {status}: invalid response")))?;
-        if value["ok"] == true {
+        if value["ok"] == true
+            && value.get("result").is_some_and(|v| !v.is_null())
+            && (200..300).contains(&status)
+        {
             return Ok(value["result"].clone());
+        }
+        if value["ok"] != false || value["error_code"].as_u64().is_none() {
+            return Err(uncertain(format!(
+                "Telegram HTTP {status}: invalid response"
+            )));
         }
         let code = value["error_code"].as_u64().unwrap_or(status as u64);
         // Telegram descriptions can contain request data. Persist only the code.
@@ -118,9 +142,10 @@ impl Telegram {
             reason: format!("Telegram API {code}"),
             delay: if code == 429 {
                 value["parameters"]["retry_after"]
-                    .as_f64()
-                    .unwrap_or(30.0)
-                    .max(1.0)
+                    .as_u64()
+                    .filter(|value| *value <= 31_536_000)
+                    .unwrap_or(30)
+                    .max(1) as f64
             } else {
                 30.0
             },
@@ -319,6 +344,21 @@ pub fn chunks(text: &str) -> Vec<String> {
     s.parts
 }
 
+fn valid_receipt(value: &Value, owner: &str) -> Result<()> {
+    if !value["message_id"].as_i64().is_some_and(|id| id > 0)
+        || value["chat"]["id"].as_i64().is_none()
+        || numeric_id(&value["chat"]["id"]) != owner
+    {
+        return Err(Failure {
+            status: "uncertain",
+            reason: "Telegram receipt invalid".into(),
+            delay: 0.0,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 pub async fn deliver(store: &Store, telegram: &Telegram, bot: &Bot, event: &Value) -> Result<f64> {
     let id = event["id"].as_str().context("event id missing")?;
     let payload = &event["payload"];
@@ -335,13 +375,14 @@ pub async fn deliver(store: &Store, telegram: &Telegram, bot: &Bot, event: &Valu
                     if i+1==parts.len() && !payload["reply_markup"].is_null(){data["reply_markup"]=payload["reply_markup"].clone()}
                     if i==0 && payload["reply_to_message_id"].is_number(){data["reply_parameters"]=json!({"message_id":payload["reply_to_message_id"]})}
                     let sent=telegram.call("sendMessage",&data,false).await?;
+                    valid_receipt(&sent, &bot.owner)?;
                     receipt.push(json!({"message_id":sent["message_id"],"chat_id":sent["chat"]["id"]}));
                     persist(store,id,"sending",Some(json!(receipt)),"",0.0).await?;
                     if i+1<parts.len(){tokio::time::sleep(Duration::from_millis(1100)).await}
                 }
                 Ok(json!(receipt))
             },
-            "document"=>{let sent=telegram.document(&bot.owner,payload).await?;Ok(json!({"message_id":sent["message_id"],"chat_id":sent["chat"]["id"],"document":sent["document"]}))},
+            "document"=>{let sent=telegram.document(&bot.owner,payload).await?;valid_receipt(&sent, &bot.owner)?;Ok(json!({"message_id":sent["message_id"],"chat_id":sent["chat"]["id"],"document":sent["document"]}))},
             "bark"=>match tokio::time::timeout(Duration::from_secs(60),crate::bark::send(payload)).await {
                 Ok(result)=>result,
                 Err(_)=>Err(Failure{status:"uncertain",reason:"Bark total deadline exceeded; reconcile before retry".into(),delay:0.0}.into()),
@@ -360,7 +401,15 @@ pub async fn deliver(store: &Store, telegram: &Telegram, bot: &Bot, event: &Valu
             let reason = failure
                 .map(|f| f.reason.as_str())
                 .unwrap_or("delivery validation failed");
-            let delay = failure.map(|f| f.delay).unwrap_or(0.0);
+            let mut delay = failure.map(|f| f.delay).unwrap_or(0.0);
+            if status == "pending" {
+                let attempts = event["attempts"]
+                    .as_u64()
+                    .unwrap_or(1)
+                    .saturating_sub(1)
+                    .min(4);
+                delay = delay.max((30.0 * 2_f64.powi(attempts as i32)).min(300.0));
+            }
             persist(store, id, status, None, reason, delay).await?;
             Ok(if status == "pending" {
                 delay.max(1.1)
@@ -405,17 +454,6 @@ async fn persist(
 #[cfg(test)]
 mod stability_tests {
     use super::*;
-
-    async fn join_bounded<T: Send + 'static>(mut task: tokio::task::JoinHandle<T>) -> Option<T> {
-        match tokio::time::timeout(Duration::from_secs(4), &mut task).await {
-            Ok(Ok(value)) => Some(value),
-            _ => {
-                task.abort();
-                let _ = task.await;
-                None
-            }
-        }
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receipt_is_retained_while_database_is_locked() {
@@ -482,173 +520,5 @@ mod stability_tests {
         assert_eq!(result["status"], "delivered");
         assert_eq!(result["receipt"][0]["message_id"], 7);
         assert_eq!(result["attempts"], 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn slow_bark_transfer_does_not_block_telegram_delivery_lane() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::sync::oneshot;
-
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::new(&temporary.path().join("state.sqlite3")).unwrap();
-        store
-            .submit(
-                "fixture",
-                &json!({"id":"slow-bark-fixture","kind":"bark","payload":{"fixture":"slow transfer"}}),
-                "fixture",
-            )
-            .unwrap();
-        let bark_event = store.claim_lane("fixture", Some(true)).unwrap().unwrap();
-        assert_eq!(bark_event["id"], "slow-bark-fixture");
-        assert_eq!(
-            store.event("slow-bark-fixture").unwrap()["status"],
-            "sending"
-        );
-
-        let bark_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bark_address = bark_listener.local_addr().unwrap();
-        let (accepted_tx, accepted_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        let bark_server = tokio::spawn(async move {
-            let (mut connection, _) =
-                tokio::time::timeout(Duration::from_secs(3), bark_listener.accept())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            let mut request = [0; 4096];
-            let read = tokio::time::timeout(Duration::from_secs(3), connection.read(&mut request))
-                .await
-                .unwrap()
-                .unwrap();
-            let request = request[..read].to_vec();
-            let _ = accepted_tx.send(read > 0);
-            let _ = tokio::time::timeout(Duration::from_secs(8), release_rx).await;
-            let body = b"{\"code\":200}";
-            let _ = connection
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        std::str::from_utf8(body).unwrap()
-                    )
-                    .as_bytes(),
-                )
-                .await;
-            request
-        });
-        // This loopback request models an in-flight Bark network transfer. It does not call
-        // bark::send or relax its production HTTPS, DNS, or address-validation rules.
-        let bark_client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(4))
-            .build()
-            .unwrap();
-        let slow_bark_request = tokio::spawn(async move {
-            bark_client
-                .post(format!("http://{bark_address}/slow-bark-transfer"))
-                .json(&json!({"fixture":"slow bark transfer"}))
-                .send()
-                .await
-                .map(|response| response.status().as_u16())
-        });
-        let bark_request_held = matches!(
-            tokio::time::timeout(Duration::from_secs(2), accepted_rx).await,
-            Ok(Ok(true))
-        );
-
-        store
-            .submit(
-                "fixture",
-                &json!({"id":"telegram-during-bark","kind":"text","payload":{"text":"fixture Telegram delivery"}}),
-                "fixture",
-            )
-            .unwrap();
-        let telegram_event = store.claim_lane("fixture", Some(false)).unwrap().unwrap();
-        assert_eq!(telegram_event["id"], "telegram-during-bark");
-
-        let telegram_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let telegram_address = telegram_listener.local_addr().unwrap();
-        let telegram_server = tokio::spawn(async move {
-            let (mut connection, _) =
-                tokio::time::timeout(Duration::from_secs(3), telegram_listener.accept())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            let mut request = [0; 4096];
-            let read = tokio::time::timeout(Duration::from_secs(3), connection.read(&mut request))
-                .await
-                .unwrap()
-                .unwrap();
-            let request = request[..read].to_vec();
-            let body = r#"{"ok":true,"result":{"message_id":9,"chat":{"id":101}}}"#;
-            connection
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            request
-        });
-        let telegram = Telegram {
-            http: reqwest::Client::builder()
-                .no_proxy()
-                .timeout(Duration::from_secs(3))
-                .build()
-                .unwrap(),
-            token: "fixture".into(),
-            base: format!("http://{telegram_address}"),
-        };
-        let bot = Bot {
-            require_start: false,
-            owner: "101".into(),
-            credential: "fixture".into(),
-            username: String::new(),
-            enabled: true,
-            menus: vec![],
-        };
-        let telegram_delivery = tokio::time::timeout(
-            Duration::from_secs(3),
-            deliver(&store, &telegram, &bot, &telegram_event),
-        )
-        .await;
-        let telegram_delivered_while_bark_held = store
-            .event("telegram-during-bark")
-            .is_ok_and(|event| event["status"] == "delivered");
-        let bark_still_sending_before_release = store
-            .event("slow-bark-fixture")
-            .is_ok_and(|event| event["status"] == "sending");
-
-        let _ = release_tx.send(());
-        let slow_bark_result = join_bounded(slow_bark_request).await;
-        let bark_request_bytes = join_bounded(bark_server).await;
-        let telegram_request_bytes = join_bounded(telegram_server).await;
-
-        assert!(
-            bark_request_held,
-            "slow loopback Bark fixture did not hold a request"
-        );
-        assert!(
-            matches!(&telegram_delivery, Ok(Ok(_))) && telegram_delivered_while_bark_held,
-            "Telegram delivery did not finish while Bark was held: {telegram_delivery:?}"
-        );
-        assert!(bark_still_sending_before_release);
-        assert_eq!(slow_bark_result.unwrap().unwrap(), 200);
-        let bark_request_bytes = bark_request_bytes.unwrap();
-        assert!(
-            bark_request_bytes
-                .windows(b"POST /slow-bark-transfer ".len())
-                .any(|window| window == b"POST /slow-bark-transfer ")
-        );
-        let telegram_request_bytes = telegram_request_bytes.unwrap();
-        assert!(
-            telegram_request_bytes
-                .windows(b"/botfixture/sendMessage".len())
-                .any(|window| window == b"/botfixture/sendMessage")
-        );
     }
 }

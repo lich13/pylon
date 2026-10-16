@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -66,6 +67,32 @@ def _tcp_connects(port: int, host: str = "127.0.0.1") -> bool:
 
 
 def _listener_lines(pid: int, port: int) -> list[str]:
+    process = Path(f"/proc/{pid}")
+    if process.is_dir():
+        inodes = set()
+        for descriptor in (process / "fd").iterdir():
+            try:
+                target = os.readlink(descriptor)
+            except FileNotFoundError:
+                continue
+            if target.startswith("socket:["):
+                inodes.add(target[8:-1])
+        listeners = []
+        for name, family in (("tcp", socket.AF_INET), ("tcp6", socket.AF_INET6)):
+            table = process / "net" / name
+            if not table.exists():
+                continue
+            for line in table.read_text().splitlines()[1:]:
+                fields = line.split()
+                address, raw_port = fields[1].split(":")
+                if fields[3] != "0A" or fields[9] not in inodes or int(raw_port, 16) != port:
+                    continue
+                raw = bytes.fromhex(address)
+                raw = b"".join(raw[i:i+4][::-1] for i in range(0, len(raw), 4))
+                listeners.append(f"{socket.inet_ntop(family, raw)}:{port}")
+        return listeners
+    if not shutil.which("lsof"):
+        pytest.skip("listener ownership inspection requires /proc or lsof")
     result = subprocess.run(
         [
             "lsof",

@@ -89,3 +89,25 @@ pub async fn isolated<T: Send + 'static>(
     .await
     .map_err(|_| anyhow::Error::from(errors::ReconcileRequired))?
 }
+
+/// Public RPC admission is separate from executor work and bot delivery.
+pub async fn rpc_isolated<T: Send + 'static>(
+    future: impl std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+) -> anyhow::Result<T> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let slots = SLOTS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(64)));
+    let permit = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        slots.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| errors::RemoteFailure { retryable: true })??;
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        runtime.block_on(future)
+    })
+    .await
+    .map_err(|_| anyhow::Error::from(errors::ReconcileRequired))?
+}

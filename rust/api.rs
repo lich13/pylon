@@ -79,9 +79,14 @@ pub async fn rpc(config: &Config, method: &str, params: Value, context: &str) ->
     Ok(response["value"].clone())
 }
 pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
+    if r["api_version"] == 2 && r["method"] == "health" {
+        return Ok(
+            json!({"version":env!("CARGO_PKG_VERSION"),"api_version":2,"catalog":app.snapshot.read().await.catalog.hash}),
+        );
+    }
     let app = app.clone();
     let request = r.clone();
-    crate::isolated(async move { dispatch_inner(&app, &request).await }).await
+    crate::rpc_isolated(async move { dispatch_inner(&app, &request).await }).await
 }
 async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
     ensure!(r["api_version"] == 2, "unsupported API version");
@@ -100,7 +105,7 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
         return Ok(json!({"ok":true}));
     }
     if method == "context.open" {
-        let snapshot = app.snapshot.read().await;
+        let snapshot = app.snapshot.read().await.clone();
         let module = snapshot
             .catalog
             .modules
@@ -180,7 +185,7 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
                 fields.len() == 3 && fields[0] == "telegram",
                 "invalid request identity"
             );
-            let snapshot = app.snapshot.read().await;
+            let snapshot = app.snapshot.read().await.clone();
             ensure!(
                 snapshot
                     .settings
@@ -198,7 +203,7 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
             Ok(json!({"ok":true}))
         }
         "delivery.submit" => {
-            let snapshot = app.snapshot.read().await;
+            let snapshot = app.snapshot.read().await.clone();
             let fallback = ctx["bot"].as_str().context("bot missing")?;
             let bot = if p["retain_target"] == true {
                 p["profile"]
@@ -275,7 +280,7 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
             let id = p["id"].as_str().context("event required")?;
             let event = app.store.event(id)?;
             ensure!(event["module"] == module, "event belongs to another module");
-            let snapshot = app.snapshot.read().await;
+            let snapshot = app.snapshot.read().await.clone();
             let bot = snapshot
                 .settings
                 .bots
@@ -352,7 +357,7 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
                 ctx["origin"] == "document",
                 "document owner request required"
             );
-            let snapshot = app.snapshot.read().await;
+            let snapshot = app.snapshot.read().await.clone();
             let bot = snapshot
                 .settings
                 .bots
@@ -370,7 +375,7 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
         }
         "task.run" => {
             let id = p["job_id"].as_str().context("task id required")?;
-            let snapshot = app.snapshot.read().await;
+            let snapshot = app.snapshot.read().await.clone();
             let (m, _) = snapshot.catalog.job(id)?;
             ensure!(m.manifest.id == module, "task belongs to another module");
             crate::runtime::request_executor(
@@ -381,7 +386,7 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
         }
         "task.status" => {
             let id = p["job_id"].as_str().context("task id required")?;
-            let snapshot = app.snapshot.read().await;
+            let snapshot = app.snapshot.read().await.clone();
             ensure!(
                 snapshot.catalog.job(id)?.0.manifest.id == module,
                 "task belongs to another module"
@@ -415,7 +420,10 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
                 "invalid run status"
             );
             let id = p["id"].as_str().context("run id required")?;
-            let job = ctx["origin"].as_str().unwrap().trim_start_matches("job:");
+            let job = ctx["origin"]
+                .as_str()
+                .context("task context required")?
+                .trim_start_matches("job:");
             let mut db = app.store.connect()?;
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let (old, finished): (String, Option<f64>) = tx
@@ -433,7 +441,7 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
                 tx.execute(
                     "UPDATE runs SET status=?,finished_at=?,detail=? WHERE id=? AND job_id=?",
                     rusqlite::params![
-                        p["status"].as_str().unwrap(),
+                        p["status"].as_str().context("invalid run status")?,
                         crate::now(),
                         p["detail"].as_str().unwrap_or(""),
                         id,
@@ -519,7 +527,7 @@ async fn proxy(State(app): State<App>, request: Request) -> Response {
             .strip_prefix("/pylon/")
             .and_then(|s| s.split('/').next())
             .context("unknown workspace")?;
-        let snapshot = app.snapshot.read().await;
+        let snapshot = app.snapshot.read().await.clone();
         let (module, web) = snapshot
             .catalog
             .modules
@@ -548,7 +556,12 @@ async fn proxy(State(app): State<App>, request: Request) -> Response {
                 .unwrap_or(path)
         );
         let (parts, body) = request.into_parts();
-        let body = to_bytes(body, 16 * 1024 * 1024).await?;
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            to_bytes(body, 16 * 1024 * 1024),
+        )
+        .await
+        .context("workspace request body timed out")??;
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -626,16 +639,20 @@ fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
         .filter_map(|r| r["created_at"].as_f64())
         .map(|at| (crate::now() - at).max(0.0))
         .fold(0.0_f64, f64::max);
-    let seen = app.store.get("uncertain:watermark")?;
-    let mut query = db.prepare(
-        "SELECT id FROM events WHERE status='uncertain' AND job_id<>'uncertain-summary'",
-    )?;
-    let new_uncertain = query
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .iter()
-        .filter(|id| seen.as_array().is_some_and(|a| !a.iter().any(|v| v == *id)))
-        .count();
+    let queued_count = tasks["totals"]["queued_count"]
+        .as_u64()
+        .unwrap_or(queued.len() as u64);
+    let oldest_wait = tasks["totals"]
+        .get("oldest_queued_at")
+        .map(|at| {
+            at.as_f64()
+                .map(|v| (crate::now() - v).max(0.0))
+                .unwrap_or(0.0)
+        })
+        .unwrap_or(oldest_wait);
+    let new_uncertain = app.store.get("uncertain:counter:v2")?["pending"]
+        .as_u64()
+        .unwrap_or(0);
     let mut q = db.prepare(
         "SELECT key,value FROM kv WHERE key LIKE 'worker:%' OR key LIKE 'delivery-timing:%'",
     )?;
@@ -646,6 +663,6 @@ fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
         .map(|(k, v)| (k, serde_json::from_str::<Value>(&v).unwrap_or(Value::Null)))
         .collect::<std::collections::BTreeMap<_, _>>();
     Ok(
-        json!({"api_version":2,"metrics":{"workers":worker_metrics,"queued_count":queued.len(),"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"sampled_at":crate::now(),"maintenance":app.config.home.join("run/freeze").exists(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
+        json!({"api_version":2,"metrics":{"sqlite_busy":crate::db::busy_count(),"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"sampled_at":crate::now(),"maintenance":app.config.home.join("run/freeze").exists(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
     )
 }
