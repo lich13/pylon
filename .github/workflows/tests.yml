@@ -1,6 +1,7 @@
 name: Rust gateway
 on:
   push:
+    branches: ['**']
     tags-ignore: ['**']
   pull_request:
 permissions:
