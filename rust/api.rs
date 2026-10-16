@@ -9,7 +9,7 @@ use axum::{
     body::{Body, to_bytes},
     extract::{DefaultBodyLimit, Request, State},
     http::StatusCode,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::post,
 };
 use serde_json::{Value, json};
@@ -493,7 +493,7 @@ async fn handler(
 }
 pub async fn serve_socket(app: App) -> Result<()> {
     let path = app.config.socket();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::create_dir_all(path.parent().context("socket parent missing")?)?;
     if path.exists() {
         if tokio::net::UnixStream::connect(&path).await.is_ok() {
             anyhow::bail!("gateway socket already active")
@@ -515,10 +515,11 @@ pub async fn serve_socket(app: App) -> Result<()> {
 }
 async fn proxy(State(app): State<App>, request: Request) -> Response {
     if app.config.home.join("run/freeze").is_file() {
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(Body::from("服务正在切换，请稍后重试。"))
-            .unwrap();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "服务正在切换，请稍后重试。",
+        )
+            .into_response();
     }
 
     async fn forward(app: App, request: Request) -> Result<Response> {
@@ -541,10 +542,11 @@ async fn proxy(State(app): State<App>, request: Request) -> Response {
             .join(&module.manifest.id)
             .exists()
         {
-            return Ok(Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from("工作区正在切换，请稍后重试。"))
-                .unwrap());
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "工作区正在切换，请稍后重试。",
+            )
+                .into_response());
         }
         let url = format!(
             "{}{}",
@@ -594,10 +596,7 @@ async fn proxy(State(app): State<App>, request: Request) -> Response {
     }
     match forward(app, request).await {
         Ok(r) => r,
-        Err(_) => Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from("工作区暂时不可用，请稍后重试。"))
-            .unwrap(),
+        Err(_) => (StatusCode::BAD_GATEWAY, "工作区暂时不可用，请稍后重试。").into_response(),
     }
 }
 pub async fn serve_web(app: App, port: u16) -> Result<()> {
@@ -662,7 +661,8 @@ fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
         .into_iter()
         .map(|(k, v)| (k, serde_json::from_str::<Value>(&v).unwrap_or(Value::Null)))
         .collect::<std::collections::BTreeMap<_, _>>();
+    let (proxy_invalid, response_invalid) = crate::telegram::invalid_responses();
     Ok(
-        json!({"api_version":2,"metrics":{"sqlite_busy":crate::db::busy_count(),"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"sampled_at":crate::now(),"maintenance":app.config.home.join("run/freeze").exists(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
+        json!({"api_version":2,"metrics":{"sqlite_busy":crate::db::busy_count(),"telegram_proxy_invalid":proxy_invalid,"telegram_response_invalid":response_invalid,"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"sampled_at":crate::now(),"maintenance":app.config.home.join("run/freeze").exists(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
     )
 }

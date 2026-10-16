@@ -218,7 +218,6 @@ pub fn install(
     expected: &str,
     health: bool,
 ) -> Result<serde_json::Value> {
-    use fs2::FileExt;
     ensure!(
         expected.len() == 64 && crate::digest(std::fs::read(archive)?) == expected,
         "module archive checksum mismatch"
@@ -229,7 +228,7 @@ pub fn install(
         .create(true)
         .append(true)
         .open(base.join(".leases.lock"))?;
-    lock.lock_exclusive()?;
+    crate::runtime::lock(&lock)?;
     let staging = base.join(format!(".install-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&staging)?;
     let result = (|| -> Result<serde_json::Value> {
@@ -333,14 +332,13 @@ pub fn rollback(
     id: &str,
     health: bool,
 ) -> Result<serde_json::Value> {
-    use fs2::FileExt;
     ensure!(crate::identifier(id), "invalid module");
     let base = config.home.join("modules");
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(base.join(".leases.lock"))?;
-    lock.lock_exclusive()?;
+    crate::runtime::lock(&lock)?;
     let mut registry = index(&base)?;
     let previous = registry["previous"][id].clone();
     ensure!(previous.is_string(), "no previous module version");
@@ -683,7 +681,6 @@ fn prepare_stop(
     catalog: &crate::catalog::Catalog,
     id: &str,
 ) -> Result<DrainGuard> {
-    use fs2::FileExt;
     use std::process::Stdio;
     let path = config.home.join("run/drain").join(id);
     std::fs::create_dir_all(path.parent().context("destination parent missing")?)?;
@@ -708,7 +705,7 @@ fn prepare_stop(
             let lock = crate::runtime::open_task_lock(
                 &config.home.join("run").join(format!("{name}.lock")),
             )?;
-            if lock.try_lock_exclusive().is_err() {
+            if !crate::runtime::try_lock(&lock)? {
                 active = true;
                 break;
             }
@@ -875,14 +872,13 @@ pub fn change(
     undo: Option<&str>,
     live: bool,
 ) -> Result<serde_json::Value> {
-    use fs2::FileExt;
     let base = config.home.join("modules");
     std::fs::create_dir_all(&base)?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(base.join(".deploy.lock"))?;
-    lock.lock_exclusive()?;
+    crate::runtime::lock(&lock)?;
     let original = index(&base)?;
     let old = crate::catalog::Catalog::load_from(base.clone())?;
     if live {
@@ -1029,13 +1025,12 @@ fn ensure_runtime(config: &crate::config::Config, id: &str) -> Result<()> {
 }
 
 fn collect_versions(config: &crate::config::Config) -> Result<()> {
-    use fs2::FileExt;
     let base = config.home.join("modules");
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(base.join(".leases.lock"))?;
-    lock.lock_exclusive()?;
+    crate::runtime::lock(&lock)?;
     let registry = index(&base)?;
     let mut retained = BTreeSet::new();
     for key in ["modules", "previous"] {
@@ -1055,7 +1050,7 @@ fn collect_versions(config: &crate::config::Config) -> Result<()> {
                 .read(true)
                 .write(true)
                 .open(file.path())?;
-            if handle.try_lock_exclusive().is_err() {
+            if !crate::runtime::try_lock(&handle)? {
                 let paths: Vec<String> = serde_json::from_slice(&std::fs::read(file.path())?)?;
                 retained.extend(paths.into_iter().map(std::path::PathBuf::from));
             } else {

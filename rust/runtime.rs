@@ -4,7 +4,6 @@ use crate::{
     config::Config,
 };
 use anyhow::{Context, Result, ensure};
-use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -15,6 +14,25 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+// Keep OS lock semantics shared by the supervisor, dispatch and module leases.
+// Contention is expected; other I/O failures must not masquerade as a busy job.
+pub(crate) fn try_lock(file: &File) -> std::io::Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+pub(crate) fn lock(file: &File) -> std::io::Result<()> {
+    file.lock()
+}
+pub(crate) fn lock_shared(file: &File) -> std::io::Result<()> {
+    file.lock_shared()
+}
+pub(crate) fn unlock(file: &File) -> std::io::Result<()> {
+    file.unlock()
+}
 
 pub(crate) fn open_task_lock(path: &Path) -> Result<File> {
     // O_CREAT on an existing lock owned by the previous runtime UID is denied
@@ -79,7 +97,7 @@ pub fn inherited_dispatch_lock(
             && actual.ino() == expected.ino(),
         "dispatch descriptor identity mismatch"
     );
-    file.try_lock_exclusive()?;
+    ensure!(try_lock(&file)?, "dispatch lock is held by another process");
     ensure!(
         unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } >= 0,
         "cannot protect dispatch descriptor"
@@ -104,7 +122,7 @@ pub fn lease(config: &Config, catalog: &Catalog) -> Result<Lease> {
         .write(true)
         .create_new(true)
         .open(&path)?;
-    file.lock_exclusive()?;
+    lock(&file)?;
     use std::io::Write;
     file.write_all(
         serde_json::to_string(
@@ -125,10 +143,10 @@ fn snapshot(config: &Config) -> Result<(Catalog, Lease)> {
         .create(true)
         .truncate(false)
         .open(config.home.join("modules/.leases.lock"))?;
-    FileExt::lock_shared(&lock)?;
+    lock_shared(&lock)?;
     let catalog = Catalog::load(config)?;
     let lease = lease(config, &catalog)?;
-    FileExt::unlock(&lock)?;
+    unlock(&lock)?;
     Ok((catalog, lease))
 }
 pub fn environment(
@@ -647,7 +665,7 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
             .join("run")
             .join(format!("request-{}.lock", crate::digest(run))),
     )?;
-    if request_lock.try_lock_exclusive().is_err() {
+    if !try_lock(&request_lock)? {
         return Ok(0);
     }
     if crate::queue::state(config, run)? != "queued" || config.home.join("run/freeze").exists() {
@@ -672,7 +690,7 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
         "{}.lock",
         if job.lock.is_empty() { id } else { &job.lock }
     )))?;
-    if lock.try_lock_exclusive().is_err() {
+    if !try_lock(&lock)? {
         return Ok(0);
     }
     // Preserve FIFO among requests that can acquire their task lock, within a quota group.
@@ -691,7 +709,7 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
                 &prior_job.lock
             };
             let prior_lock = open_task_lock(&config.home.join("run").join(format!("{name}.lock")))?;
-            if prior_lock.try_lock_exclusive().is_ok() {
+            if try_lock(&prior_lock)? {
                 return Ok(0);
             }
         }
@@ -709,7 +727,7 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
             job.topic,
             if job.model { "model" } else { "process" }
         )))?;
-        if file.try_lock_exclusive().is_ok() {
+        if try_lock(&file)? {
             quota = Some(file);
             break;
         }

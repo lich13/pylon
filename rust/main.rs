@@ -133,21 +133,45 @@ enum Modules {
         activate: bool,
     },
 }
-#[tokio::main]
-async fn main() {
-    if let Err(e) = run().await {
+fn main() {
+    if let Err(e) = start(Args::parse()) {
         pylon::errors::log("cli", &e);
         eprintln!("{}", pylon::errors::cli_message(&e));
         std::process::exit(1)
     }
 }
-async fn run() -> Result<()> {
-    let args = Args::parse();
+fn start(args: Args) -> Result<()> {
+    let gateway = matches!(args.command, Command::Gateway);
+    // Keep the supervisor lock outside the runtime until all bounded shutdown
+    // work has finished. Other commands retain their normal runtime lifetime.
+    let lock = if gateway {
+        Some(pylon::daemon::acquire_lock(&Config::new(
+            args.home.clone(),
+        ))?)
+    } else {
+        None
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run(args, lock.as_ref()));
+    if gateway {
+        runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    } else {
+        drop(runtime);
+    }
+    result
+}
+async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
     let mut config = Config::new(args.home);
     config.offline = args.offline;
     let result = match args.command {
         Command::Gateway => {
-            pylon::daemon::run(api::App::new(config)?).await?;
+            pylon::daemon::run(
+                api::App::new(config)?,
+                lock.context("gateway lock missing")?,
+            )
+            .await?;
             Value::Null
         }
         Command::Executor => {

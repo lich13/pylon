@@ -1,5 +1,61 @@
 use pylon::{config::Config, db::Store, queue};
+use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use std::path::Path;
+
+fn insert_uncertain_event(db: &Connection, id: &str, job_id: &str) {
+    db.execute(
+        "INSERT INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at)
+         VALUES(?, 'fixture', ?, 'text', '{}', 'uncertain', 0, 0, 1.0, 1.0)",
+        params![id, job_id],
+    )
+    .unwrap();
+}
+
+fn create_legacy_db(path: &Path, uncertain_events: &[(&str, &str)], watermark: Option<Value>) {
+    let db = Connection::open(path).unwrap();
+    // The legacy schema has the same public tables, but no v2 counter or triggers.
+    db.execute_batch(include_str!("../rust/schema.sql"))
+        .unwrap();
+    let counter: i64 = db
+        .query_row(
+            "SELECT count(*) FROM kv WHERE key='uncertain:counter:v2'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let triggers: i64 = db
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'uncertain_count_%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(counter, 0);
+    assert_eq!(triggers, 0);
+    for (id, job_id) in uncertain_events {
+        insert_uncertain_event(&db, id, job_id);
+    }
+    if let Some(watermark) = watermark {
+        db.execute(
+            "INSERT INTO kv(key,value) VALUES('uncertain:watermark',?)",
+            [watermark.to_string()],
+        )
+        .unwrap();
+    }
+}
+
+fn summary_count(store: &Store) -> u64 {
+    store
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM events WHERE job_id='uncertain-summary'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
 
 #[test]
 fn delivery_lanes_claim_independently_and_once() {
@@ -29,35 +85,22 @@ fn delivery_lanes_claim_independently_and_once() {
 #[test]
 fn uncertain_baseline_and_daily_summary_never_replay_history_or_recurse() {
     let temp = tempfile::tempdir().unwrap();
-    let store = Store::new(&temp.path().join("events.sqlite3")).unwrap();
+    let path = temp.path().join("events.sqlite3");
+    create_legacy_db(&path, &[("historic", "fixture")], Some(json!(["historic"])));
+    let store = Store::new(&path).unwrap();
     let event = |id| json!({"id":id,"kind":"text","payload":{"text":"fixture"}});
-    store
-        .submit("fixture", &event("historic"), "fixture")
-        .unwrap();
-    store
-        .finish("historic", "uncertain", None, "fixture", 0.0)
-        .unwrap();
+    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 0);
     store.uncertain_digest("fixture").unwrap();
-    let count = || {
-        store
-            .connect()
-            .unwrap()
-            .query_row(
-                "SELECT count(*) FROM events WHERE job_id='uncertain-summary'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap()
-    };
-    assert_eq!(count(), 0);
+    assert_eq!(summary_count(&store), 0);
     store
         .submit("fixture", &event("new-first"), "fixture")
         .unwrap();
     store
         .finish("new-first", "uncertain", None, "fixture", 0.0)
         .unwrap();
+    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
     store.uncertain_digest("fixture").unwrap();
-    assert_eq!(count(), 1);
+    assert_eq!(summary_count(&store), 1);
     store
         .connect()
         .unwrap()
@@ -73,15 +116,143 @@ fn uncertain_baseline_and_daily_summary_never_replay_history_or_recurse() {
         .finish("new-later", "uncertain", None, "fixture", 0.0)
         .unwrap();
     store.uncertain_digest("fixture").unwrap();
-    assert_eq!(count(), 1);
+    assert_eq!(summary_count(&store), 1);
+    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
     assert_eq!(store.event("historic").unwrap()["attempts"], 0);
     assert_eq!(store.event("historic").unwrap()["status"], "uncertain");
+
+    // Simulate a summary event committed before its daily marker. It must prevent
+    // this day's retry from clearing the pending count or creating another event.
+    let blocked_day = "2099-01-02";
+    let blocked_id = pylon::digest(format!("uncertain:summary:{blocked_day}"));
+    let db = store.connect().unwrap();
+    insert_uncertain_event(&db, &blocked_id[..32], "uncertain-summary");
+    drop(db);
+    assert!(
+        store
+            .get(&format!("uncertain:summary:{blocked_day}"))
+            .unwrap()
+            .is_null()
+    );
+    store.uncertain_digest_day("fixture", blocked_day).unwrap();
+    assert_eq!(summary_count(&store), 2);
     assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
     store.uncertain_digest_day("fixture", "2099-01-02").unwrap();
-    assert_eq!(count(), 2);
-    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 0);
+    assert_eq!(summary_count(&store), 2);
     store.uncertain_digest_day("fixture", "2099-01-03").unwrap();
-    assert_eq!(count(), 2);
+    assert_eq!(summary_count(&store), 3);
+    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 0);
+    store.uncertain_digest_day("fixture", "2099-01-04").unwrap();
+    assert_eq!(summary_count(&store), 3);
+}
+
+#[test]
+fn fresh_uncertain_store_counts_before_first_digest_and_preserves_existing_counter() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("events.sqlite3");
+    let store = Store::new(&path).unwrap();
+    let event = json!({
+        "id":"fresh-uncertain",
+        "kind":"text",
+        "payload":{"text":"fixture"}
+    });
+    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 0);
+    store.submit("fixture", &event, "fixture").unwrap();
+    store
+        .finish("fresh-uncertain", "uncertain", None, "fixture", 0.0)
+        .unwrap();
+    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
+
+    // An old watermark that disagrees with the active v2 count cannot reseed it.
+    store
+        .put("uncertain:watermark", &json!(["fresh-uncertain"]))
+        .unwrap();
+    let reopened = Store::new(&path).unwrap();
+    assert_eq!(reopened.get("uncertain:counter:v2").unwrap()["pending"], 1);
+    reopened
+        .uncertain_digest_day("fixture", "2099-02-01")
+        .unwrap();
+    assert_eq!(reopened.get("uncertain:counter:v2").unwrap()["pending"], 0);
+
+    let reopened_again = Store::new(&path).unwrap();
+    assert_eq!(
+        reopened_again.get("uncertain:counter:v2").unwrap()["pending"],
+        0
+    );
+    assert_eq!(summary_count(&reopened_again), 1);
+}
+
+#[test]
+fn legacy_uncertain_history_without_watermark_seeds_counter_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("events.sqlite3");
+    create_legacy_db(
+        &path,
+        &[("legacy-one", "fixture"), ("legacy-two", "fixture")],
+        None,
+    );
+
+    let store = Store::new(&path).unwrap();
+    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 2);
+    let reopened = Store::new(&path).unwrap();
+    assert_eq!(reopened.get("uncertain:counter:v2").unwrap()["pending"], 2);
+    reopened
+        .uncertain_digest_day("fixture", "2099-02-02")
+        .unwrap();
+    assert_eq!(reopened.get("uncertain:counter:v2").unwrap()["pending"], 0);
+    assert_eq!(summary_count(&reopened), 1);
+}
+
+#[test]
+fn uncertain_triggers_rebuild_a_missing_counter_on_insert_and_update() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::new(&temp.path().join("events.sqlite3")).unwrap();
+    let event = |id| json!({"id":id,"kind":"text","payload":{"text":"fixture"}});
+    store
+        .submit("fixture", &event("already-uncertain"), "fixture")
+        .unwrap();
+    store
+        .finish("already-uncertain", "uncertain", None, "fixture", 0.0)
+        .unwrap();
+    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
+
+    let db = store.connect().unwrap();
+    db.execute("DELETE FROM kv WHERE key='uncertain:counter:v2'", [])
+        .unwrap();
+    insert_uncertain_event(&db, "ignored-summary", "uncertain-summary");
+    insert_uncertain_event(&db, "inserted-uncertain", "fixture");
+    drop(db);
+    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 2);
+
+    let db = store.connect().unwrap();
+    db.execute("DELETE FROM kv WHERE key='uncertain:counter:v2'", [])
+        .unwrap();
+    drop(db);
+    store
+        .submit("fixture", &event("updated-uncertain"), "fixture")
+        .unwrap();
+    store
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status='uncertain' WHERE id='updated-uncertain'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 3);
+
+    store
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status='uncertain' WHERE id='updated-uncertain'",
+            [],
+        )
+        .unwrap();
+    store
+        .finish("inserted-uncertain", "uncertain", None, "fixture", 0.0)
+        .unwrap();
+    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 3);
 }
 
 #[test]
@@ -124,18 +295,22 @@ fn summary_flush_repairs_a_stale_cross_process_file_without_rewriting_stable_byt
 fn counter_migration_is_atomic_idempotent_and_does_not_count_receipt_retries() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.sqlite3");
+    create_legacy_db(
+        &path,
+        &[("historical", "fixture"), ("unreported", "fixture")],
+        Some(json!(["historical"])),
+    );
+    let old_db = Connection::open(&path).unwrap();
+    old_db
+        .execute(
+            "INSERT INTO kv(key,value) VALUES('uncertain:summary:2099-01-01','true')",
+            [],
+        )
+        .unwrap();
+    drop(old_db);
+
     let store = Store::new(&path).unwrap();
-    let event = |id| json!({"id":id,"kind":"text","payload":{"text":"fixture"}});
-    for id in ["historical", "unreported"] {
-        store.submit("fixture", &event(id), "fixture").unwrap();
-        store.finish(id, "uncertain", None, "fixture", 0.0).unwrap();
-    }
-    store
-        .put("uncertain:watermark", &json!(["historical"]))
-        .unwrap();
-    store
-        .put("uncertain:summary:2099-01-01", &json!(true))
-        .unwrap();
+    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
     store.uncertain_digest_day("fixture", "2099-01-01").unwrap();
     assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
     store
@@ -143,6 +318,7 @@ fn counter_migration_is_atomic_idempotent_and_does_not_count_receipt_retries() {
         .unwrap();
     assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
     let reopened = Store::new(&path).unwrap();
+    assert_eq!(reopened.get("uncertain:counter:v2").unwrap()["pending"], 1);
     reopened
         .uncertain_digest_day("fixture", "2099-01-02")
         .unwrap();
@@ -224,10 +400,12 @@ fn rollback_counter_retirement_keeps_old_gateway_reports_from_being_repeated() {
     store
         .finish("old-version-event", "uncertain", None, "fixture", 0.0)
         .unwrap();
+    assert!(store.get("uncertain:counter:v2").unwrap().is_null());
     store
         .put("uncertain:watermark", &json!(["old-version-event"]))
         .unwrap();
     let upgraded = Store::new(&path).unwrap();
+    assert_eq!(upgraded.get("uncertain:counter:v2").unwrap()["pending"], 0);
     upgraded
         .uncertain_digest_day("fixture", "2099-01-03")
         .unwrap();

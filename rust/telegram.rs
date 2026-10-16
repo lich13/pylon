@@ -6,8 +6,29 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
+use tokio::sync::watch;
+
+static PROXY_INVALID: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_INVALID: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn invalid_responses() -> (u64, u64) {
+    (
+        PROXY_INVALID.load(Ordering::Relaxed),
+        RESPONSE_INVALID.load(Ordering::Relaxed),
+    )
+}
+fn invalid_response(status: u16, read_only: bool) {
+    if !read_only {
+        let counter = if matches!(status, 502..=504) {
+            &PROXY_INVALID
+        } else {
+            &RESPONSE_INVALID
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 pub fn numeric_id(value: &Value) -> String {
     value
@@ -114,10 +135,10 @@ impl Telegram {
             }
         })?;
         let status = response.status().as_u16();
-        let value: Value = response
-            .json()
-            .await
-            .map_err(|_| uncertain(format!("Telegram HTTP {status}: invalid response")))?;
+        let value: Value = response.json().await.map_err(|_| {
+            invalid_response(status, read_only);
+            uncertain(format!("Telegram HTTP {status}: invalid response"))
+        })?;
         if value["ok"] == true
             && value.get("result").is_some_and(|v| !v.is_null())
             && (200..300).contains(&status)
@@ -125,6 +146,7 @@ impl Telegram {
             return Ok(value["result"].clone());
         }
         if value["ok"] != false || value["error_code"].as_u64().is_none() {
+            invalid_response(status, read_only);
             return Err(uncertain(format!(
                 "Telegram HTTP {status}: invalid response"
             )));
@@ -360,42 +382,163 @@ fn valid_receipt(value: &Value, owner: &str) -> Result<()> {
 }
 
 pub async fn deliver(store: &Store, telegram: &Telegram, bot: &Bot, event: &Value) -> Result<f64> {
-    let id = event["id"].as_str().context("event id missing")?;
+    let (_sender, mut stop) = watch::channel(false);
+    deliver_with_stop(store, telegram, bot, event, &mut stop).await
+}
+
+#[derive(Debug)]
+struct Deferred;
+impl std::fmt::Display for Deferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("delivery completion deferred")
+    }
+}
+impl std::error::Error for Deferred {}
+
+fn interrupted() -> anyhow::Error {
+    Failure {
+        status: "uncertain",
+        reason: "delivery interrupted before acknowledgement".into(),
+        delay: 0.0,
+    }
+    .into()
+}
+
+async fn write_with_stop(
+    request: impl std::future::Future<Output = Result<Value>>,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<Value> {
+    tokio::pin!(request);
+    tokio::select! {
+        biased;
+        result = &mut request => result,
+        _ = stop.changed() => {
+            // A response already arriving at shutdown can still establish a
+            // receipt. Bound that drain; never issue a second network request.
+            tokio::time::timeout(Duration::from_secs(1), &mut request)
+                .await.unwrap_or_else(|_| Err(interrupted()))
+        },
+    }
+}
+
+async fn checkpoint(
+    store: &Store,
+    event: &Value,
+    status: &str,
+    receipt: Option<Value>,
+    reason: &str,
+    delay: f64,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let record = crate::completion::Completion::delivery(event, status, receipt, reason, delay)?;
+    match crate::completion::persist(store, record, stop).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Deferred.into()),
+        Err(error) => {
+            // Never reinterpret a completion-write failure as a failed remote send.
+            crate::errors::log("delivery-checkpoint", &error);
+            Err(crate::errors::ReconcileRequired.into())
+        }
+    }
+}
+
+pub(crate) async fn deliver_with_stop(
+    store: &Store,
+    telegram: &Telegram,
+    bot: &Bot,
+    event: &Value,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<f64> {
+    let _hold = crate::completion::Hold::delivery(store, event, stop)
+        .await
+        .context(crate::errors::ReconcileRequired)?;
+    crate::completion::stage(
+        store,
+        crate::completion::Completion::delivery(
+            event,
+            "uncertain",
+            event.get("receipt").filter(|v| !v.is_null()).cloned(),
+            "delivery interrupted before acknowledgement",
+            0.0,
+        )?,
+    )
+    .await
+    .context(crate::errors::ReconcileRequired)?;
     let payload = &event["payload"];
-    let result:Result<Value>=async {
-        let check_expiry=||->Result<()>{if payload["expires_at"].as_f64().is_some_and(|v|v<=crate::now()){return Err(Failure{status:"suppressed",reason:"notification expired".into(),delay:0.0}.into())}Ok(())};
+    let result: Result<Value> = async {
+        let check_expiry = || -> Result<()> {
+            if payload["expires_at"].as_f64().is_some_and(|v| v <= crate::now()) {
+                return Err(Failure { status: "suppressed", reason: "notification expired".into(), delay: 0.0 }.into());
+            }
+            Ok(())
+        };
+        if *stop.borrow() {
+            return Err(Failure { status: "pending", reason: "stopped before send".into(), delay: 0.0 }.into());
+        }
         check_expiry()?;
         match event["kind"].as_str().unwrap_or("") {
-            "text"=>{
-                let mut receipt=event["receipt"].as_array().cloned().unwrap_or_default();
-                let parts=chunks(payload["text"].as_str().unwrap_or(""));
+            "text" => {
+                let mut receipt = event["receipt"].as_array().cloned().unwrap_or_default();
+                let parts = chunks(payload["text"].as_str().unwrap_or(""));
+                if receipt.len() == parts.len() {
+                    checkpoint(store, event, "delivered", Some(json!(receipt)), "", 0.0, stop).await?;
+                    return Ok(json!(receipt));
+                }
+                anyhow::ensure!(receipt.len() < parts.len(), "receipt exceeds message parts");
                 for (i,part) in parts.iter().enumerate().skip(receipt.len()) {
                     check_expiry()?;
                     let mut data=json!({"chat_id":bot.owner,"text":part,"parse_mode":"HTML","link_preview_options":{"is_disabled":true}});
                     if i+1==parts.len() && !payload["reply_markup"].is_null(){data["reply_markup"]=payload["reply_markup"].clone()}
                     if i==0 && payload["reply_to_message_id"].is_number(){data["reply_parameters"]=json!({"message_id":payload["reply_to_message_id"]})}
-                    let sent=telegram.call("sendMessage",&data,false).await?;
+                    if *stop.borrow() { return Err(interrupted()); }
+                    let sent = write_with_stop(async { Ok(telegram.call("sendMessage", &data, false).await?) }, stop).await?;
                     valid_receipt(&sent, &bot.owner)?;
                     receipt.push(json!({"message_id":sent["message_id"],"chat_id":sent["chat"]["id"]}));
-                    persist(store,id,"sending",Some(json!(receipt)),"",0.0).await?;
-                    if i+1<parts.len(){tokio::time::sleep(Duration::from_millis(1100)).await}
+                    let status = if i + 1 == parts.len() { "delivered" } else { "sending" };
+                    checkpoint(store, event, status, Some(json!(receipt)), "", 0.0, stop).await?;
+                    if i + 1 < parts.len() {
+                        tokio::select! {
+                            _ = stop.changed() => return Err(interrupted()),
+                            _ = tokio::time::sleep(Duration::from_millis(1100)) => {},
+                        }
+                    }
                 }
                 Ok(json!(receipt))
             },
-            "document"=>{let sent=telegram.document(&bot.owner,payload).await?;valid_receipt(&sent, &bot.owner)?;Ok(json!({"message_id":sent["message_id"],"chat_id":sent["chat"]["id"],"document":sent["document"]}))},
-            "bark"=>match tokio::time::timeout(Duration::from_secs(60),crate::bark::send(payload)).await {
-                Ok(result)=>result,
-                Err(_)=>Err(Failure{status:"uncertain",reason:"Bark total deadline exceeded; reconcile before retry".into(),delay:0.0}.into()),
+            "document" => {
+                let sent = write_with_stop(telegram.document(&bot.owner, payload), stop).await?;
+                valid_receipt(&sent, &bot.owner)?;
+                Ok(json!({"message_id":sent["message_id"],"chat_id":sent["chat"]["id"],"document":sent["document"]}))
             },
+            "bark" => write_with_stop(async {
+                match tokio::time::timeout(Duration::from_secs(60), crate::bark::send(payload)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(Failure { status:"uncertain", reason:"Bark total deadline exceeded; reconcile before retry".into(), delay:0.0 }.into()),
+                }
+            }, stop).await,
             _=>anyhow::bail!("unsupported delivery kind")
         }
     }.await;
     match result {
         Ok(receipt) => {
-            persist(store, id, "delivered", Some(receipt), "", 0.0).await?;
+            if event["kind"] != "text" {
+                let result =
+                    checkpoint(store, event, "delivered", Some(receipt), "", 0.0, stop).await;
+                if let Err(error) = result
+                    && !error.is::<Deferred>()
+                {
+                    return Err(error);
+                }
+            }
             Ok(1.1)
         }
         Err(error) => {
+            if error.is::<Deferred>() {
+                return Ok(1.1);
+            }
+            if error.is::<crate::errors::ReconcileRequired>() {
+                return Err(error);
+            }
             let failure = error.downcast_ref::<Failure>();
             let status = failure.map(|f| f.status).unwrap_or("failed");
             let reason = failure
@@ -410,43 +553,17 @@ pub async fn deliver(store: &Store, telegram: &Telegram, bot: &Bot, event: &Valu
                     .min(4);
                 delay = delay.max((30.0 * 2_f64.powi(attempts as i32)).min(300.0));
             }
-            persist(store, id, status, None, reason, delay).await?;
+            let result = checkpoint(store, event, status, None, reason, delay, stop).await;
+            if let Err(error) = result
+                && !error.is::<Deferred>()
+            {
+                return Err(error);
+            }
             Ok(if status == "pending" {
                 delay.max(1.1)
             } else {
                 1.1
             })
-        }
-    }
-}
-
-async fn persist(
-    store: &Store,
-    id: &str,
-    status: &str,
-    receipt: Option<Value>,
-    reason: &str,
-    delay: f64,
-) -> Result<()> {
-    // A known remote receipt must never be converted into a second network request.
-    let mut backoff = 0.25_f64;
-    loop {
-        let (id, status, receipt, reason) = (
-            id.to_owned(),
-            status.to_owned(),
-            receipt.clone(),
-            reason.to_owned(),
-        );
-        match store
-            .blocking(move |s| s.finish(&id, &status, receipt.as_ref(), &reason, delay))
-            .await
-        {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                crate::errors::log("delivery-persistence", &error);
-                tokio::time::sleep(Duration::from_secs_f64(backoff)).await;
-                backoff = (backoff * 2.0).min(5.0);
-            }
         }
     }
 }

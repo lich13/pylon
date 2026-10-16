@@ -33,6 +33,16 @@ pub struct Store {
 }
 impl Store {
     pub fn new(path: &Path) -> Result<Self> {
+        let store = Self::migration_target(path)?;
+        {
+            let db = store.connect()?;
+            crate::migration::internal_state(&db)?;
+        }
+        Ok(store)
+    }
+    /// The import transaction owns internal initialization so rejected imports
+    /// leave existing state untouched. Normal runtime callers must use `new`.
+    pub(crate) fn migration_target(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path.parent().context("missing database directory")?)?;
         let store = Self {
             path: path.to_path_buf(),
@@ -41,7 +51,6 @@ impl Store {
         {
             let db = store.connect()?;
             db.execute_batch(include_str!("schema.sql"))?;
-            crate::migration::internal_state(&db)?;
         }
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -130,45 +139,23 @@ impl Store {
     pub fn uncertain_digest_day(&self, target: &str, day: &str) -> Result<()> {
         let mut db = self.connect()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let counter: Option<String> = tx
-            .query_row(
-                "SELECT value FROM kv WHERE key='uncertain:counter:v2'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let mut counter: Value = if let Some(value) = counter {
-            serde_json::from_str(&value)?
-        } else {
-            // Convert the old watermark once, preserving only genuinely unsummarized events.
-            let old: Option<String> = tx
-                .query_row(
-                    "SELECT value FROM kv WHERE key='uncertain:watermark'",
-                    [],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let pending = if let Some(old) = old {
-                let seen: std::collections::BTreeSet<String> = serde_json::from_str(&old)?;
-                let mut query = tx.prepare("SELECT id FROM events WHERE status='uncertain' AND job_id<>'uncertain-summary'")?;
-                let ids = query
-                    .query_map([], |r| r.get::<_, String>(0))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                ids.iter().filter(|id| !seen.contains(*id)).count()
-            } else {
-                0
-            };
-            json!({"version":2,"pending":pending,"last_day":""})
-        };
+        crate::migration::initialize_uncertain(&tx)?;
+        let value: String = tx.query_row(
+            "SELECT value FROM kv WHERE key='uncertain:counter:v2'",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut counter: Value = serde_json::from_str(&value)?;
         let key = format!("uncertain:summary:{day}");
-        let sent: bool =
-            tx.query_row("SELECT EXISTS(SELECT 1 FROM kv WHERE key=?)", [&key], |r| {
-                r.get(0)
-            })?;
+        let event_id = crate::digest(&key)[..32].to_owned();
+        let sent: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kv WHERE key=?) OR EXISTS(SELECT 1 FROM events WHERE id=?)",
+            params![key, event_id], |r| r.get(0),
+        )?;
         let pending = counter["pending"].as_u64().unwrap_or(0);
         if pending > 0 && counter["last_day"] != day && !sent {
             let payload = json!({"text":format!("Pylon 有 {pending} 条新增投递结果待核对。原消息未自动重发，可在状态页查看。"),"expires_at":crate::now()+600.0});
-            tx.execute("INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'uncertain-summary','text',?,'pending',0,0,?,?,'gateway')",params![&crate::digest(&key)[..32],target,payload.to_string(),crate::now(),crate::now()])?;
+            tx.execute("INSERT INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'uncertain-summary','text',?,'pending',0,0,?,?,'gateway')",params![event_id,target,payload.to_string(),crate::now(),crate::now()])?;
             counter["pending"] = json!(0);
             counter["last_day"] = json!(day);
         }
@@ -200,17 +187,15 @@ impl Store {
     ) -> Result<()> {
         let mut db = self.connect()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if reply["text"].as_str().is_some_and(|s| !s.is_empty()) {
-            let id = crate::digest(format!("{bot}:text:reply:{update}"));
-            tx.execute("INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'bot','text',?,'pending',0,0,?,?,?)",params![&id[..32],bot,reply.to_string(),crate::now(),crate::now(),owner])?;
-        }
-        tx.execute(
-            "UPDATE updates SET status=? WHERE profile=? AND update_id=?",
-            params![status, bot, update],
+        complete_update_transaction(
+            &tx,
+            bot,
+            update,
+            owner,
+            reply,
+            status,
+            &contexts.iter().map(crate::digest).collect::<Vec<_>>(),
         )?;
-        for token in contexts {
-            tx.execute("DELETE FROM contexts WHERE hash=?", [crate::digest(token)])?;
-        }
         tx.commit()?;
         Ok(())
     }
@@ -355,6 +340,29 @@ impl Store {
         }
         Ok(false)
     }
+}
+
+pub(crate) fn complete_update_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    bot: &str,
+    update: i64,
+    owner: &str,
+    reply: &Value,
+    status: &str,
+    contexts: &[String],
+) -> Result<()> {
+    if reply["text"].as_str().is_some_and(|s| !s.is_empty()) {
+        let id = crate::digest(format!("{bot}:text:reply:{update}"));
+        tx.execute("INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'bot','text',?,'pending',0,0,?,?,?)",params![&id[..32],bot,reply.to_string(),crate::now(),crate::now(),owner])?;
+    }
+    tx.execute(
+        "UPDATE updates SET status=? WHERE profile=? AND update_id=?",
+        params![status, bot, update],
+    )?;
+    for hash in contexts {
+        tx.execute("DELETE FROM contexts WHERE hash=?", [hash])?;
+    }
+    Ok(())
 }
 
 pub struct PooledConnection {

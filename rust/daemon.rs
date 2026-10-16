@@ -4,11 +4,34 @@ use crate::{
     config::Bot,
     telegram::{Telegram, authorized},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, time::Duration};
 use tokio::sync::watch;
+
+/// Unlike a bare JoinHandle, dropping this owner cancels its async child.
+struct Child<T>(tokio::task::JoinHandle<T>);
+impl<T> std::ops::Deref for Child<T> {
+    type Target = tokio::task::JoinHandle<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl<T> std::future::Future for Child<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+impl<T> Drop for Child<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 pub fn menu(snapshot: &Snapshot, bot: &str) -> Vec<Value> {
     let mut commands = snapshot
@@ -341,6 +364,16 @@ async fn route(
     }
 }
 pub async fn command_once(app: &App, id: &str, tg: &Telegram) -> Result<bool> {
+    let (_sender, mut stop) = watch::channel(false);
+    command_once_with_stop(app, id, tg, &mut stop).await
+}
+
+async fn command_once_with_stop(
+    app: &App,
+    id: &str,
+    tg: &Telegram,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<bool> {
     let bot_id = id.to_owned();
     let row = app.store.blocking(move |store| {
         let id = bot_id.as_str();
@@ -359,29 +392,53 @@ pub async fn command_once(app: &App, id: &str, tg: &Telegram) -> Result<bool> {
     let Some((uid, kind, payload)) = row else {
         return Ok(false);
     };
+    let initial = crate::completion::Completion::command(
+        id,
+        uid,
+        &payload,
+        "gateway",
+        Value::Null,
+        "uncertain",
+        &[],
+    );
+    let _hold = crate::completion::Hold::new(&app.store, &initial, stop)
+        .await
+        .context(crate::errors::ReconcileRequired)?;
+    crate::completion::stage(&app.store, initial)
+        .await
+        .context(crate::errors::ReconcileRequired)?;
     let message: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
     if kind == "callback_query" && !message.is_null() {
-        let _ = tg
-            .call(
+        let query = json!({"callback_query_id":message["id"]});
+        tokio::select! {
+            _ = stop.changed() => {},
+            _ = tg.call(
                 "answerCallbackQuery",
-                &json!({"callback_query_id":message["id"]}),
+                &query,
                 true,
-            )
-            .await;
+            ) => {},
+        }
     }
     let mut contexts = Vec::new();
-    let result = if message.is_null() {
+    let result = if *stop.borrow() {
+        Err(crate::errors::ReconcileRequired.into())
+    } else if message.is_null() {
         Err(anyhow::anyhow!("stored update is invalid"))
     } else {
-        route(
-            app,
-            &mut contexts,
-            id,
-            &kind,
-            &message,
-            &format!("telegram:{id}:{uid}"),
-        )
-        .await
+        let request_id = format!("telegram:{id}:{uid}");
+        let result = tokio::select! {
+            biased;
+            value = route(app, &mut contexts, id, &kind, &message, &request_id) => value,
+            _ = stop.changed() => Err(crate::errors::ReconcileRequired.into()),
+        };
+        // A disconnected executor request can still be running independently.
+        if result
+            .as_ref()
+            .is_err_and(|e| e.is::<crate::errors::ReconcileRequired>())
+        {
+            contexts.clear();
+        }
+        result
     };
     let (mut reply, status) = match result {
         Ok(value) => (value, "done"),
@@ -401,27 +458,11 @@ pub async fn command_once(app: &App, id: &str, tg: &Telegram) -> Result<bool> {
     if owner == "gateway" && status == "uncertain" {
         reply["expires_at"] = json!(crate::now() + 600.0);
     }
-    loop {
-        let (id, owner, reply, contexts) = (
-            id.to_owned(),
-            owner.clone(),
-            reply.clone(),
-            contexts.clone(),
-        );
-        match app
-            .store
-            .blocking(move |store| {
-                store.complete_update(&id, uid, &owner, &reply, status, &contexts)
-            })
-            .await
-        {
-            Ok(()) => break,
-            Err(error) => {
-                crate::errors::log("command-result-persistence", &error);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
+    let result =
+        crate::completion::Completion::command(id, uid, &payload, &owner, reply, status, &contexts);
+    crate::completion::persist(&app.store, result, stop)
+        .await
+        .context(crate::errors::ReconcileRequired)?;
     Ok(true)
 }
 async fn pause(stop: &mut watch::Receiver<bool>, seconds: f64) -> bool {
@@ -483,11 +524,13 @@ async fn lane_once(
                 }
             }
         }
-        "command" => Ok(if command_once(&app, &id, &tg).await? {
-            0.0
-        } else {
-            0.5
-        }),
+        "command" => Ok(
+            if command_once_with_stop(&app, &id, &tg, &mut stop).await? {
+                0.0
+            } else {
+                0.5
+            },
+        ),
         "menu" => {
             let result = tokio::select! {
                 biased;
@@ -520,7 +563,12 @@ async fn lane_once(
                 .await?;
             if let Some(event) = event {
                 let started = crate::now();
-                let delay = crate::telegram::deliver(&app.store, &tg, &bot, &event).await?;
+                let delay =
+                    crate::telegram::deliver_with_stop(&app.store, &tg, &bot, &event, &mut stop)
+                        .await?;
+                if *stop.borrow() {
+                    return Ok(delay);
+                }
                 // Metrics cannot change an already persisted delivery result.
                 if let Err(error) = app
                     .store
@@ -576,8 +624,9 @@ async fn bot_worker_client(
                     continue;
                 }
                 // The child boundary catches a panic without cancelling another lane.
-                let result = tokio::spawn(lane_once(app.clone(), id.clone(), bot.clone(), tg.clone(), lane, stop.clone()))
+                let result = Child(tokio::spawn(lane_once(app.clone(), id.clone(), bot.clone(), tg.clone(), lane, stop.clone())))
                     .await.unwrap_or_else(|_| Err(crate::errors::ReconcileRequired.into()));
+                if *stop.borrow() { break; }
                 let recovering = failures > 0;
                 let delay = match &result {
                     Ok(delay) => { failures = 0; *delay }
@@ -647,15 +696,20 @@ fn configuration_fingerprint(config: &crate::config::Config) -> String {
     }
     crate::digest(bytes)
 }
-pub async fn run(app: App) -> Result<()> {
-    use fs2::FileExt;
-    std::fs::create_dir_all(app.config.home.join("gateway"))?;
+pub fn acquire_lock(config: &crate::config::Config) -> Result<std::fs::File> {
+    std::fs::create_dir_all(config.home.join("gateway"))?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(app.config.home.join("gateway/daemon.lock"))?;
-    lock.try_lock_exclusive()
-        .context("gateway already running")?;
+        .open(config.home.join("gateway/daemon.lock"))?;
+    ensure!(crate::runtime::try_lock(&lock)?, "gateway already running");
+    Ok(lock)
+}
+
+pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
+    app.store
+        .blocking(|s| crate::completion::reconcile(&s))
+        .await?;
     app.store.blocking(|s| s.recover()).await?;
     if let Some(target) = app.snapshot.read().await.settings.routes.get("personal") {
         let target = target.clone();
@@ -663,16 +717,29 @@ pub async fn run(app: App) -> Result<()> {
             .blocking(move |s| s.uncertain_digest(&target))
             .await?;
     }
-    let rpc = tokio::spawn(crate::api::serve_socket(app.clone()));
+    let mut rpc = Child(tokio::spawn(crate::api::serve_socket(app.clone())));
     let port = app.snapshot.read().await.settings.web_port;
-    let web = tokio::spawn(crate::api::serve_web(app.clone(), port));
-    type BotWorker = (
-        String,
-        watch::Sender<bool>,
-        tokio::task::JoinHandle<Result<()>>,
-    );
+    let mut web = Child(tokio::spawn(crate::api::serve_web(app.clone(), port)));
+    type BotWorker = (String, watch::Sender<bool>, Child<Result<()>>);
     let mut workers: BTreeMap<String, BotWorker> = BTreeMap::new();
     let mut shutdown = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let (shutdown_tx, mut stopping) = watch::channel(false);
+    let _signal = Child(tokio::spawn(async move {
+        tokio::select! { _ = shutdown.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+        let _ = shutdown_tx.send(true);
+    }));
+    let journal_store = app.store.clone();
+    let reconciler = Child(tokio::spawn(async move {
+        loop {
+            if let Err(error) = journal_store
+                .blocking(|s| crate::completion::reconcile(&s))
+                .await
+            {
+                crate::errors::log("completion-reconcile", &error);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }));
     let mut rejected = app
         .store
         .blocking(|s| s.get("configuration-rejected"))
@@ -683,161 +750,195 @@ pub async fn run(app: App) -> Result<()> {
     let mut logged_rejected = String::new();
     let mut retrying: BTreeMap<String, (u32, f64)> = BTreeMap::new();
     let mut next_digest = crate::now() + 60.0;
-    loop {
-        // A malformed replacement keeps the entire last valid configuration active.
-        if let Err(error) = app.reload().await {
-            let config = app.config.clone();
-            let fingerprint =
-                crate::blocking(move || Ok(configuration_fingerprint(&config))).await?;
-            if fingerprint != rejected {
-                if logged_rejected != fingerprint {
-                    crate::errors::log("configuration rejected", &error);
-                    logged_rejected = fingerprint.clone();
+    let supervise = async {
+        loop {
+            // A malformed replacement keeps the entire last valid configuration active.
+            if let Err(error) = app.reload().await {
+                let config = app.config.clone();
+                let fingerprint =
+                    crate::blocking(move || Ok(configuration_fingerprint(&config))).await?;
+                if fingerprint != rejected {
+                    if logged_rejected != fingerprint {
+                        crate::errors::log("configuration rejected", &error);
+                        logged_rejected = fingerprint.clone();
+                    }
+                    let hash = fingerprint.clone();
+                    let target = app
+                        .snapshot
+                        .read()
+                        .await
+                        .settings
+                        .routes
+                        .get("personal")
+                        .cloned();
+                    match app
+                        .store
+                        .blocking(move |s| s.configuration_rejected(&hash, target.as_deref()))
+                        .await
+                    {
+                        Ok(()) => rejected = fingerprint,
+                        Err(error) => crate::errors::log("configuration-status", &error),
+                    }
                 }
-                let hash = fingerprint.clone();
-                let target = app
-                    .snapshot
-                    .read()
-                    .await
-                    .settings
-                    .routes
-                    .get("personal")
-                    .cloned();
+            } else if !rejected.is_empty() {
                 match app
                     .store
-                    .blocking(move |s| s.configuration_rejected(&hash, target.as_deref()))
+                    .blocking(|s| s.put("configuration-rejected", &Value::Null))
                     .await
                 {
-                    Ok(()) => rejected = fingerprint,
+                    Ok(()) => {
+                        rejected.clear();
+                        logged_rejected.clear();
+                    }
                     Err(error) => crate::errors::log("configuration-status", &error),
                 }
             }
-        } else if !rejected.is_empty() {
-            match app
-                .store
-                .blocking(|s| s.put("configuration-rejected", &Value::Null))
-                .await
-            {
-                Ok(()) => {
-                    rejected.clear();
-                    logged_rejected.clear();
-                }
-                Err(error) => crate::errors::log("configuration-status", &error),
-            }
-        }
-        let snapshot = app.snapshot.read().await.clone();
-        let mut desired = BTreeMap::new();
-        for (id, bot) in snapshot.settings.bots.iter().filter(|(_, b)| b.enabled) {
-            let token = match app.config.token(bot) {
-                Ok(token) => token,
-                Err(error) => {
-                    crate::errors::log("credential-read", &error);
-                    if let Some((hash, _, _)) = workers.get(id) {
-                        desired.insert(id.clone(), hash.clone());
+            let snapshot = app.snapshot.read().await.clone();
+            let mut desired = BTreeMap::new();
+            for (id, bot) in snapshot.settings.bots.iter().filter(|(_, b)| b.enabled) {
+                let token = match app.config.token(bot) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        crate::errors::log("credential-read", &error);
+                        if let Some((hash, _, _)) = workers.get(id) {
+                            desired.insert(id.clone(), hash.clone());
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
-            desired.insert(
-                id.clone(),
-                crate::digest(format!(
-                    "{}:{}:{}",
-                    snapshot.settings.telegram_ip_family,
-                    serde_json::to_string(bot)?,
-                    crate::digest(token)
-                )),
-            );
-        }
-        let remove = workers
-            .iter()
-            .filter(|(id, (hash, _, task))| desired.get(*id) != Some(hash) || task.is_finished())
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for id in remove {
-            if let Some((_, stop, task)) = workers.get(&id) {
-                let _ = stop.send(true);
-                if !task.is_finished() {
-                    continue;
-                }
-            }
-            if let Some((hash, stop, task)) = workers.remove(&id) {
-                let changed = desired.get(&id) != Some(&hash);
-                let _ = stop.send(true);
-                let result = task.await;
-                if !changed && !matches!(result, Ok(Ok(()))) {
-                    let attempts = retrying
-                        .get(&id)
-                        .map(|v| v.0)
-                        .unwrap_or(0)
-                        .saturating_add(1);
-                    retrying.insert(
-                        id.clone(),
-                        (
-                            attempts,
-                            crate::now() + (5.0 * 2_f64.powi(attempts.min(4) as i32 - 1)).min(60.0),
-                        ),
-                    );
-                } else {
-                    retrying.remove(&id);
-                }
-                // A failed subloop can leave a claimed send/update with no owner.
-                // Quarantine it without replay, scoped to this bot only.
-                let bot_id = id.clone();
-                if let Err(error)=app.store.blocking(move |s| {
-                    let db=s.connect()?;
-                    db.execute("UPDATE events SET status='uncertain',error='bot worker stopped before acknowledgement',updated_at=? WHERE profile=? AND status='sending'",params![crate::now(),bot_id])?;
-                    db.execute("UPDATE updates SET status='uncertain' WHERE profile=? AND status='running'",[&bot_id])?;
-                    s.put(&format!("connection:{bot_id}"),&json!({"status":"restarting","at":crate::now()}))
-                }).await{crate::errors::log("worker-retirement",&error)}
-            }
-        }
-        for (id, hash) in desired {
-            if retrying.get(&id).is_some_and(|(_, at)| *at > crate::now()) {
-                continue;
-            }
-            workers.entry(id.clone()).or_insert_with(|| {
-                let (tx, rx) = watch::channel(false);
-                let task = tokio::spawn(bot_worker(
-                    app.clone(),
+                };
+                desired.insert(
                     id.clone(),
-                    snapshot.settings.bots[&id].clone(),
-                    rx,
-                ));
-                (hash, tx, task)
-            });
-        }
-        if let Some(target) = snapshot.settings.routes.get("personal")
-            && crate::now() >= next_digest
-        {
-            next_digest = crate::now() + 60.0;
-            let target = target.clone();
-            if let Err(error) = app
-                .store
-                .blocking(move |s| s.uncertain_digest(&target))
-                .await
-            {
-                crate::errors::log("uncertain-summary", &error)
+                    crate::digest(format!(
+                        "{}:{}:{}",
+                        snapshot.settings.telegram_ip_family,
+                        serde_json::to_string(bot)?,
+                        crate::digest(token)
+                    )),
+                );
             }
+            let remove = workers
+                .iter()
+                .filter(|(id, (hash, _, task))| {
+                    desired.get(*id) != Some(hash) || task.is_finished()
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            for id in remove {
+                if let Some((_, stop, task)) = workers.get(&id) {
+                    let _ = stop.send(true);
+                    if !task.is_finished() {
+                        continue;
+                    }
+                }
+                if let Some((hash, stop, task)) = workers.remove(&id) {
+                    let changed = desired.get(&id) != Some(&hash);
+                    let _ = stop.send(true);
+                    let result = task.await;
+                    if !changed && !matches!(result, Ok(Ok(()))) {
+                        let attempts = retrying
+                            .get(&id)
+                            .map(|v| v.0)
+                            .unwrap_or(0)
+                            .saturating_add(1);
+                        retrying.insert(
+                            id.clone(),
+                            (
+                                attempts,
+                                crate::now()
+                                    + (5.0 * 2_f64.powi(attempts.min(4) as i32 - 1)).min(60.0),
+                            ),
+                        );
+                    } else {
+                        retrying.remove(&id);
+                    }
+                    // A failed subloop can leave a claimed send/update with no owner.
+                    // Quarantine it without replay, scoped to this bot only.
+                    let bot_id = id.clone();
+                    if let Err(error) = app
+                        .store
+                        .blocking(move |s| crate::completion::interrupt_bot(&s, &bot_id))
+                        .await
+                    {
+                        crate::errors::log("worker-retirement", &error);
+                    }
+                }
+            }
+            for (id, hash) in desired {
+                if retrying.get(&id).is_some_and(|(_, at)| *at > crate::now()) {
+                    continue;
+                }
+                workers.entry(id.clone()).or_insert_with(|| {
+                    let (tx, rx) = watch::channel(false);
+                    let task = Child(tokio::spawn(bot_worker(
+                        app.clone(),
+                        id.clone(),
+                        snapshot.settings.bots[&id].clone(),
+                        rx,
+                    )));
+                    (hash, tx, task)
+                });
+            }
+            if let Some(target) = snapshot.settings.routes.get("personal")
+                && crate::now() >= next_digest
+            {
+                next_digest = crate::now() + 60.0;
+                let target = target.clone();
+                if let Err(error) = app
+                    .store
+                    .blocking(move |s| s.uncertain_digest(&target))
+                    .await
+                {
+                    crate::errors::log("uncertain-summary", &error)
+                }
+            }
+            if rpc.is_finished() {
+                (&mut rpc).await.context("gateway RPC listener failed")??;
+                anyhow::bail!("gateway RPC listener stopped")
+            }
+            if web.is_finished() {
+                (&mut web).await.context("gateway web listener failed")??;
+                anyhow::bail!("gateway web listener stopped")
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        if rpc.is_finished() {
-            rpc.await.context("gateway RPC listener task failed")??;
-            anyhow::bail!("gateway RPC listener stopped")
-        }
-        if web.is_finished() {
-            web.await.context("gateway web listener task failed")??;
-            anyhow::bail!("gateway web listener stopped")
-        }
-        tokio::select! {_=shutdown.recv()=>break,_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(Duration::from_secs(5))=>{}}
-    }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+    let outcome = tokio::select! {
+        biased;
+        _ = stopping.changed() => Ok(()),
+        result = supervise => result,
+    };
+    // Five seconds for cooperative draining/database reconciliation and two for
+    // runtime shutdown in main, within the global eight-second gateway budget.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    rpc.abort();
+    web.abort();
+    reconciler.abort();
+    let bot_ids = workers.keys().cloned().collect::<Vec<_>>();
     for (_, stop, _) in workers.values() {
         let _ = stop.send(true);
     }
+    let mut draining = tokio::task::JoinSet::new();
     for (_, (_, _, task)) in workers {
-        let _ = task.await;
+        draining.spawn(task);
     }
-    rpc.abort();
-    web.abort();
-    Ok(())
+    let _ = tokio::time::timeout_at(deadline, async {
+        while draining.join_next().await.is_some() {}
+    })
+    .await;
+    draining.abort_all();
+    let _ = tokio::time::timeout_at(
+        deadline,
+        app.store.blocking(move |store| {
+            for bot in bot_ids {
+                crate::completion::interrupt_bot(&store, &bot)?;
+            }
+            Ok(())
+        }),
+    )
+    .await;
+    outcome
 }
 
 #[cfg(test)]

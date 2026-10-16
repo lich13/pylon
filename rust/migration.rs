@@ -13,13 +13,17 @@ pub fn import(config: &Config, source: &Path, mapping: &Path) -> Result<Value> {
     );
     let mapping: Value = serde_json::from_slice(&std::fs::read(mapping)?)?;
     let settings = config.settings()?;
-    let store = Store::new(&config.db())?;
-    ensure!(
-        store.get("migration:complete")?.is_null(),
-        "migration already completed; never overwrite live state"
-    );
+    let store = Store::migration_target(&config.db())?;
     let mut db = store.connect()?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    ensure!(
+        !tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kv WHERE key='migration:complete')",
+            [],
+            |r| r.get::<_, bool>(0)
+        )?,
+        "migration already completed; never overwrite live state"
+    );
     ensure!(
         tx.query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))? == 0,
         "target contains events; state merge required"
@@ -91,6 +95,7 @@ pub fn import(config: &Config, source: &Path, mapping: &Path) -> Result<Value> {
             tx.execute("INSERT INTO web_sessions SELECT hash,?,profile,csrf,expires_at FROM previous.market_web_sessions WHERE profile=?",params![value.owner,bot])?;
         }
     }
+    internal_state_transaction(&tx)?;
     let counts = json!({"events":tx.query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0))?,"uncertain":tx.query_row("SELECT count(*) FROM events WHERE status='uncertain'",[],|r|r.get::<_,i64>(0))?,"sessions":tx.query_row("SELECT count(*) FROM web_sessions",[],|r|r.get::<_,i64>(0))?});
     tx.execute(
         "INSERT INTO kv VALUES('migration:complete',?)",
@@ -102,15 +107,58 @@ pub fn import(config: &Config, source: &Path, mapping: &Path) -> Result<Value> {
 
 /// Idempotent internal diagnostics migration; public tables and IDs stay unchanged.
 pub fn internal_state(db: &rusqlite::Connection) -> Result<()> {
-    db.execute_batch(
-            "CREATE TRIGGER IF NOT EXISTS uncertain_count_update_v2 AFTER UPDATE OF status ON events
-             WHEN NEW.status='uncertain' AND OLD.status<>'uncertain' AND NEW.job_id<>'uncertain-summary'
-             BEGIN UPDATE kv SET value=json_set(value,'$.pending',json_extract(value,'$.pending')+1)
-               WHERE key='uncertain:counter:v2'; END;
-             CREATE TRIGGER IF NOT EXISTS uncertain_count_insert_v2 AFTER INSERT ON events
-             WHEN NEW.status='uncertain' AND NEW.job_id<>'uncertain-summary'
-             BEGIN UPDATE kv SET value=json_set(value,'$.pending',json_extract(value,'$.pending')+1)
-               WHERE key='uncertain:counter:v2'; END;"
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+    internal_state_transaction(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn internal_state_transaction(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    initialize_uncertain(tx)?;
+    let installed: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM kv WHERE key='uncertain:triggers' AND value='3')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !installed {
+        tx.execute_batch(
+            "DROP TRIGGER IF EXISTS uncertain_count_update_v2;
+                          DROP TRIGGER IF EXISTS uncertain_count_insert_v2;",
         )?;
+        for (name, action, condition) in [
+            (
+                "uncertain_count_update_v2",
+                "UPDATE OF status",
+                "AND OLD.status<>'uncertain'",
+            ),
+            ("uncertain_count_insert_v2", "INSERT", ""),
+        ] {
+            tx.execute_batch(&format!(
+                "CREATE TRIGGER {name} AFTER {action} ON events
+                 WHEN NEW.status='uncertain' {condition} AND NEW.job_id<>'uncertain-summary'
+                 BEGIN
+                   UPDATE kv SET value=json_set(value,'$.pending',json_extract(value,'$.pending')+1)
+                     WHERE key='uncertain:counter:v2';
+                   {seed}
+                 END;",
+                // A deliberately retired counter must stay inactive while an older
+                // binary owns the database. The next Store::new seeds it explicitly.
+                seed = UNCERTAIN_SEED.replace("WHERE NOT EXISTS", "WHERE NOT EXISTS (SELECT 1 FROM kv WHERE key='uncertain:counter:v2:retired') AND NOT EXISTS"),
+            ))?;
+        }
+        tx.execute("INSERT INTO kv VALUES('uncertain:triggers','3') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [])?;
+    }
+    Ok(())
+}
+
+const UNCERTAIN_SEED: &str = "INSERT INTO kv(key,value)
+ SELECT 'uncertain:counter:v2',json_object('version',2,'pending',
+   (SELECT count(*) FROM events WHERE status='uncertain' AND job_id<>'uncertain-summary'
+    AND id NOT IN (SELECT value FROM json_each(COALESCE(
+      (SELECT value FROM kv WHERE key='uncertain:watermark'),'[]')))), 'last_day','')
+ WHERE NOT EXISTS (SELECT 1 FROM kv WHERE key='uncertain:counter:v2');";
+
+pub(crate) fn initialize_uncertain(db: &rusqlite::Connection) -> Result<()> {
+    db.execute_batch(UNCERTAIN_SEED)?;
     Ok(())
 }

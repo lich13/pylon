@@ -148,7 +148,7 @@ pub fn summary_refresh(config: &Config) -> Result<()> {
 fn summary_inner(config: &Config, force: bool, metrics: Option<Value>) -> Result<()> {
     let db = connect(config)?;
     let lock = crate::runtime::open_task_lock(&config.home.join("supervisor/summary.lock"))?;
-    fs2::FileExt::lock_exclusive(&lock)?;
+    crate::runtime::lock(&lock)?;
     let previous = public(config);
     if !force && (0.0..1.0).contains(&(now() - previous["updated_at"].as_f64().unwrap_or(0.0))) {
         return Ok(());
@@ -229,7 +229,7 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
                 .join("run")
                 .join(format!("dispatch-{}.lock", crate::digest(&id))),
         )?;
-        if fs2::FileExt::try_lock_exclusive(&dispatch_lock).is_err() {
+        if !crate::runtime::try_lock(&dispatch_lock)? {
             continue;
         }
         // An OS lock, not a PID/age heuristic, owns an active invocation.
@@ -239,7 +239,7 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
                 .join("run")
                 .join(format!("request-{}.lock", crate::digest(&id))),
         )?;
-        if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+        if !crate::runtime::try_lock(&lock)? {
             continue;
         }
         // The owner may have completed after the scan. Re-read while holding its lock.
