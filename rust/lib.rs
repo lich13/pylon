@@ -7,6 +7,7 @@ mod completion;
 pub mod config;
 pub mod daemon;
 pub mod db;
+pub mod downgrade;
 pub mod errors;
 pub mod migration;
 pub mod modules;

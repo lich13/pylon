@@ -138,6 +138,59 @@ pub(crate) fn directory(store: &Store) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Inspect the private mailbox without creating it or reading result payloads.
+/// A disappearing entry was reconciled concurrently; an unsafe entry is not empty.
+pub(crate) fn pending_count(database: &Path) -> Result<u64> {
+    let state = fs::symlink_metadata(database)?;
+    ensure!(
+        state.is_file() && state.nlink() == 1 && state.permissions().mode() & 0o777 == 0o600,
+        "unsafe completion state"
+    );
+    let path = database
+        .parent()
+        .context("missing state directory")?
+        .join("completions");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.is_dir()
+            && metadata.uid() == state.uid()
+            && metadata.permissions().mode() & 0o777 == 0o700,
+        "unsafe completion directory"
+    );
+    let mut count = 0;
+    for entry in fs::read_dir(&path)? {
+        let entry = entry?;
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.uid() == state.uid()
+                && metadata.permissions().mode() & 0o777 == 0o600,
+            "unsafe completion file"
+        );
+        count += 1;
+    }
+    // Detect replacement of the mailbox while enumerating it.
+    let after = fs::symlink_metadata(&path)?;
+    ensure!(
+        after.is_dir()
+            && after.dev() == metadata.dev()
+            && after.ino() == metadata.ino()
+            && after.uid() == metadata.uid()
+            && after.permissions().mode() & 0o777 == 0o700,
+        "completion directory changed"
+    );
+    Ok(count)
+}
+
 /// Prevent the reconciler from finalizing a still-owned partial delivery.
 pub(crate) struct Hold(PathBuf);
 impl Hold {

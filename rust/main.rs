@@ -32,6 +32,11 @@ enum Command {
         dispatch_fd: Option<i32>,
     },
     Diagnose,
+    /// Inspect compatibility before replacing the gateway with an older binary.
+    DowngradeCheck {
+        #[arg(long)]
+        target_version: String,
+    },
     Serve {
         id: String,
     },
@@ -134,7 +139,19 @@ enum Modules {
     },
 }
 fn main() {
-    if let Err(e) = start(Args::parse()) {
+    let args = Args::parse();
+    if let Command::DowngradeCheck { target_version } = &args.command {
+        let report = pylon::downgrade::check(&Config::new(args.home.clone()), target_version);
+        match serde_json::to_string(&report) {
+            Ok(value) => println!("{value}"),
+            Err(error) => {
+                pylon::errors::log("downgrade-output", &error.into());
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(i32::from(!report.ok));
+    }
+    if let Err(e) = start(args) {
         pylon::errors::log("cli", &e);
         eprintln!("{}", pylon::errors::cli_message(&e));
         std::process::exit(1)
@@ -206,6 +223,7 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
             )
             .await?
         }
+        Command::DowngradeCheck { .. } => anyhow::bail!("invalid command dispatch"),
         Command::Serve { id } => {
             let code = pylon::runtime::service(&config, &id).await?;
             if code != 0 {
