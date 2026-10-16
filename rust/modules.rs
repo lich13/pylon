@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeSet, path::Path};
 
 fn source_name(path: &Path) -> bool {
@@ -308,7 +308,7 @@ pub fn install(
             )?;
         }
         if !destination.exists() {
-            std::fs::create_dir_all(destination.parent().unwrap())?;
+            std::fs::create_dir_all(destination.parent().context("destination parent missing")?)?;
             std::fs::rename(&staging, &destination)?;
         }
         registry["modules"][&manifest.id] = serde_json::json!(relative);
@@ -352,11 +352,16 @@ pub fn rollback(
         crate::catalog::Catalog::load_index(base.clone(), Some(registry.clone()))?
             .validate_settings(&config.settings()?)?;
         let original: crate::catalog::Manifest = serde_json::from_slice(&std::fs::read(
-            base.join(current.as_str().unwrap()).join("module.json"),
+            base.join(current.as_str().context("current module version missing")?)
+                .join("module.json"),
         )?)?;
         let candidate: crate::catalog::Manifest = serde_json::from_slice(&std::fs::read(
-            base.join(registry["modules"][id].as_str().unwrap())
-                .join("module.json"),
+            base.join(
+                registry["modules"][id]
+                    .as_str()
+                    .context("candidate module version missing")?,
+            )
+            .join("module.json"),
         )?)?;
         if original.data_version != candidate.data_version {
             ensure!(
@@ -639,7 +644,7 @@ fn health_candidate(
             .stderr(Stdio::null());
         crate::child_identity(&mut cmd, user.uid, user.gid);
         let mut child = cmd.spawn()?;
-        child.stdin.take().unwrap().write_all(serde_json::json!({"api_version":2,"action":"health","profile":module.manifest.workspace,"payload":{}}).to_string().as_bytes())?;
+        child.stdin.take().context("health input unavailable")?.write_all(serde_json::json!({"api_version":2,"action":"health","profile":module.manifest.workspace,"payload":{}}).to_string().as_bytes())?;
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(status) = child.try_wait()? {
@@ -681,7 +686,7 @@ fn prepare_stop(
     use fs2::FileExt;
     use std::process::Stdio;
     let path = config.home.join("run/drain").join(id);
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::create_dir_all(path.parent().context("destination parent missing")?)?;
     // A previous interrupted deployment intentionally leaves admission frozen for inspection.
     let marker = std::fs::OpenOptions::new()
         .write(true)
@@ -845,7 +850,7 @@ fn activate(
         let status = std::process::Command::new(std::env::current_exe()?)
             .args([
                 "--home",
-                config.home.to_str().unwrap(),
+                config.home.to_str().context("invalid home path")?,
                 "rpc",
                 "admin.reload",
             ])
@@ -897,10 +902,10 @@ pub fn change(
     };
     let candidate = result
         .as_object_mut()
-        .unwrap()
+        .context("invalid module result")?
         .remove("candidate_registry")
-        .unwrap();
-    let id = result["id"].as_str().unwrap();
+        .context("candidate registry missing")?;
+    let id = result["id"].as_str().context("module identity missing")?;
     if live {
         let next = crate::catalog::Catalog::load_index(base.clone(), Some(candidate.clone()))?;
         let _drain = match prepare_stop(config, &old, id) {
@@ -947,7 +952,7 @@ pub fn change(
                     let status = std::process::Command::new(std::env::current_exe()?)
                         .args([
                             "--home",
-                            config.home.to_str().unwrap(),
+                            config.home.to_str().context("invalid home path")?,
                             "rpc",
                             "admin.reload",
                         ])

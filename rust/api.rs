@@ -40,9 +40,17 @@ impl App {
         })
     }
     pub async fn reload(&self) -> Result<()> {
-        let settings = self.config.settings()?;
-        self.config.validate_credentials(&settings)?;
-        let catalog = Catalog::load(&self.config)?;
+        let config = self.config.clone();
+        let (settings, catalog) = crate::blocking(move || {
+            let settings = config.settings()?;
+            config.validate_credentials(&settings)?;
+            Ok((settings, Catalog::load(&config)?))
+        })
+        .await?;
+        ensure!(
+            settings.web_port == self.snapshot.read().await.settings.web_port,
+            "web port requires restart"
+        );
         *self.snapshot.write().await = Snapshot { settings, catalog };
         Ok(())
     }
@@ -71,6 +79,11 @@ pub async fn rpc(config: &Config, method: &str, params: Value, context: &str) ->
     Ok(response["value"].clone())
 }
 pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
+    let app = app.clone();
+    let request = r.clone();
+    crate::isolated(async move { dispatch_inner(&app, &request).await }).await
+}
+async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
     ensure!(r["api_version"] == 2, "unsupported API version");
     let method = r["method"].as_str().context("method required")?;
     let p = &r["params"];
@@ -169,9 +182,15 @@ pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
             );
             let snapshot = app.snapshot.read().await;
             ensure!(
-                snapshot.settings.bots.get(fields[1]).is_some_and(
-                    |b| b.owner == snapshot.settings.bots[ctx["bot"].as_str().unwrap()].owner
-                ),
+                snapshot
+                    .settings
+                    .bots
+                    .get(fields[1])
+                    .is_some_and(|b| snapshot
+                        .settings
+                        .bots
+                        .get(ctx["bot"].as_str().unwrap_or(""))
+                        .is_some_and(|source| b.owner == source.owner)),
                 "owner mismatch"
             );
             let id = fields[2].parse::<i64>()?;
@@ -195,7 +214,11 @@ pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
             };
             ensure!(snapshot.settings.bots.contains_key(bot), "unknown bot");
             ensure!(
-                snapshot.settings.bots[bot].owner == snapshot.settings.bots[fallback].owner,
+                snapshot
+                    .settings
+                    .bots
+                    .get(fallback)
+                    .is_some_and(|source| snapshot.settings.bots[bot].owner == source.owner),
                 "delivery owner mismatch"
             );
             let bot = bot.to_owned();
@@ -259,10 +282,18 @@ pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
                 .get(event["profile"].as_str().unwrap_or(""))
                 .context("bot missing")?;
             ensure!(
-                snapshot.settings.bots[ctx["bot"].as_str().unwrap()].owner == bot.owner,
+                snapshot
+                    .settings
+                    .bots
+                    .get(ctx["bot"].as_str().unwrap_or(""))
+                    .is_some_and(|source| source.owner == bot.owner),
                 "owner mismatch"
             );
-            let tg = crate::telegram::Telegram::new(&app.config, bot)?;
+            let tg = crate::telegram::Telegram::with_family(
+                &app.config,
+                bot,
+                &snapshot.settings.telegram_ip_family,
+            )?;
             let receipts = event["receipt"]
                 .as_array()
                 .cloned()
@@ -327,7 +358,11 @@ pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
                 .bots
                 .get(ctx["bot"].as_str().unwrap_or(""))
                 .context("bot missing")?;
-            let tg = crate::telegram::Telegram::new(&app.config, bot)?;
+            let tg = crate::telegram::Telegram::with_family(
+                &app.config,
+                bot,
+                &snapshot.settings.telegram_ip_family,
+            )?;
             Ok(json!(
                 tg.download(p["file_id"].as_str().context("file id required")?)
                     .await?
@@ -577,7 +612,40 @@ fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
     let mut q=db.prepare("SELECT r.id,r.job_id,r.status,r.finished_at FROM runs r JOIN (SELECT job_id,max(started_at) AS started_at FROM runs GROUP BY job_id) latest ON r.job_id=latest.job_id AND r.started_at=latest.started_at")?;
     let latest=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"finished_at":r.get::<_,Option<f64>>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     let bots=snapshot.settings.bots.iter().map(|(id,bot)|Ok(json!({"id":id,"enabled":bot.enabled,"connection":app.store.get(&format!("connection:{id}"))?,"menu":app.store.get(&format!("menu-state:{id}"))?}))).collect::<Result<Vec<_>>>()?;
+    let tasks = crate::queue::public(&app.config);
+    let queued = tasks["requests"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|r| r["state"] == "queued")
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let oldest_wait = queued
+        .iter()
+        .filter_map(|r| r["created_at"].as_f64())
+        .map(|at| (crate::now() - at).max(0.0))
+        .fold(0.0_f64, f64::max);
+    let seen = app.store.get("uncertain:watermark")?;
+    let mut query = db.prepare(
+        "SELECT id FROM events WHERE status='uncertain' AND job_id<>'uncertain-summary'",
+    )?;
+    let new_uncertain = query
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .filter(|id| seen.as_array().is_some_and(|a| !a.iter().any(|v| v == *id)))
+        .count();
+    let mut q = db.prepare(
+        "SELECT key,value FROM kv WHERE key LIKE 'worker:%' OR key LIKE 'delivery-timing:%'",
+    )?;
+    let worker_metrics = q
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::from_str::<Value>(&v).unwrap_or(Value::Null)))
+        .collect::<std::collections::BTreeMap<_, _>>();
     Ok(
-        json!({"api_version":2,"version":env!("CARGO_PKG_VERSION"),"sampled_at":crate::now(),"maintenance":app.config.home.join("run/freeze").exists(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
+        json!({"api_version":2,"metrics":{"workers":worker_metrics,"queued_count":queued.len(),"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"sampled_at":crate::now(),"maintenance":app.config.home.join("run/freeze").exists(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
     )
 }

@@ -51,6 +51,42 @@ pub(crate) fn open_task_lock(path: &Path) -> Result<File> {
     anyhow::bail!("task lock changed repeatedly during open")
 }
 
+pub fn inherited_dispatch_lock(
+    config: &Config,
+    run: &str,
+    fd: Option<i32>,
+) -> Result<Option<File>> {
+    let Some(fd) = fd else { return Ok(None) };
+    ensure!(
+        fd >= 3 && (config.offline || unsafe { libc::geteuid() } == 0),
+        "invalid dispatch descriptor"
+    );
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::MetadataExt,
+    };
+    let file = unsafe { File::from_raw_fd(fd) };
+    let path = config
+        .home
+        .join("run")
+        .join(format!("dispatch-{}.lock", crate::digest(run)));
+    let actual = file.metadata()?;
+    let expected = fs::symlink_metadata(path)?;
+    ensure!(
+        actual.is_file()
+            && expected.is_file()
+            && actual.dev() == expected.dev()
+            && actual.ino() == expected.ino(),
+        "dispatch descriptor identity mismatch"
+    );
+    file.try_lock_exclusive()?;
+    ensure!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } >= 0,
+        "cannot protect dispatch descriptor"
+    );
+    Ok(Some(file))
+}
+
 pub struct Lease {
     _file: File,
     path: PathBuf,
@@ -286,13 +322,27 @@ pub async fn process(
     let mut child = cmd.spawn().context("could not start business process")?;
     let pid = child.id().context("missing process id")?;
     // Drain both streams concurrently; bounded capture keeps a noisy module from exhausting the gateway.
-    async fn capture(mut stream: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<String> {
+    type Tail = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+    async fn capture(
+        mut stream: impl tokio::io::AsyncRead + Unpin,
+        tail: Tail,
+    ) -> std::io::Result<String> {
         let mut bytes = vec![];
         let mut chunk = [0; 8192];
         loop {
             let n = stream.read(&mut chunk).await?;
             if n == 0 {
                 break;
+            }
+            {
+                let mut tail = tail
+                    .lock()
+                    .map_err(|_| std::io::Error::other("output buffer unavailable"))?;
+                tail.extend_from_slice(&chunk[..n]);
+                if tail.len() > 65536 {
+                    let excess = tail.len() - 65536;
+                    tail.drain(..excess);
+                }
             }
             bytes.extend_from_slice(&chunk[..n]);
             if bytes.len() > 8 * 1024 * 1024 {
@@ -301,8 +351,16 @@ pub async fn process(
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
-    let mut out = tokio::spawn(capture(child.stdout.take().unwrap()));
-    let mut err = tokio::spawn(capture(child.stderr.take().unwrap()));
+    let stdout_tail = Tail::default();
+    let stderr_tail = Tail::default();
+    let mut out = tokio::spawn(capture(
+        child.stdout.take().context("missing stdout")?,
+        stdout_tail.clone(),
+    ));
+    let mut err = tokio::spawn(capture(
+        child.stderr.take().context("missing stderr")?,
+        stderr_tail.clone(),
+    ));
     let operation = async {
         if let Some(value) = input {
             let mut stdin = child.stdin.take().context("missing process input")?;
@@ -339,6 +397,26 @@ pub async fn process(
         unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
         out.abort();
         err.abort();
+        let retain = || -> Result<()> {
+            let _db = crate::queue::connect(config)?;
+            let stdout = stdout_tail
+                .lock()
+                .map_err(|_| anyhow::anyhow!("output buffer unavailable"))?;
+            let stderr = stderr_tail
+                .lock()
+                .map_err(|_| anyhow::anyhow!("output buffer unavailable"))?;
+            crate::config::atomic_json(
+                &config
+                    .home
+                    .join("supervisor")
+                    .join(format!("process-last-{}.json", module.manifest.id)),
+                &json!({"at":crate::now(),"module":module.manifest.id,"stdout":safe_tail(&stdout),"stderr":safe_tail(&stderr)}),
+                0o600,
+            )
+        };
+        if let Err(error) = retain() {
+            crate::errors::log("process-diagnostics", &error)
+        }
     }
     result
 }
@@ -416,48 +494,54 @@ pub async fn request_executor(config: &Config, request: &Value) -> Result<Value>
 pub async fn executor(config: Config) -> Result<()> {
     use axum::{Json, Router, extract::State, routing::post};
     async fn handle(State(config): State<Config>, Json(request): Json<Value>) -> Json<Value> {
-        let result = if request["kind"] == "job" {
-            async {
-                let ctx = api::rpc(
-                    &config,
-                    "context.inspect",
-                    json!({}),
-                    request["context"].as_str().unwrap_or(""),
-                )
-                .await?;
-                let id = request["job_id"].as_str().context("task required")?;
-                let catalog = Catalog::load(&config)?;
-                ensure!(
-                    catalog.job(id)?.0.manifest.id == ctx["module"],
-                    "task context mismatch"
-                );
-                let mut cmd = tokio::process::Command::new(std::env::current_exe()?);
-                cmd.args(["--home", config.home.to_str().unwrap()]);
-                if config.offline {
-                    cmd.arg("--offline");
+        let result = crate::isolated(async move {
+            if request["kind"] == "job" {
+                async {
+                    let ctx = api::rpc(
+                        &config,
+                        "context.inspect",
+                        json!({}),
+                        request["context"].as_str().unwrap_or(""),
+                    )
+                    .await?;
+                    let id = request["job_id"].as_str().context("task required")?;
+                    let catalog = Catalog::load(&config)?;
+                    ensure!(
+                        catalog.job(id)?.0.manifest.id == ctx["module"],
+                        "task context mismatch"
+                    );
+                    let mut cmd = tokio::process::Command::new(std::env::current_exe()?);
+                    cmd.args(["--home", config.home.to_str().context("invalid home path")?]);
+                    if config.offline {
+                        cmd.arg("--offline");
+                    }
+                    let mut child = cmd
+                        .args(["execute", id])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()?;
+                    tokio::spawn(async move {
+                        let _ = child.wait().await;
+                    });
+                    Ok(json!({"accepted":true}))
                 }
-                let mut child = cmd
-                    .args(["execute", id])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()?;
-                tokio::spawn(async move {
-                    let _ = child.wait().await;
-                });
-                Ok(json!({"accepted":true}))
+                .await
+            } else {
+                invoke_local(&config, &request).await
             }
-            .await
-        } else {
-            invoke_local(&config, &request).await
-        };
+        })
+        .await;
         match result {
             Ok(value) => Json(json!({"ok":true,"value":value})),
-            Err(e) => Json(json!({"ok":false,"error":e.to_string()})),
+            Err(e) => {
+                crate::errors::log("executor-request", &e);
+                Json(crate::errors::public(&e))
+            }
         }
     }
     let path = config.home.join("run/executor.sock");
-    fs::create_dir_all(path.parent().unwrap())?;
+    fs::create_dir_all(path.parent().context("socket parent missing")?)?;
     if path.exists() {
         ensure!(
             tokio::net::UnixStream::connect(&path).await.is_err(),
@@ -470,18 +554,29 @@ pub async fn executor(config: Config) -> Result<()> {
     let supervisor = config.clone();
     tokio::spawn(async move {
         loop {
-            if crate::queue::dispatch(&supervisor).await.is_err() {
-                eprintln!("task queue reconciliation unavailable");
+            if let Err(error) = crate::queue::dispatch(&supervisor).await {
+                crate::errors::log("queue-reconcile", &error);
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
+    let closing = config.clone();
     axum::serve(
         listener,
         Router::new()
             .route("/invoke", post(handle))
             .with_state(config),
     )
+    .with_graceful_shutdown(async move {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {_=signal.recv()=>{},_=tokio::signal::ctrl_c()=>{}}
+        }
+        if let Err(error) = crate::blocking(move || crate::queue::summary_flush(&closing)).await {
+            crate::errors::log("summary-shutdown", &error)
+        }
+    })
     .await?;
     Ok(())
 }
@@ -610,7 +705,7 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
         &catalog,
         module,
         &job.workspace,
-        context["bot"].as_str().unwrap(),
+        context["bot"].as_str().context("context bot missing")?,
         token,
     )?;
     for (k, v) in &job.env {
@@ -737,9 +832,15 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
         finish["status"] = result["status"].clone();
         finish["execution_status"] = result["status"].clone();
     }
-    let final_status = finish["status"].as_str().unwrap().to_owned();
+    let final_status = finish["status"]
+        .as_str()
+        .context("completion status missing")?
+        .to_owned();
     crate::queue::report(config, run, token, &finish)?;
-    let _ = crate::queue::flush(config, run).await;
+    if let Err(error) = crate::queue::flush(config, run).await {
+        crate::errors::log("queue-report", &error);
+    }
+    crate::queue::summary_flush(config)?;
     if fs::symlink_metadata(&result_file).is_ok() {
         fs::remove_file(result_file)?;
     }
@@ -797,7 +898,7 @@ pub async fn service(config: &Config, id: &str) -> Result<i32> {
         &catalog,
         module,
         &service.workspace,
-        context["bot"].as_str().unwrap(),
+        context["bot"].as_str().context("context bot missing")?,
         token,
     )?;
     // This context remains valid for this service across disconnected restarts.
@@ -829,7 +930,7 @@ pub async fn module_exec(config: &Config, id: &str, alias: &str, args: &[String]
         &catalog,
         module,
         &module.manifest.workspace,
-        context["bot"].as_str().unwrap(),
+        context["bot"].as_str().context("context bot missing")?,
         token,
     )?;
     let result = process(config, module, &entry, &env, None, None).await;
@@ -838,4 +939,27 @@ pub async fn module_exec(config: &Config, id: &str, alias: &str, args: &[String]
     print!("{out}");
     eprint!("{err}");
     Ok(code)
+}
+
+pub(crate) fn safe_tail(bytes: &[u8]) -> Value {
+    // Free-form module output is untrusted. Only known exception names survive redaction.
+    let text = String::from_utf8_lossy(bytes);
+    let allowed = [
+        "TimeoutError",
+        "ConnectionError",
+        "PermissionError",
+        "ValueError",
+        "TypeError",
+        "RuntimeError",
+        "JSONDecodeError",
+        "IncompleteRead",
+        "Traceback",
+        "BrokenPipeError",
+        "OSError",
+    ];
+    let classes: std::collections::BTreeSet<_> = text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| allowed.contains(word))
+        .collect();
+    json!({"captured_bytes":bytes.len(),"fingerprint":crate::digest(bytes),"error_types":classes,"tail":"[untrusted output redacted]"})
 }

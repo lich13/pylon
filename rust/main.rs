@@ -28,6 +28,8 @@ enum Command {
     #[command(hide = true)]
     Resume {
         id: String,
+        #[arg(long, hide = true)]
+        dispatch_fd: Option<i32>,
     },
     Diagnose,
     Serve {
@@ -134,7 +136,8 @@ enum Modules {
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
-        eprintln!("{e}");
+        pylon::errors::log("cli", &e);
+        eprintln!("{}", pylon::errors::cli_message(&e));
         std::process::exit(1)
     }
 }
@@ -162,7 +165,8 @@ async fn run() -> Result<()> {
             }
             Value::Null
         }
-        Command::Resume { id } => {
+        Command::Resume { id, dispatch_fd } => {
+            let _dispatch = pylon::runtime::inherited_dispatch_lock(&config, &id, dispatch_fd)?;
             let code = pylon::runtime::resume(&config, &id).await?;
             if code != 0 {
                 std::process::exit(code)
@@ -217,7 +221,7 @@ async fn run() -> Result<()> {
                 let token = pylon::config::credential_input()?;
                 let credential = format!("bot-{id}");
                 let path = config.home.join("gateway/secrets").join(&credential);
-                std::fs::create_dir_all(path.parent().unwrap())?;
+                std::fs::create_dir_all(path.parent().context("credential parent missing")?)?;
                 use std::io::Write;
                 use std::os::unix::fs::OpenOptionsExt;
                 let mut file = std::fs::OpenOptions::new()
@@ -229,7 +233,8 @@ async fn run() -> Result<()> {
                 file.sync_all()?;
                 if unsafe { libc::geteuid() } == 0 {
                     use std::os::unix::fs::MetadataExt;
-                    let parent = std::fs::metadata(path.parent().unwrap())?;
+                    let parent =
+                        std::fs::metadata(path.parent().context("credential parent missing")?)?;
                     std::os::unix::fs::chown(&path, Some(parent.uid()), Some(parent.gid()))?;
                 }
                 settings.bots.insert(
@@ -292,88 +297,96 @@ async fn run() -> Result<()> {
             atomic_json(&config.home.join("config/bots.json"), &s, 0o644)?;
             json!({"ok":true})
         }
-        Command::Modules { action } => match action {
-            Modules::Check { module, directory } => {
-                if let Some(name) = module {
-                    developer_tool(directory, "check", &[name])?;
-                    json!({"ok":true})
-                } else {
-                    pylon::modules::check(
-                        &directory.unwrap_or_else(|| config.home.join("modules")),
-                    )?
-                }
-            }
-            Modules::Preview {
-                module,
-                port,
-                directory,
-            } => {
-                developer_tool(
-                    directory,
-                    "preview",
-                    &[module, "--port".into(), port.to_string()],
-                )?;
-                Value::Null
-            }
-            Modules::Deploy {
-                module,
-                host,
-                directory,
-            } => {
-                developer_tool(
-                    directory,
-                    "deploy",
-                    &[
+        Command::Modules { action } => {
+            pylon::isolated(async move {
+                Ok(match action {
+                    Modules::Check { module, directory } => {
+                        if let Some(name) = module {
+                            developer_tool(directory, "check", &[name])?;
+                            json!({"ok":true})
+                        } else {
+                            pylon::modules::check(
+                                &directory.unwrap_or_else(|| config.home.join("modules")),
+                            )?
+                        }
+                    }
+                    Modules::Preview {
                         module,
-                        "--host".into(),
+                        port,
+                        directory,
+                    } => {
+                        developer_tool(
+                            directory,
+                            "preview",
+                            &[module, "--port".into(), port.to_string()],
+                        )?;
+                        Value::Null
+                    }
+                    Modules::Deploy {
+                        module,
                         host,
-                        "--binary".into(),
-                        std::env::current_exe()?.to_string_lossy().into_owned(),
-                    ],
-                )?;
-                Value::Null
-            }
-            Modules::Ci {
-                module,
-                gateway,
-                directory,
-            } => {
-                developer_tool(
-                    directory,
-                    "ci",
-                    &[
+                        directory,
+                    } => {
+                        developer_tool(
+                            directory,
+                            "deploy",
+                            &[
+                                module,
+                                "--host".into(),
+                                host,
+                                "--binary".into(),
+                                std::env::current_exe()?.to_string_lossy().into_owned(),
+                            ],
+                        )?;
+                        Value::Null
+                    }
+                    Modules::Ci {
                         module,
-                        "--gateway".into(),
-                        gateway.to_string_lossy().into_owned(),
-                    ],
-                )?;
-                Value::Null
-            }
-            Modules::Exec {
-                module,
-                alias,
-                args,
-            } => {
-                let code = pylon::runtime::module_exec(&config, &module, &alias, &args).await?;
-                if code != 0 {
-                    std::process::exit(code)
-                }
-                Value::Null
-            }
-            Modules::Render { destination } => {
-                pylon::modules::render(&config, &destination)?;
-                json!({"ok":true})
-            }
-            Modules::Pack { source, output } => pylon::modules::pack(&source, &output)?,
-            Modules::Install {
-                archive,
-                sha256,
-                activate,
-            } => pylon::modules::change(&config, Some((&archive, &sha256)), None, activate)?,
-            Modules::Rollback { id, activate } => {
-                pylon::modules::change(&config, None, Some(&id), activate)?
-            }
-        },
+                        gateway,
+                        directory,
+                    } => {
+                        developer_tool(
+                            directory,
+                            "ci",
+                            &[
+                                module,
+                                "--gateway".into(),
+                                gateway.to_string_lossy().into_owned(),
+                            ],
+                        )?;
+                        Value::Null
+                    }
+                    Modules::Exec {
+                        module,
+                        alias,
+                        args,
+                    } => {
+                        let code =
+                            pylon::runtime::module_exec(&config, &module, &alias, &args).await?;
+                        if code != 0 {
+                            std::process::exit(code)
+                        }
+                        Value::Null
+                    }
+                    Modules::Render { destination } => {
+                        pylon::modules::render(&config, &destination)?;
+                        json!({"ok":true})
+                    }
+                    Modules::Pack { source, output } => pylon::modules::pack(&source, &output)?,
+                    Modules::Install {
+                        archive,
+                        sha256,
+                        activate,
+                    } => {
+                        pylon::modules::change(&config, Some((&archive, &sha256)), None, activate)?
+                    }
+                    Modules::Rollback { id, activate } => {
+                        pylon::modules::change(&config, None, Some(&id), activate)?
+                    }
+                })
+            })
+            .await?
+        }
         Command::Migrate { source, mapping } => {
             pylon::migration::import(&config, &source, &mapping)?
         }
@@ -387,11 +400,17 @@ async fn run() -> Result<()> {
 fn developer_tool(directory: Option<PathBuf>, action: &str, args: &[String]) -> Result<()> {
     let source = directory
         .or_else(|| std::env::var_os("PYLON_MODULES_DIR").map(PathBuf::from))
-        .unwrap_or_else(|| std::env::current_dir().unwrap().join("../pylon-tasks"))
+        .map(Ok)
+        .unwrap_or_else(|| std::env::current_dir().map(|p| p.join("../pylon-tasks")))?
         .canonicalize()?;
     let python = std::env::var_os("PYLON_TASK_PYTHON")
         .map(PathBuf::from)
-        .unwrap_or_else(|| source.parent().unwrap().join("pylon/.venv/bin/python"));
+        .unwrap_or(
+            source
+                .parent()
+                .context("module source has no parent")?
+                .join("pylon/.venv/bin/python"),
+        );
     let status = std::process::Command::new(python)
         .env("PYTHONPATH", source.join("sdk/src"))
         .args(["-m", "pylon_sdk.tools", "--source"])

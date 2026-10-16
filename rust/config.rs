@@ -26,6 +26,10 @@ fn yes() -> bool {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default = "default_web_port")]
+    pub web_port: u16,
+    #[serde(default = "default_ip_family")]
+    pub telegram_ip_family: String,
     pub bots: BTreeMap<String, Bot>,
     #[serde(default)]
     pub routes: BTreeMap<String, String>,
@@ -39,6 +43,12 @@ pub struct Settings {
     pub groups: BTreeMap<String, ResourceGroup>,
     #[serde(default)]
     pub runtime_users: BTreeMap<String, RuntimeUser>,
+}
+fn default_web_port() -> u16 {
+    8793
+}
+fn default_ip_family() -> String {
+    "ipv4".into()
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeUser {
@@ -78,6 +88,11 @@ impl Config {
     }
     pub fn settings(&self) -> Result<Settings> {
         let s: Settings = serde_json::from_slice(&fs::read(self.home.join("config/bots.json"))?)?;
+        ensure!(s.web_port > 0, "invalid web port");
+        ensure!(
+            ["ipv4", "ipv6", "auto"].contains(&s.telegram_ip_family.as_str()),
+            "invalid Telegram address family"
+        );
         for (id, bot) in &s.bots {
             ensure!(
                 crate::identifier(id)

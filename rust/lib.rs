@@ -49,3 +49,43 @@ pub fn identifier(value: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
 }
+
+/// Bound blocking work without occupying Tokio's network executor threads.
+pub async fn blocking<T: Send + 'static>(
+    operation: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let permit = SLOTS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(32)))
+        .clone()
+        .acquire_owned()
+        .await?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|_| anyhow::Error::from(errors::ReconcileRequired))?
+}
+
+/// A request owns its blocking thread through async waits, so synchronous SQLite and
+/// filesystem operations cannot stall the network runtime. Cancellation never replays it.
+pub async fn isolated<T: Send + 'static>(
+    future: impl std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+) -> anyhow::Result<T> {
+    let runtime = tokio::runtime::Handle::current();
+    static REQUESTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let permit = REQUESTS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(64)))
+        .clone()
+        .acquire_owned()
+        .await?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        runtime.block_on(future)
+    })
+    .await
+    .map_err(|_| anyhow::Error::from(errors::ReconcileRequired))?
+}

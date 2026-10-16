@@ -59,6 +59,49 @@ pub fn public(error: &Error) -> Value {
         "error_code": if transient { "unavailable" } else { "rejected" }, "retryable": transient})
 }
 
+/// Keep established local CLI diagnostics without exposing arbitrary error strings.
+pub fn cli_message(error: &Error) -> &'static str {
+    for cause in error.chain() {
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.raw_os_error() == Some(libc::ELOOP))
+        {
+            return "symbolic link rejected";
+        }
+        let safe = match cause.to_string().as_str() {
+            "duplicate bot credential" => "duplicate bot credential",
+            "duplicate or invalid command" => "duplicate or invalid command",
+            "unsafe supervisor state directory" => "unsafe supervisor state directory",
+            "unsafe supervisor state file" => "unsafe supervisor state file",
+            "task workspace is not configured" => "task workspace is not configured",
+            "task topic is not configured" => "task topic is not configured",
+            "module stop preparation failed" => "module stop preparation failed",
+            "module health check rejected" => "module health check rejected",
+            "freeze new triggers before state migration" => {
+                "freeze new triggers before state migration"
+            }
+            "unfinished runs require reconciliation before migration" => {
+                "unfinished runs require reconciliation before migration"
+            }
+            "migration already completed; never overwrite live state" => {
+                "migration already completed; never overwrite live state"
+            }
+            "target contains events; state merge required" => {
+                "target contains events; state merge required"
+            }
+            _ => continue,
+        };
+        return safe;
+    }
+    if error.is::<ReconcileRequired>() {
+        "operation result uncertain; inspect retained state"
+    } else if retryable(error) {
+        "service temporarily unavailable"
+    } else {
+        "request rejected"
+    }
+}
+
 pub fn log(scope: &'static str, error: &Error) {
     let causes = error
         .chain()
@@ -108,9 +151,9 @@ pub fn log(scope: &'static str, error: &Error) {
         })
         .collect::<Vec<_>>();
     eprintln!(
-        "{scope} failure retryable={} causes={}",
-        retryable(error),
-        causes.join(",")
+        "{}",
+        json!({"event":"failure", "scope":scope,"at":crate::now(),
+                          "retryable":retryable(error),"causes":causes})
     );
 }
 
@@ -129,6 +172,10 @@ mod tests {
         assert_eq!(result["retryable"], true);
         assert!(!result.to_string().contains("fixture"));
         let e = anyhow::anyhow!("fixture-sensitive-database-error");
+        assert_eq!(public(&e)["error"], "request rejected");
+        assert_eq!(cli_message(&e), "request rejected");
+        let e = anyhow::anyhow!("duplicate bot credential").context("fixture-secret");
+        assert_eq!(cli_message(&e), "duplicate bot credential");
         assert_eq!(public(&e)["error"], "request rejected");
         let e = Error::from(std::io::Error::other("fixture")).context(ReconcileRequired);
         assert_eq!(public(&e)["retryable"], false);

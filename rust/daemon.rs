@@ -334,8 +334,8 @@ pub async fn command_once(app: &App, id: &str, tg: &Telegram) -> Result<bool> {
     let Some((uid, kind, payload)) = row else {
         return Ok(false);
     };
-    let message: Value = serde_json::from_str(&payload)?;
-    if kind == "callback_query" {
+    let message: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+    if kind == "callback_query" && !message.is_null() {
         let _ = tg
             .call(
                 "answerCallbackQuery",
@@ -344,7 +344,11 @@ pub async fn command_once(app: &App, id: &str, tg: &Telegram) -> Result<bool> {
             )
             .await;
     }
-    let result = route(app, id, &kind, &message, &format!("telegram:{id}:{uid}")).await;
+    let result = if message.is_null() {
+        Err(anyhow::anyhow!("stored update is invalid"))
+    } else {
+        route(app, id, &kind, &message, &format!("telegram:{id}:{uid}")).await
+    };
     let (mut reply, status) = match result {
         Ok(value) => (value, "done"),
         Err(_) => (
@@ -357,106 +361,113 @@ pub async fn command_once(app: &App, id: &str, tg: &Telegram) -> Result<bool> {
         .and_then(|v| v.remove("_module"))
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "gateway".into());
-    if reply["text"].as_str().is_some_and(|s| !s.is_empty()) {
-        let key = crate::digest(format!("{id}:text:reply:{uid}"))[..32].to_owned();
-        app.store.submit(
-            &owner,
-            &json!({"id":key,"kind":"text","job_id":"bot","payload":reply}),
-            id,
-        )?;
+    if owner == "gateway" && status == "uncertain" {
+        reply["expires_at"] = json!(crate::now() + 600.0);
     }
-    app.store.connect()?.execute(
-        "UPDATE updates SET status=? WHERE profile=? AND update_id=?",
-        params![status, id, uid],
-    )?;
+    loop {
+        match app.store.complete_update(id, uid, &owner, &reply, status) {
+            Ok(()) => break,
+            Err(error) => {
+                crate::errors::log("command-result-persistence", &error);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
     Ok(true)
 }
 async fn pause(stop: &mut watch::Receiver<bool>, seconds: f64) -> bool {
     tokio::select! {_=stop.changed()=>true,_=tokio::time::sleep(Duration::from_secs_f64(seconds))=>*stop.borrow()}
 }
-async fn bot_worker(app: App, id: String, bot: Bot, mut stop: watch::Receiver<bool>) -> Result<()> {
-    let tg = Telegram::new(&app.config, &bot)?;
-    let poll = {
-        let app = app.clone();
-        let id = id.clone();
-        let bot = bot.clone();
-        let tg = tg.clone();
-        let mut stop = stop.clone();
-        async move {
+async fn bot_worker(app: App, id: String, bot: Bot, stop: watch::Receiver<bool>) -> Result<()> {
+    let family = app
+        .snapshot
+        .read()
+        .await
+        .settings
+        .telegram_ip_family
+        .clone();
+    let tg = Telegram::with_family(&app.config, &bot, &family)?;
+    let mut lanes = Vec::new();
+    for lane in ["poll", "command", "telegram", "bark", "menu"] {
+        let (app, id, bot, tg, mut stop) = (
+            app.clone(),
+            id.clone(),
+            bot.clone(),
+            tg.clone(),
+            stop.clone(),
+        );
+        lanes.push(tokio::spawn(async move {
+            let mut failures=0_u32;
             while !*stop.borrow() {
                 if app.config.home.join("run/freeze").exists() {
-                    if pause(&mut stop, 1.0).await {
-                        break;
+                    if pause(&mut stop,1.0).await {break;}
+                    continue;
+                }
+                let (work,bot_id,identity,client)=(app.clone(),id.clone(),bot.clone(),tg.clone());
+                let result=crate::isolated(async move {
+                    match lane {
+                        "poll"=>{
+                            let offset=work.store.get(&format!("offset:{bot_id}"))?.as_i64().unwrap_or(0);
+                            match client.call("getUpdates",&json!({"offset":offset,"timeout":25,"allowed_updates":["message","callback_query"]}),true).await {
+                                Ok(value)=>{
+                                    save_updates(&work,&bot_id,&identity,value.as_array().context("invalid updates")?)?;
+                                    work.store.put(&format!("connection:{bot_id}"),&json!({"status":"ok","at":crate::now()}))?;
+                                    Ok(if value.as_array().is_some_and(|v|v.is_empty()){1.0}else{0.1})
+                                },
+                                Err(f)=>{
+                                    work.store.put(&format!("connection:{bot_id}"),&json!({"status":"failed","at":crate::now(),"retry_after":f.delay.max(5.0)}))?;
+                                    Ok(f.delay.max(5.0))
+                                }
+                            }
+                        },
+                        "command"=>Ok(if command_once(&work,&bot_id,&client).await?{0.0}else{0.5}),
+                        "menu"=>{
+                            let result=synchronize(&work,&bot_id,&identity,&client).await;
+                            work.store.put(&format!("menu-state:{bot_id}"),&json!({"status":if result.is_ok(){"ok"}else{"failed"},"at":crate::now()}))?;
+                            result?;
+                            Ok(30.0)
+                        },
+                        _=>{
+                            if identity.require_start && work.store.get(&format!("bot_started:{bot_id}"))?!=json!(true){return Ok(1.0)}
+                            if let Some(event)=work.store.claim_lane(&bot_id,Some(lane=="bark"))? {
+                                let started=crate::now();
+                                let delay=crate::telegram::deliver(&work.store,&client,&identity,&event).await?;
+                                work.store.put(&format!("delivery-timing:{bot_id}:{lane}"),&json!({"seconds":crate::now()-started,"at":crate::now()}))?;
+                                Ok(delay)
+                            }else{Ok(0.5)}
+                        }
                     }
-                    continue;
-                }
-                let offset = app
-                    .store
-                    .get(&format!("offset:{id}"))?
-                    .as_i64()
-                    .unwrap_or(0);
-                match tg.call("getUpdates",&json!({"offset":offset,"timeout":25,"allowed_updates":["message","callback_query"]}),true).await {
-                Ok(value)=>{app.store.put(&format!("connection:{id}"),&json!({"status":"ok","at":crate::now()}))?;save_updates(&app,&id,&bot,value.as_array().context("invalid updates")?)?;if pause(&mut stop,if value.as_array().is_some_and(|a|a.is_empty()){1.0}else{0.1}).await{break}},
-                Err(f)=>{app.store.put(&format!("connection:{id}"),&json!({"status":"failed","at":crate::now(),"retry_after":f.delay.max(5.0)}))?;if pause(&mut stop,f.delay.max(5.0)).await{break}}
+                }).await;
+                let delay=match result {
+                    Ok(delay)=>{failures=0;delay},
+                    Err(error)=>{
+                        failures=failures.saturating_add(1);
+                        crate::errors::log(lane,&error);
+                        let store=app.store.clone();let key=format!("worker:{id}:{lane}");
+                        if let Err(error)=store.blocking(move |s|{
+                            let count=s.get(&key)?["restarts"].as_u64().unwrap_or(0)+1;
+                            s.put(&key,&json!({"restarts":count,"consecutive_failures":failures,"at":crate::now(),"status":"retrying"}))
+                        }).await{crate::errors::log("worker-status",&error)}
+                        // Only the failed lane's abandoned claims become uncertain; other lanes retain ownership.
+                        if error.is::<crate::errors::ReconcileRequired>() {
+                            let bot_id=id.clone();
+                            if let Err(error)=store.blocking(move |s| {
+                                let db=s.connect()?;
+                                if lane=="command" {db.execute("UPDATE updates SET status='uncertain' WHERE profile=? AND status='running'",[&bot_id])?;}
+                                if matches!(lane,"telegram"|"bark") {db.execute("UPDATE events SET status='uncertain',error='delivery worker interrupted',updated_at=? WHERE profile=? AND status='sending' AND (kind='bark')=?",params![crate::now(),bot_id,lane=="bark"])?;}
+                                Ok(())
+                            }).await{crate::errors::log("worker-reconcile",&error)}
+                        }
+                        (5.0*2_f64.powi(failures.min(4) as i32-1)).min(60.0)
+                    }
+                };
+                if pause(&mut stop,delay).await{break;}
             }
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-    };
-    let commands = {
-        let app = app.clone();
-        let id = id.clone();
-        let tg = tg.clone();
-        let mut stop = stop.clone();
-        async move {
-            while !*stop.borrow() {
-                if !app.config.home.join("run/freeze").exists()
-                    && command_once(&app, &id, &tg).await?
-                {
-                    continue;
-                }
-                if pause(&mut stop, 0.5).await {
-                    break;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-    };
-    let sends = async move {
-        let mut metadata_at = 0.0;
-        while !*stop.borrow() {
-            if app.config.home.join("run/freeze").exists() {
-                if pause(&mut stop, 1.0).await {
-                    break;
-                }
-                continue;
-            }
-            if crate::now() > metadata_at {
-                metadata_at = crate::now() + 30.0;
-                let result = synchronize(&app, &id, &bot, &tg).await;
-                app.store.put(
-                    &format!("menu-state:{id}"),
-                    &json!({"status":if result.is_ok(){"ok"}else{"failed"},"at":crate::now()}),
-                )?;
-            }
-            if bot.require_start && app.store.get(&format!("bot_started:{id}"))? != json!(true) {
-                if pause(&mut stop, 1.0).await {
-                    break;
-                }
-                continue;
-            }
-            let delay = if let Some(event) = app.store.claim(&id)? {
-                crate::telegram::deliver(&app.store, &tg, &bot, &event).await?
-            } else {
-                0.5
-            };
-            if pause(&mut stop, delay).await {
-                break;
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    tokio::try_join!(poll, commands, sends)?;
+        }));
+    }
+    for lane in lanes {
+        lane.await.context("bot lane task failed")?;
+    }
     Ok(())
 }
 pub async fn run(app: App) -> Result<()> {
@@ -468,9 +479,16 @@ pub async fn run(app: App) -> Result<()> {
         .open(app.config.home.join("gateway/daemon.lock"))?;
     lock.try_lock_exclusive()
         .context("gateway already running")?;
-    app.store.recover()?;
+    app.store.blocking(|s| s.recover()).await?;
+    if let Some(target) = app.snapshot.read().await.settings.routes.get("personal") {
+        let target = target.clone();
+        app.store
+            .blocking(move |s| s.uncertain_digest(&target))
+            .await?;
+    }
     let rpc = tokio::spawn(crate::api::serve_socket(app.clone()));
-    let web = tokio::spawn(crate::api::serve_web(app.clone(), 8793));
+    let port = app.snapshot.read().await.settings.web_port;
+    let web = tokio::spawn(crate::api::serve_web(app.clone(), port));
     type BotWorker = (
         String,
         watch::Sender<bool>,
@@ -478,20 +496,64 @@ pub async fn run(app: App) -> Result<()> {
     );
     let mut workers: BTreeMap<String, BotWorker> = BTreeMap::new();
     let mut shutdown = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut rejected = String::new();
+    let mut retrying: BTreeMap<String, (u32, f64)> = BTreeMap::new();
     loop {
         // A malformed replacement keeps the entire last valid configuration active.
-        if app.reload().await.is_err() {
-            eprintln!("configuration rejected; previous registry remains active");
+        if let Err(error) = app.reload().await {
+            let mut rejected_bytes =
+                std::fs::read(app.config.home.join("config/bots.json")).unwrap_or_default();
+            rejected_bytes.extend(
+                std::fs::read(app.config.home.join("modules/registry.json")).unwrap_or_default(),
+            );
+            let fingerprint = crate::digest(rejected_bytes);
+            if fingerprint != rejected {
+                crate::errors::log("configuration rejected", &error);
+                rejected = fingerprint;
+                let hash = rejected.clone();
+                if let Err(e) = app
+                    .store
+                    .blocking(move |s| {
+                        s.put(
+                            "configuration-rejected",
+                            &json!({"fingerprint":hash,"at":crate::now()}),
+                        )
+                    })
+                    .await
+                {
+                    crate::errors::log("configuration-status", &e)
+                }
+            }
+        } else if !rejected.is_empty() {
+            rejected.clear();
+            if let Err(e) = app
+                .store
+                .blocking(|s| s.put("configuration-rejected", &Value::Null))
+                .await
+            {
+                crate::errors::log("configuration-status", &e)
+            }
         }
         let snapshot = app.snapshot.read().await.clone();
         let mut desired = BTreeMap::new();
         for (id, bot) in snapshot.settings.bots.iter().filter(|(_, b)| b.enabled) {
+            let token = match app.config.token(bot) {
+                Ok(token) => token,
+                Err(error) => {
+                    crate::errors::log("credential-read", &error);
+                    if let Some((hash, _, _)) = workers.get(id) {
+                        desired.insert(id.clone(), hash.clone());
+                    }
+                    continue;
+                }
+            };
             desired.insert(
                 id.clone(),
                 crate::digest(format!(
-                    "{}:{}",
+                    "{}:{}:{}",
+                    snapshot.settings.telegram_ip_family,
                     serde_json::to_string(bot)?,
-                    crate::digest(app.config.token(bot)?)
+                    crate::digest(token)
                 )),
             );
         }
@@ -501,24 +563,41 @@ pub async fn run(app: App) -> Result<()> {
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for id in remove {
-            if let Some((_, stop, task)) = workers.remove(&id) {
+            if let Some((hash, stop, task)) = workers.remove(&id) {
+                let changed = desired.get(&id) != Some(&hash);
                 let _ = stop.send(true);
-                let _ = task.await;
+                let result = task.await;
+                if !changed && !matches!(result, Ok(Ok(()))) {
+                    let attempts = retrying
+                        .get(&id)
+                        .map(|v| v.0)
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    retrying.insert(
+                        id.clone(),
+                        (
+                            attempts,
+                            crate::now() + (5.0 * 2_f64.powi(attempts.min(4) as i32 - 1)).min(60.0),
+                        ),
+                    );
+                } else {
+                    retrying.remove(&id);
+                }
                 // A failed subloop can leave a claimed send/update with no owner.
                 // Quarantine it without replay, scoped to this bot only.
-                let db = app.store.connect()?;
-                db.execute("UPDATE events SET status='uncertain',error='bot worker stopped before acknowledgement',updated_at=? WHERE profile=? AND status='sending'",params![crate::now(),id])?;
-                db.execute(
-                    "UPDATE updates SET status='uncertain' WHERE profile=? AND status='running'",
-                    [&id],
-                )?;
-                app.store.put(
-                    &format!("connection:{id}"),
-                    &json!({"status":"restarting","at":crate::now()}),
-                )?;
+                let bot_id = id.clone();
+                if let Err(error)=app.store.blocking(move |s| {
+                    let db=s.connect()?;
+                    db.execute("UPDATE events SET status='uncertain',error='bot worker stopped before acknowledgement',updated_at=? WHERE profile=? AND status='sending'",params![crate::now(),bot_id])?;
+                    db.execute("UPDATE updates SET status='uncertain' WHERE profile=? AND status='running'",[&bot_id])?;
+                    s.put(&format!("connection:{bot_id}"),&json!({"status":"restarting","at":crate::now()}))
+                }).await{crate::errors::log("worker-retirement",&error)}
             }
         }
         for (id, hash) in desired {
+            if retrying.get(&id).is_some_and(|(_, at)| *at > crate::now()) {
+                continue;
+            }
             workers.entry(id.clone()).or_insert_with(|| {
                 let (tx, rx) = watch::channel(false);
                 let task = tokio::spawn(bot_worker(
@@ -529,6 +608,16 @@ pub async fn run(app: App) -> Result<()> {
                 ));
                 (hash, tx, task)
             });
+        }
+        if let Some(target) = snapshot.settings.routes.get("personal") {
+            let target = target.clone();
+            if let Err(error) = app
+                .store
+                .blocking(move |s| s.uncertain_digest(&target))
+                .await
+            {
+                crate::errors::log("uncertain-summary", &error)
+            }
         }
         if rpc.is_finished() {
             rpc.await.context("gateway RPC listener task failed")??;
