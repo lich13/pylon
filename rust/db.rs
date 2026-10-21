@@ -30,6 +30,7 @@ fn wait_for_writer(attempt: i32) -> bool {
 pub struct Store {
     pub path: PathBuf,
     pool: Arc<Mutex<Vec<Connection>>>,
+    pub(crate) runtime: Arc<crate::optimization::Runtime>,
 }
 impl Store {
     pub fn new(path: &Path) -> Result<Self> {
@@ -47,6 +48,7 @@ impl Store {
         let store = Self {
             path: path.to_path_buf(),
             pool: Arc::new(Mutex::new(Vec::new())),
+            runtime: Arc::default(),
         };
         {
             let db = store.connect()?;
@@ -57,24 +59,7 @@ impl Store {
         Ok(store)
     }
     pub fn connect(&self) -> Result<PooledConnection> {
-        let cached = self
-            .pool
-            .lock()
-            .map_err(|_| anyhow::anyhow!("database pool unavailable"))?
-            .pop();
-        // Opening and SQLite waits must not serialize other borrowers of this pool.
-        let db = if let Some(db) = cached {
-            db
-        } else {
-            let db = Connection::open(&self.path)?;
-            db.busy_handler(Some(wait_for_writer))?;
-            db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
-            db
-        };
-        Ok(PooledConnection {
-            db: Some(db),
-            pool: self.pool.clone(),
-        })
+        connect(&self.path, &self.pool)
     }
     pub async fn blocking<T: Send + 'static>(
         &self,
@@ -121,19 +106,19 @@ impl Store {
             "UPDATE updates SET status='uncertain' WHERE status='running'",
             [],
         )?;
-        for (bot, ids, count) in interrupted {
+        for (bot, ids, count) in &interrupted {
             let id = crate::digest(format!("{bot}:recovery:{ids}"));
             let payload = json!({"text":format!("服务重启，{count} 条操作结果待核对。请打开对应入口查看已有记录；没有重复执行。"),"expires_at":crate::now()+600.0});
             tx.execute("INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'system','text',?,'pending',0,0,?,?,'gateway')", params![&id[..32],bot,payload.to_string(),crate::now(),crate::now()])?;
         }
         tx.commit()?;
+        for (bot, _, _) in interrupted {
+            self.runtime.delivery_ready(&bot, false);
+        }
         Ok(())
     }
     pub fn uncertain_digest(&self, target: &str) -> Result<()> {
-        let day = chrono::Utc::now()
-            .with_timezone(&chrono_tz::Asia::Taipei)
-            .format("%Y-%m-%d")
-            .to_string();
+        let day = utc8_day(std::time::SystemTime::now());
         self.uncertain_digest_day(target, &day)
     }
     pub fn uncertain_digest_day(&self, target: &str, day: &str) -> Result<()> {
@@ -153,7 +138,8 @@ impl Store {
             params![key, event_id], |r| r.get(0),
         )?;
         let pending = counter["pending"].as_u64().unwrap_or(0);
-        if pending > 0 && counter["last_day"] != day && !sent {
+        let inserted = pending > 0 && counter["last_day"] != day && !sent;
+        if inserted {
             let payload = json!({"text":format!("Pylon 有 {pending} 条新增投递结果待核对。原消息未自动重发，可在状态页查看。"),"expires_at":crate::now()+600.0});
             tx.execute("INSERT INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'uncertain-summary','text',?,'pending',0,0,?,?,'gateway')",params![event_id,target,payload.to_string(),crate::now(),crate::now()])?;
             counter["pending"] = json!(0);
@@ -161,6 +147,9 @@ impl Store {
         }
         tx.execute("INSERT INTO kv VALUES('uncertain:counter:v2',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [counter.to_string()])?;
         tx.commit()?;
+        if inserted {
+            self.runtime.delivery_ready(target, false);
+        }
         Ok(())
     }
     pub fn configuration_rejected(&self, fingerprint: &str, target: Option<&str>) -> Result<()> {
@@ -174,6 +163,9 @@ impl Store {
             tx.execute("INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'system','text',?,'pending',0,0,?,?,'gateway')",params![&id[..32],target,payload.to_string(),crate::now(),crate::now()])?;
         }
         tx.commit()?;
+        if let Some(target) = target {
+            self.runtime.delivery_ready(target, false);
+        }
         Ok(())
     }
     pub fn complete_update(
@@ -197,6 +189,9 @@ impl Store {
             &contexts.iter().map(crate::digest).collect::<Vec<_>>(),
         )?;
         tx.commit()?;
+        if reply["text"].as_str().is_some_and(|s| !s.is_empty()) {
+            self.runtime.delivery_ready(bot, false);
+        }
         Ok(())
     }
     pub fn has_event(&self, id: &str) -> Result<bool> {
@@ -223,6 +218,7 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
+        let inserted = existing.is_none();
         if let Some((owner, payload, job)) = existing {
             ensure!(owner == module, "event belongs to another module");
             let original: Value = serde_json::from_str(&payload)?;
@@ -235,6 +231,9 @@ impl Store {
                 params![id,bot,value["job_id"].as_str().unwrap_or("manual"),kind,value["payload"].to_string(),value["next_attempt"].as_f64().unwrap_or(0.0),value["created_at"].as_f64().unwrap_or(crate::now()),crate::now(),module])?;
         }
         tx.commit()?;
+        if inserted {
+            self.runtime.delivery_ready(bot, kind == "bark");
+        }
         self.event(id)
     }
     pub fn event(&self, id: &str) -> Result<Value> {
@@ -257,13 +256,29 @@ impl Store {
         self.claim_lane(bot, None)
     }
     pub fn claim_lane(&self, bot: &str, bark: Option<bool>) -> Result<Option<Value>> {
+        Ok(match self.claim_ready(bot, bark)? {
+            Claim::Event(event) => Some(event),
+            Claim::Empty(_) | Claim::Discarded => None,
+        })
+    }
+    pub(crate) fn claim_ready(&self, bot: &str, bark: Option<bool>) -> Result<Claim> {
         let mut db = self.connect()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let row=tx.query_row("SELECT id,kind,payload,receipt,attempts FROM events WHERE profile=? AND status='pending' AND next_attempt<=? AND (? IS NULL OR (kind='bark')=?) ORDER BY created_at,id LIMIT 1",params![bot,crate::now(),bark,bark],|r|{
             Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,i64>(4)?))
         }).optional()?;
         let Some((id, kind, payload, receipt, attempts)) = row else {
-            return Ok(None);
+            let due = tx.query_row(
+                "SELECT min(next_attempt) FROM events WHERE profile=? AND status='pending' AND (? IS NULL OR (kind='bark')=?)",
+                params![bot, bark, bark], |r| r.get::<_, Option<f64>>(0),
+            )?;
+            if bark.is_some() {
+                self.runtime
+                    .metrics
+                    .delivery_empty_claims
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(Claim::Empty(due));
         };
         let parsed: Result<(Value, Option<Value>), serde_json::Error> = (|| {
             Ok((
@@ -279,7 +294,7 @@ impl Store {
             Err(_) => {
                 tx.execute("UPDATE events SET status=?,error='stored delivery payload invalid',updated_at=? WHERE id=?",params![if receipt.is_some(){"uncertain"}else{"failed"},crate::now(),id])?;
                 tx.commit()?;
-                return Ok(None);
+                return Ok(Claim::Discarded);
             }
         };
         tx.execute(
@@ -287,7 +302,7 @@ impl Store {
             params![crate::now(), id],
         )?;
         tx.commit()?;
-        Ok(Some(
+        Ok(Claim::Event(
             json!({"id":id,"profile":bot,"kind":kind,"payload":payload,"receipt":receipt,"attempts":attempts+1}),
         ))
     }
@@ -299,7 +314,23 @@ impl Store {
         error: &str,
         delay: f64,
     ) -> Result<()> {
-        self.connect()?.execute("UPDATE events SET status=?,receipt=COALESCE(?,receipt),error=?,next_attempt=?,updated_at=? WHERE id=?",params![status,receipt.map(Value::to_string),error,crate::now()+delay,crate::now(),id])?;
+        let mut db = self.connect()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE events SET status=?,receipt=COALESCE(?,receipt),error=?,next_attempt=?,updated_at=? WHERE id=?",params![status,receipt.map(Value::to_string),error,crate::now()+delay,crate::now(),id])?;
+        let lane: Option<(String, bool)> = if status == "pending" {
+            tx.query_row(
+                "SELECT profile,kind='bark' FROM events WHERE id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        tx.commit()?;
+        if let Some((bot, bark)) = lane {
+            self.runtime.delivery_ready(&bot, bark);
+        }
         Ok(())
     }
     pub fn own_callback(&self, bot: &str, owner: &str, query: &Value) -> Result<bool> {
@@ -405,9 +436,38 @@ pub(crate) fn pooled(path: &Path) -> Result<PooledConnection> {
         .entry(path.to_owned())
         .or_default()
         .clone();
-    Store {
-        path: path.to_owned(),
-        pool,
-    }
-    .connect()
+    connect(path, &pool)
+}
+
+fn connect(path: &Path, pool: &Arc<Mutex<Vec<Connection>>>) -> Result<PooledConnection> {
+    let cached = pool
+        .lock()
+        .map_err(|_| anyhow::anyhow!("database pool unavailable"))?
+        .pop();
+    // Opening and SQLite waits must not serialize other borrowers of this pool.
+    let db = if let Some(db) = cached {
+        db
+    } else {
+        let db = Connection::open(path)?;
+        db.busy_handler(Some(wait_for_writer))?;
+        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+        db
+    };
+    Ok(PooledConnection {
+        db: Some(db),
+        pool: pool.clone(),
+    })
+}
+
+pub(crate) enum Claim {
+    Event(Value),
+    Empty(Option<f64>),
+    Discarded,
+}
+
+pub(crate) fn utc8_day(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(time)
+        .with_timezone(&chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid UTC+8 offset"))
+        .format("%Y-%m-%d")
+        .to_string()
 }

@@ -84,6 +84,9 @@ impl Telegram {
         Self::with_family(config, bot, &config.settings()?.telegram_ip_family)
     }
     pub fn with_family(config: &Config, bot: &Bot, family: &str) -> Result<Self> {
+        Self::with_token(config, family, config.token(bot)?)
+    }
+    pub(crate) fn with_token(config: &Config, family: &str, token: String) -> Result<Self> {
         let base = if config.offline {
             std::env::var("PYLON_TEST_TELEGRAM").context("offline Telegram endpoint required")?
         } else {
@@ -106,11 +109,7 @@ impl Telegram {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(45))
             .build()?;
-        Ok(Self {
-            http,
-            token: config.token(bot)?,
-            base,
-        })
+        Ok(Self { http, token, base })
     }
     async fn response(
         &self,

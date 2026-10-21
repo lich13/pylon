@@ -11,7 +11,9 @@ pub mod downgrade;
 pub mod errors;
 pub mod migration;
 pub mod modules;
+mod optimization;
 pub mod queue;
+mod reload;
 pub mod runtime;
 pub mod telegram;
 

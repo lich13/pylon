@@ -22,6 +22,241 @@ fn delivery_record(event: &Value, status: &str, receipt: Value) -> Completion {
     Completion::delivery(event, status, Some(receipt), "fixture result", 0.0).unwrap()
 }
 
+async fn wait_for(mut predicate: impl FnMut() -> bool, budget: Duration) {
+    tokio::time::timeout(budget, async {
+        while !predicate() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("completion condition did not converge");
+}
+
+#[tokio::test]
+async fn adaptive_reconciler_backs_off_and_discovers_an_external_writer() {
+    let (_temp, store) = new_store();
+    let event = claim_delivery(&store, "external");
+    let scans = || {
+        store
+            .runtime
+            .metrics
+            .completion_scans
+            .load(Ordering::Relaxed)
+    };
+    let mut task = tokio::task::JoinSet::new();
+    task.spawn(run(store.clone()));
+    // Four initial scans at approximately 0, 1, 3, and 8 seconds.
+    wait_for(|| scans() >= 4, Duration::from_secs(10)).await;
+    let count = scans();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(scans(), count, "empty scan unexpectedly self-woke");
+    let external = Store::new(&store.path).unwrap();
+    stage(&external, delivery_record(&event, "delivered", json!([])))
+        .await
+        .unwrap();
+    // A distinct Store has no shared wake; the ten-second scan is the fallback.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(scans(), count);
+    wait_for(
+        || store.event("external").unwrap()["status"] == "delivered",
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(pending_count(&store.path).unwrap(), 0);
+    drop(task);
+}
+
+#[tokio::test]
+async fn sleeping_reconciler_wakes_for_write_and_active_release_within_one_second() {
+    let (_temp, store) = new_store();
+    let event = claim_delivery(&store, "wake-idle");
+    let scans = || {
+        store
+            .runtime
+            .metrics
+            .completion_scans
+            .load(Ordering::Relaxed)
+    };
+    let mut task = tokio::task::JoinSet::new();
+    task.spawn(run(store.clone()));
+    wait_for(|| scans() >= 4, Duration::from_secs(10)).await;
+    let record = delivery_record(&event, "delivered", json!([]));
+    let (_tx, mut stop) = watch::channel(false);
+    let hold = Hold::new(&store, &record, &mut stop).await.unwrap();
+    let before = scans();
+    stage(&store, record).await.unwrap();
+    wait_for(|| scans() > before, Duration::from_secs(1)).await;
+    assert_eq!(store.event("wake-idle").unwrap()["status"], "sending");
+    let held = scans();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(scans(), held, "ACTIVE record caused a busy loop");
+    drop(hold);
+    wait_for(
+        || store.event("wake-idle").unwrap()["status"] == "delivered",
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(pending_count(&store.path).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn busy_database_retries_at_one_second_and_does_not_lose_completion() {
+    let (_temp, store) = new_store();
+    let event = claim_delivery(&store, "busy-reconcile");
+    stage(&store, delivery_record(&event, "delivered", json!([])))
+        .await
+        .unwrap();
+    let mut db = store.connect().unwrap();
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let mut task = tokio::task::JoinSet::new();
+    task.spawn(run(store.clone()));
+    // The first SQLite busy attempt consumes its existing five-second budget;
+    // the second scan must start one second later, not back off to ten seconds.
+    wait_for(
+        || {
+            store
+                .runtime
+                .metrics
+                .completion_scans
+                .load(Ordering::Relaxed)
+                >= 2
+        },
+        Duration::from_secs(8),
+    )
+    .await;
+    assert_eq!(pending_count(&store.path).unwrap(), 1);
+    tx.commit().unwrap();
+    wait_for(
+        || store.event("busy-reconcile").unwrap()["status"] == "delivered",
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(pending_count(&store.path).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn durable_write_and_writer_release_wake_but_reconciler_release_does_not() {
+    let (_temp, store) = new_store();
+    let event = claim_delivery(&store, "owned");
+    let record = delivery_record(&event, "delivered", json!([]));
+    let (_tx, mut stop) = watch::channel(false);
+    let hold = Hold::new(&store, &record, &mut stop).await.unwrap();
+    let mut changed = store.runtime.completion.subscribe();
+    stage(&store, record).await.unwrap();
+    assert!(changed.has_changed().unwrap());
+    changed.borrow_and_update();
+    let scan = reconcile_scan(&store).unwrap();
+    assert!(!scan.empty());
+    assert_eq!(scan.active, 1);
+    assert_eq!(store.event("owned").unwrap()["status"], "sending");
+    drop(hold);
+    tokio::time::timeout(Duration::from_secs(1), changed.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let scan = reconcile_scan(&store).unwrap();
+    assert_eq!(scan.entries, 1);
+    assert_eq!(scan.active, 0);
+    assert_eq!(store.event("owned").unwrap()["status"], "delivered");
+    assert!(
+        !changed.has_changed().unwrap(),
+        "reconciler Hold must not self-wake"
+    );
+    assert!(reconcile_scan(&store).unwrap().empty());
+}
+
+#[tokio::test]
+async fn cancelling_the_awaiting_task_does_not_lose_the_durable_write_wakeup() {
+    let (_temp, store) = new_store();
+    let event = claim_delivery(&store, "cancel-waiter");
+    let record = delivery_record(&event, "delivered", json!([]));
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker = std::thread::spawn(move || {
+        let _lock = FILES.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    locked_rx.await.unwrap();
+    let mut changed = store.runtime.completion.subscribe();
+    let writer = store.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            save(&writer, &record)
+        })
+        .await
+    });
+    started_rx.await.unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert!(!changed.has_changed().unwrap());
+    release_tx.send(()).unwrap();
+    blocker.join().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), changed.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending_count(&store.path).unwrap(), 1);
+    reconcile(&store).unwrap();
+    assert_eq!(store.event("cancel-waiter").unwrap()["status"], "delivered");
+}
+
+#[test]
+fn malformed_records_and_temporary_files_are_never_mistaken_for_idle() {
+    let (_temp, store) = new_store();
+    let root = directory(&store).unwrap();
+    fs::write(root.join("broken.json"), "invalid fixture").unwrap();
+    fs::set_permissions(root.join("broken.json"), fs::Permissions::from_mode(0o600)).unwrap();
+    let scan = reconcile_scan(&store).unwrap();
+    assert!(!scan.empty());
+    assert_eq!(scan.failed, 1);
+    fs::remove_file(root.join("broken.json")).unwrap();
+    fs::write(root.join(".fixture.tmp"), "partial fixture").unwrap();
+    assert!(!reconcile_scan(&store).unwrap().empty());
+}
+
+#[tokio::test]
+async fn pending_and_command_completion_commit_before_delivery_wakes() {
+    let (_temp, store) = new_store();
+    let event = claim_delivery(&store, "retry");
+    let (_wake, mut changed) = store.runtime.delivery_listener("fixture-bot", false);
+    let path = stage(&store, delivery_record(&event, "pending", json!([])))
+        .await
+        .unwrap();
+    assert!(!changed.has_changed().unwrap());
+    apply(&store, &path, true).unwrap();
+    assert!(changed.has_changed().unwrap());
+    assert_eq!(store.event("retry").unwrap()["status"], "pending");
+    changed.borrow_and_update();
+    store.connect().unwrap().execute("INSERT INTO updates(profile,update_id,payload,status) VALUES('fixture-bot',51,'{}','running')", []).unwrap();
+    let record = Completion::command(
+        "fixture-bot",
+        51,
+        "{}",
+        "fixture-module",
+        json!({"text":"reply"}),
+        "done",
+        &[],
+    );
+    let path = stage(&store, record).await.unwrap();
+    apply(&store, &path, true).unwrap();
+    assert!(changed.has_changed().unwrap());
+    assert_eq!(
+        store
+            .connect()
+            .unwrap()
+            .query_row("SELECT status FROM updates WHERE update_id=51", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "done"
+    );
+}
+
 #[tokio::test]
 async fn partial_delivery_receipt_recovers_to_uncertain_without_requeue() {
     let (_temp, store) = new_store();

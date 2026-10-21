@@ -10,7 +10,7 @@ use std::{
     io::{Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, atomic::Ordering},
     time::Duration,
 };
 use tokio::sync::watch;
@@ -192,7 +192,7 @@ pub(crate) fn pending_count(database: &Path) -> Result<u64> {
 }
 
 /// Prevent the reconciler from finalizing a still-owned partial delivery.
-pub(crate) struct Hold(PathBuf);
+pub(crate) struct Hold(PathBuf, Option<Arc<crate::optimization::Runtime>>);
 impl Hold {
     pub(crate) async fn delivery(
         store: &Store,
@@ -220,7 +220,7 @@ impl Hold {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("completion ownership unavailable"))?;
                 if active.insert(path.clone()) {
-                    return Ok(Self(path));
+                    return Ok(Self(path, Some(store.runtime.clone())));
                 }
             }
             // Reconciliation may just have committed pending, allowing the next
@@ -240,6 +240,9 @@ impl Drop for Hold {
     fn drop(&mut self) {
         if let Ok(mut active) = ACTIVE.get_or_init(Default::default).lock() {
             active.remove(&self.0);
+        }
+        if let Some(runtime) = &self.1 {
+            runtime.completion.notify();
         }
     }
 }
@@ -299,6 +302,7 @@ fn save(store: &Store, record: &Completion) -> Result<PathBuf> {
         fs::remove_file(&temporary)?;
     }
     result?;
+    store.runtime.completion.notify();
     Ok(path)
 }
 
@@ -321,6 +325,7 @@ fn apply(store: &Store, path: &Path, recovering: bool) -> Result<()> {
         }
         Err(error) => return Err(error),
     };
+    let mut ready = None;
     match &record.result {
         Outcome::Delivery {
             id,
@@ -369,6 +374,13 @@ fn apply(store: &Store, path: &Path, recovering: bool) -> Result<()> {
                 };
                 tx.execute("UPDATE events SET status=?,receipt=COALESCE(?,receipt),error=?,next_attempt=?,updated_at=? WHERE id=?",
                     params![status, receipt.as_ref().map(Value::to_string), reason, next_attempt, crate::now(), id])?;
+                if status == "pending" {
+                    let bark =
+                        tx.query_row("SELECT kind='bark' FROM events WHERE id=?", [id], |r| {
+                            r.get(0)
+                        })?;
+                    ready = Some((bot.clone(), bark));
+                }
             }
         }
         Outcome::Command {
@@ -397,10 +409,16 @@ fn apply(store: &Store, path: &Path, recovering: bool) -> Result<()> {
                 crate::db::complete_update_transaction(
                     &tx, bot, *update, owner, reply, status, contexts,
                 )?;
+                if reply["text"].as_str().is_some_and(|s| !s.is_empty()) {
+                    ready = Some((bot.clone(), false));
+                }
             }
         }
     }
     tx.commit()?;
+    if let Some((bot, bark)) = ready {
+        store.runtime.delivery_ready(&bot, bark);
+    }
     // Keep partial checkpoints until the next outcome or reconciliation. A
     // blocking writer may finish after its async waiter times out; deleting this
     // checkpoint could otherwise leave an ownerless `sending` row forever.
@@ -472,10 +490,33 @@ pub(crate) async fn stage(store: &Store, record: Completion) -> Result<PathBuf> 
         .context("completion writer failed")?
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct Scan {
+    entries: u64,
+    active: u64,
+    failed: u64,
+}
+impl Scan {
+    fn empty(&self) -> bool {
+        self.entries == 0 && self.active == 0 && self.failed == 0
+    }
+}
+
 pub(crate) fn reconcile(store: &Store) -> Result<()> {
+    reconcile_scan(store).map(|_| ())
+}
+
+fn reconcile_scan(store: &Store) -> Result<Scan> {
+    store
+        .runtime
+        .metrics
+        .completion_scans
+        .fetch_add(1, Ordering::Relaxed);
+    let mut scan = Scan::default();
     let root = directory(store)?;
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
+        scan.entries += 1;
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
@@ -484,18 +525,44 @@ pub(crate) fn reconcile(store: &Store) -> Result<()> {
             .lock()
             .map_err(|_| anyhow::anyhow!("completion ownership unavailable"))?;
         if !active.insert(path.clone()) {
+            scan.active += 1;
             continue;
         }
         drop(active);
-        let _hold = Hold(path.clone());
+        let _hold = Hold(path.clone(), None);
         if let Err(error) = apply(store, &path, true) {
+            scan.failed += 1;
             crate::errors::log("completion-reconcile", &error);
             if crate::errors::retryable(&error) {
                 return Err(error);
             }
         }
     }
-    Ok(())
+    Ok(scan)
+}
+
+pub(crate) async fn run(store: Store) {
+    let mut changed = store.runtime.completion.subscribe();
+    let mut idle = crate::optimization::Idle::default();
+    loop {
+        // Mark before scanning: a write during/after the scan must stay unseen.
+        changed.borrow_and_update();
+        let result = store.blocking(|s| reconcile_scan(&s)).await;
+        let delay = match result {
+            Ok(scan) if scan.empty() => idle.next(&crate::optimization::COMPLETION_IDLE),
+            other => {
+                idle.reset();
+                if let Err(error) = other {
+                    crate::errors::log("completion-reconcile", &error);
+                }
+                Duration::from_secs(1)
+            }
+        };
+        tokio::select! {
+            _ = changed.changed() => {},
+            _ = tokio::time::sleep(delay) => {},
+        }
+    }
 }
 
 pub(crate) fn interrupt_bot(store: &Store, bot: &str) -> Result<()> {

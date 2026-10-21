@@ -13,46 +13,79 @@ use axum::{
     routing::post,
 };
 use serde_json::{Value, json};
-use std::{os::unix::fs::PermissionsExt, sync::Arc};
-use tokio::sync::RwLock;
+use std::{
+    collections::BTreeMap,
+    os::unix::fs::PermissionsExt,
+    sync::{Arc, atomic::Ordering},
+};
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Clone)]
 pub struct Snapshot {
     pub settings: Settings,
     pub catalog: Catalog,
+    pub(crate) credentials: BTreeMap<String, String>,
 }
 #[derive(Clone)]
 pub struct App {
     pub config: Config,
     pub store: Store,
     pub snapshot: Arc<RwLock<Snapshot>>,
+    pub(crate) reload_guard: Arc<Mutex<Option<Arc<crate::reload::Inputs>>>>,
 }
 impl App {
     pub fn new(config: Config) -> Result<Self> {
-        let settings = config.settings()?;
-        config.validate_credentials(&settings)?;
-        let catalog = Catalog::load(&config)?;
+        let (snapshot, inputs) = crate::reload::load(&config)?;
         let store = Store::new(&config.db())?;
+        store
+            .runtime
+            .metrics
+            .reload_full
+            .fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             config,
             store,
-            snapshot: Arc::new(RwLock::new(Snapshot { settings, catalog })),
+            snapshot: Arc::new(RwLock::new(snapshot)),
+            reload_guard: Arc::new(Mutex::new(Some(Arc::new(inputs)))),
         })
     }
     pub async fn reload(&self) -> Result<()> {
+        self.reload_inner(true).await.map(|_| ())
+    }
+    pub(crate) async fn reload_if_changed(&self) -> Result<bool> {
+        self.reload_inner(false).await
+    }
+    async fn reload_inner(&self, force: bool) -> Result<bool> {
+        let mut guard = self.reload_guard.lock().await;
+        let previous = guard.clone();
+        let settings = self.snapshot.read().await.settings.clone();
         let config = self.config.clone();
-        let (settings, catalog) = crate::blocking(move || {
-            let settings = config.settings()?;
-            config.validate_credentials(&settings)?;
-            Ok((settings, Catalog::load(&config)?))
+        let runtime = self.store.runtime.clone();
+        let candidate = crate::blocking(move || {
+            if !force
+                && let Some(previous) = previous
+                && previous.unchanged(&config, &settings)?
+            {
+                runtime
+                    .metrics
+                    .reload_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+            runtime.metrics.reload_full.fetch_add(1, Ordering::Relaxed);
+            crate::reload::load(&config).map(Some)
         })
         .await?;
+        let Some((snapshot, inputs)) = candidate else {
+            return Ok(false);
+        };
         ensure!(
-            settings.web_port == self.snapshot.read().await.settings.web_port,
+            snapshot.settings.web_port == self.snapshot.read().await.settings.web_port,
             "web port requires restart"
         );
-        *self.snapshot.write().await = Snapshot { settings, catalog };
-        Ok(())
+        *self.snapshot.write().await = snapshot;
+        *guard = Some(Arc::new(inputs));
+        Ok(true)
     }
 }
 pub async fn rpc(config: &Config, method: &str, params: Value, context: &str) -> Result<Value> {
@@ -664,6 +697,6 @@ fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
     let (proxy_invalid, response_invalid) = crate::telegram::invalid_responses();
     let completions_pending = crate::completion::pending_count(&app.store.path)?;
     Ok(
-        json!({"api_version":2,"metrics":{"sqlite_busy":crate::db::busy_count(),"telegram_proxy_invalid":proxy_invalid,"telegram_response_invalid":response_invalid,"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"completions_pending":completions_pending,"sampled_at":crate::now(),"maintenance":app.config.home.join("run/freeze").exists(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
+        json!({"api_version":2,"metrics":{"optimization":app.store.runtime.metrics.snapshot(),"sqlite_busy":crate::db::busy_count(),"telegram_proxy_invalid":proxy_invalid,"telegram_response_invalid":response_invalid,"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"completions_pending":completions_pending,"sampled_at":crate::now(),"maintenance":app.config.home.join("run/freeze").exists(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
     )
 }

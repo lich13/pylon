@@ -55,8 +55,13 @@ fn source_name(path: &Path) -> bool {
         .contains(&s.to_string_lossy().as_ref())
     })
 }
-fn source_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
-    fn visit(root: &Path, dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+pub(crate) struct Sources {
+    pub files: Vec<std::path::PathBuf>,
+    pub directories: Vec<std::path::PathBuf>,
+}
+
+pub(crate) fn source_inventory(root: &Path) -> Result<Sources> {
+    fn visit(root: &Path, dir: &Path, out: &mut Sources) -> Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -70,19 +75,30 @@ fn source_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
                 "module packages cannot contain symbolic links"
             );
             if meta.is_dir() {
-                visit(root, &path, out)?
+                out.directories.push(relative.to_path_buf());
+                visit(root, &path, out)?;
             } else if meta.is_file() {
-                out.push(relative.to_path_buf());
+                out.files.push(relative.to_path_buf());
             }
         }
         Ok(())
     }
-    let mut files = vec![];
-    visit(root, root, &mut files)?;
-    files.sort();
-    Ok(files)
+    let mut sources = Sources {
+        files: vec![],
+        directories: vec![],
+    };
+    visit(root, root, &mut sources)?;
+    sources.files.sort();
+    sources.directories.sort();
+    Ok(sources)
+}
+
+pub(crate) fn source_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
+    Ok(source_inventory(root)?.files)
 }
 pub fn content_hash(root: &Path) -> Result<String> {
+    #[cfg(test)]
+    crate::reload::reads::record(root);
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     for path in source_files(root)? {

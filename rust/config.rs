@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    os::unix::fs::PermissionsExt,
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -87,7 +88,10 @@ impl Config {
         }
     }
     pub fn settings(&self) -> Result<Settings> {
-        let s: Settings = serde_json::from_slice(&fs::read(self.home.join("config/bots.json"))?)?;
+        self.settings_from_bytes(&fs::read(self.home.join("config/bots.json"))?)
+    }
+    pub(crate) fn settings_from_bytes(&self, bytes: &[u8]) -> Result<Settings> {
+        let s: Settings = serde_json::from_slice(bytes)?;
         ensure!(s.web_port > 0, "invalid web port");
         ensure!(
             ["ipv4", "ipv6", "auto"].contains(&s.telegram_ip_family.as_str()),
@@ -150,14 +154,17 @@ impl Config {
         Ok(s)
     }
     pub fn validate_credentials(&self, s: &Settings) -> Result<()> {
+        self.credential_fingerprints(s).map(|_| ())
+    }
+    pub(crate) fn credential_fingerprints(&self, s: &Settings) -> Result<BTreeMap<String, String>> {
         let mut seen = BTreeSet::new();
-        for bot in s.bots.values().filter(|b| b.enabled) {
-            ensure!(
-                seen.insert(crate::digest(self.token(bot)?)),
-                "duplicate bot credential"
-            );
+        let mut fingerprints = BTreeMap::new();
+        for (id, bot) in s.bots.iter().filter(|(_, b)| b.enabled) {
+            let fingerprint = crate::digest(self.token(bot)?);
+            ensure!(seen.insert(fingerprint.clone()), "duplicate bot credential");
+            fingerprints.insert(id.clone(), fingerprint);
         }
-        Ok(())
+        Ok(fingerprints)
     }
     pub fn contained(&self, relative: &str) -> Result<PathBuf> {
         let p = Path::new(relative);
@@ -186,12 +193,43 @@ impl Config {
     }
     pub fn token(&self, bot: &Bot) -> Result<String> {
         let p = self.home.join("gateway/secrets").join(&bot.credential);
-        let metadata = fs::symlink_metadata(&p).context("credential unavailable")?;
+        self.contained(&format!("gateway/secrets/{}", bot.credential))?;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&p)
+            .context("credential unavailable")?;
+        let metadata = file.metadata()?;
         ensure!(
             metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
             "unsafe credential permissions"
         );
-        let token = fs::read_to_string(p)?.trim().to_owned();
+        #[cfg(test)]
+        crate::reload::reads::record(&p);
+        let mut token = String::new();
+        file.read_to_string(&mut token)
+            .context("credential unavailable")?;
+        let after = fs::symlink_metadata(&p).context("credential unavailable")?;
+        ensure!(
+            after.is_file()
+                && after.permissions().mode() & 0o077 == 0
+                && after.dev() == metadata.dev()
+                && after.ino() == metadata.ino()
+                && after.len() == metadata.len()
+                && (
+                    after.mtime(),
+                    after.mtime_nsec(),
+                    after.ctime(),
+                    after.ctime_nsec()
+                ) == (
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec()
+                ),
+            "credential changed while reading"
+        );
+        let token = token.trim().to_owned();
         ensure!(
             token
                 .split_once(':')

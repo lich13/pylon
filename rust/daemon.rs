@@ -468,6 +468,12 @@ async fn command_once_with_stop(
 async fn pause(stop: &mut watch::Receiver<bool>, seconds: f64) -> bool {
     tokio::select! {_=stop.changed()=>true,_=tokio::time::sleep(Duration::from_secs_f64(seconds))=>*stop.borrow()}
 }
+enum LaneOutcome {
+    Wait(f64),
+    Worked(f64),
+    Empty(Option<f64>),
+}
+
 async fn lane_once(
     app: App,
     id: String,
@@ -475,9 +481,9 @@ async fn lane_once(
     tg: Telegram,
     lane: &'static str,
     mut stop: watch::Receiver<bool>,
-) -> Result<f64> {
+) -> Result<LaneOutcome> {
     if *stop.borrow() {
-        return Ok(0.0);
+        return Ok(LaneOutcome::Wait(0.0));
     }
     match lane {
         "poll" => {
@@ -491,7 +497,7 @@ async fn lane_once(
             let query = json!({"offset":offset,"timeout":25,"allowed_updates":["message","callback_query"]});
             let result = tokio::select! {
                 biased;
-                _ = stop.changed() => return Ok(0.0),
+                _ = stop.changed() => return Ok(LaneOutcome::Wait(0.0)),
                 result = tg.call("getUpdates", &query, true) => result,
             };
             match result {
@@ -508,7 +514,7 @@ async fn lane_once(
                             )
                         })
                         .await?;
-                    Ok(if empty { 1.0 } else { 0.1 })
+                    Ok(LaneOutcome::Wait(if empty { 1.0 } else { 0.1 }))
                 }
                 Err(failure) => {
                     let delay = failure.delay.max(5.0);
@@ -520,21 +526,21 @@ async fn lane_once(
                             )
                         })
                         .await?;
-                    Ok(delay)
+                    Ok(LaneOutcome::Wait(delay))
                 }
             }
         }
-        "command" => Ok(
+        "command" => Ok(LaneOutcome::Wait(
             if command_once_with_stop(&app, &id, &tg, &mut stop).await? {
                 0.0
             } else {
                 0.5
             },
-        ),
+        )),
         "menu" => {
             let result = tokio::select! {
                 biased;
-                _ = stop.changed() => return Ok(0.0),
+                _ = stop.changed() => return Ok(LaneOutcome::Wait(0.0)),
                 result = synchronize(&app, &id, &bot, &tg) => result,
             };
             let ok = result.is_ok();
@@ -547,27 +553,32 @@ async fn lane_once(
                 })
                 .await?;
             result?;
-            Ok(30.0)
+            Ok(LaneOutcome::Wait(30.0))
         }
         _ => {
             if bot.require_start {
                 let key = format!("bot_started:{id}");
                 if app.store.blocking(move |s| s.get(&key)).await? != json!(true) {
-                    return Ok(1.0);
+                    return Ok(LaneOutcome::Wait(1.0));
                 }
             }
             let claimed_bot = id.clone();
             let event = app
                 .store
-                .blocking(move |s| s.claim_lane(&claimed_bot, Some(lane == "bark")))
+                .blocking(move |s| s.claim_ready(&claimed_bot, Some(lane == "bark")))
                 .await?;
-            if let Some(event) = event {
+            let event = match event {
+                crate::db::Claim::Empty(due) => return Ok(LaneOutcome::Empty(due)),
+                crate::db::Claim::Discarded => return Ok(LaneOutcome::Worked(0.0)),
+                crate::db::Claim::Event(event) => event,
+            };
+            {
                 let started = crate::now();
                 let delay =
                     crate::telegram::deliver_with_stop(&app.store, &tg, &bot, &event, &mut stop)
                         .await?;
                 if *stop.borrow() {
-                    return Ok(delay);
+                    return Ok(LaneOutcome::Worked(delay));
                 }
                 // Metrics cannot change an already persisted delivery result.
                 if let Err(error) = app
@@ -582,22 +593,30 @@ async fn lane_once(
                 {
                     crate::errors::log("delivery-metrics", &error);
                 }
-                Ok(delay)
-            } else {
-                Ok(0.5)
+                Ok(LaneOutcome::Worked(delay))
             }
         }
     }
 }
-async fn bot_worker(app: App, id: String, bot: Bot, stop: watch::Receiver<bool>) -> Result<()> {
-    let family = app
-        .snapshot
-        .read()
-        .await
-        .settings
-        .telegram_ip_family
-        .clone();
-    let tg = Telegram::with_family(&app.config, &bot, &family)?;
+async fn bot_worker(
+    app: App,
+    id: String,
+    bot: Bot,
+    family: String,
+    credential: String,
+    stop: watch::Receiver<bool>,
+) -> Result<()> {
+    let config = app.config.clone();
+    let validated = bot.clone();
+    let tg = crate::blocking(move || {
+        let token = config.token(&validated)?;
+        ensure!(
+            crate::digest(&token) == credential,
+            "credential generation changed"
+        );
+        Telegram::with_token(&config, &family, token)
+    })
+    .await?;
     bot_worker_client(app, id, bot, tg, stop).await
 }
 async fn bot_worker_client(
@@ -618,19 +637,38 @@ async fn bot_worker_client(
         );
         lanes.spawn(async move {
             let mut failures = 0_u32;
+            let mut idle = crate::optimization::Idle::default();
+            let listener = matches!(lane, "telegram" | "bark")
+                .then(|| app.store.runtime.delivery_listener(&id, lane == "bark"));
+            let (_wake, mut changed) = match listener {
+                Some((wake, changed)) => (Some(wake), Some(changed)),
+                None => (None, None),
+            };
             while !*stop.borrow() {
                 if app.config.home.join("run/freeze").exists() {
                     if pause(&mut stop, 1.0).await { break; }
                     continue;
                 }
+                if let Some(changed) = &mut changed { changed.borrow_and_update(); }
                 // The child boundary catches a panic without cancelling another lane.
                 let result = Child(tokio::spawn(lane_once(app.clone(), id.clone(), bot.clone(), tg.clone(), lane, stop.clone())))
                     .await.unwrap_or_else(|_| Err(crate::errors::ReconcileRequired.into()));
                 if *stop.borrow() { break; }
                 let recovering = failures > 0;
                 let delay = match &result {
-                    Ok(delay) => { failures = 0; *delay }
+                    Ok(LaneOutcome::Empty(due)) => {
+                        failures = 0;
+                        let delay = idle.next(&crate::optimization::DELIVERY_IDLE).as_secs_f64();
+                        due.filter(|due| due.is_finite())
+                            .map(|due| delay.min((due - crate::now()).max(0.0))).unwrap_or(delay)
+                    }
+                    Ok(LaneOutcome::Wait(delay) | LaneOutcome::Worked(delay)) => {
+                        failures = 0;
+                        idle.reset();
+                        *delay
+                    }
                     Err(error) => {
+                        idle.reset();
                         failures = failures.saturating_add(1);
                         crate::errors::log(lane, error);
                         if error.is::<crate::errors::ReconcileRequired>() {
@@ -653,7 +691,16 @@ async fn bot_worker_client(
                         s.put(&key, &json!({"restarts":count,"consecutive_failures":failures,"at":crate::now(),"status":if failures==0 {"ok"} else {"retrying"}}))
                     }).await { crate::errors::log("worker-status", &error); }
                 }
-                if pause(&mut stop, delay).await { break; }
+                let stopped = if matches!(result, Ok(LaneOutcome::Empty(_))) {
+                    if let Some(changed) = &mut changed {
+                        tokio::select! {
+                            _ = stop.changed() => true,
+                            _ = changed.changed() => false,
+                            _ = tokio::time::sleep(Duration::from_secs_f64(delay)) => *stop.borrow(),
+                        }
+                    } else { pause(&mut stop, delay).await }
+                } else { pause(&mut stop, delay).await };
+                if stopped { break; }
             }
         });
     }
@@ -729,17 +776,7 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
         let _ = shutdown_tx.send(true);
     }));
     let journal_store = app.store.clone();
-    let reconciler = Child(tokio::spawn(async move {
-        loop {
-            if let Err(error) = journal_store
-                .blocking(|s| crate::completion::reconcile(&s))
-                .await
-            {
-                crate::errors::log("completion-reconcile", &error);
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    }));
+    let reconciler = Child(tokio::spawn(crate::completion::run(journal_store)));
     let mut rejected = app
         .store
         .blocking(|s| s.get("configuration-rejected"))
@@ -753,7 +790,7 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
     let supervise = async {
         loop {
             // A malformed replacement keeps the entire last valid configuration active.
-            if let Err(error) = app.reload().await {
+            if let Err(error) = app.reload_if_changed().await {
                 let config = app.config.clone();
                 let fingerprint =
                     crate::blocking(move || Ok(configuration_fingerprint(&config))).await?;
@@ -796,23 +833,13 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
             let snapshot = app.snapshot.read().await.clone();
             let mut desired = BTreeMap::new();
             for (id, bot) in snapshot.settings.bots.iter().filter(|(_, b)| b.enabled) {
-                let token = match app.config.token(bot) {
-                    Ok(token) => token,
-                    Err(error) => {
-                        crate::errors::log("credential-read", &error);
-                        if let Some((hash, _, _)) = workers.get(id) {
-                            desired.insert(id.clone(), hash.clone());
-                        }
-                        continue;
-                    }
-                };
                 desired.insert(
                     id.clone(),
                     crate::digest(format!(
                         "{}:{}:{}",
                         snapshot.settings.telegram_ip_family,
                         serde_json::to_string(bot)?,
-                        crate::digest(token)
+                        snapshot.credentials[id]
                     )),
                 );
             }
@@ -873,6 +900,8 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
                         app.clone(),
                         id.clone(),
                         snapshot.settings.bots[&id].clone(),
+                        snapshot.settings.telegram_ip_family.clone(),
+                        snapshot.credentials[&id].clone(),
                         rx,
                     )));
                     (hash, tx, task)
@@ -991,7 +1020,9 @@ mod tests {
             snapshot: Arc::new(tokio::sync::RwLock::new(Snapshot {
                 settings: crate::config::Settings::default(),
                 catalog: crate::catalog::Catalog::default(),
+                credentials: BTreeMap::new(),
             })),
+            reload_guard: Arc::default(),
         };
         let wanted = menu(&*app.snapshot.read().await, "fixture");
         store
