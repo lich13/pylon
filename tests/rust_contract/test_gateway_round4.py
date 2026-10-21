@@ -283,7 +283,7 @@ def _assert_read_only_check(
 
 
 @pytest.mark.parametrize("completion_files", [None, []], ids=["missing-buffer", "empty-buffer"])
-@pytest.mark.parametrize("target", ["0.5.4", "0.5.5"])
+@pytest.mark.parametrize("target", ["0.5.4", "0.5.5", "0.5.6"])
 def test_missing_and_empty_buffer_are_safe_for_current_targets(
     round4_root, completion_files, target
 ):
@@ -337,7 +337,7 @@ def test_every_regular_buffer_file_blocks_downgrade_without_being_parsed(
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.5",
+        "0.5.6",
         exit_code=1,
         ok=False,
         pending=1,
@@ -365,7 +365,7 @@ def test_buffer_count_includes_json_temporary_and_corrupt_files(round4_root):
 
 @pytest.mark.parametrize(
     "target",
-    ["0.5.2", "0.5.6", "v0.5.5", "0.5.5.0"],
+    ["0.5.2", "0.5.7", "v0.5.6", "0.5.6.0"],
     ids=["older", "newer", "prefix", "extra-component"],
 )
 def test_unknown_target_returns_fixed_json_without_creating_home(round4_root, target):
@@ -493,7 +493,7 @@ def test_corrupt_v2_counter_is_unavailable_and_never_repaired(round4_root, raw):
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.5",
+        "0.5.6",
         exit_code=1,
         ok=False,
         pending=0,
@@ -527,7 +527,7 @@ def test_missing_database_and_corrupt_database_are_read_only_unavailable(round4_
     _assert_read_only_check(
         missing_root,
         missing_home,
-        "0.5.5",
+        "0.5.6",
         exit_code=1,
         ok=False,
         pending=None,
@@ -546,7 +546,7 @@ def test_missing_database_and_corrupt_database_are_read_only_unavailable(round4_
     _assert_read_only_check(
         corrupt_root,
         corrupt_home,
-        "0.5.5",
+        "0.5.6",
         exit_code=1,
         ok=False,
         pending=0,
@@ -594,7 +594,7 @@ def test_completion_buffer_rejects_links_hardlinks_nested_and_special_entries(
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.5",
+        "0.5.6",
         exit_code=1,
         ok=False,
         pending=None,
@@ -627,7 +627,7 @@ def test_private_state_rejects_unsafe_permissions(round4_root, unsafe_part):
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.5",
+        "0.5.6",
         exit_code=1,
         ok=False,
         pending=None,
@@ -651,7 +651,7 @@ def test_completion_directory_owner_must_match_private_database_owner(round4_roo
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.5",
+        "0.5.6",
         exit_code=1,
         ok=False,
         pending=None,
@@ -679,7 +679,7 @@ def test_completion_file_owner_must_match_private_database_owner(round4_root):
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.5",
+        "0.5.6",
         exit_code=1,
         ok=False,
         pending=None,
@@ -704,7 +704,7 @@ def test_closed_wal_database_is_read_only_and_creates_no_sidecars(round4_root):
     before_hash = _file_hash(database_path)
     report = _invoke_check(
         home,
-        "0.5.5",
+        "0.5.6",
         exit_code=0,
         ok=True,
         pending=0,
@@ -835,7 +835,7 @@ def test_diagnostics_count_is_top_level_and_permissions_stay_unchanged(
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.5",
+        "0.5.6",
         exit_code=0,
         ok=True,
         pending=0,

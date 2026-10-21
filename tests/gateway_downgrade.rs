@@ -61,10 +61,10 @@ fn home_with_state(
 fn empty_buffer_is_safe_for_current_target() {
     let (_temporary, config, _database_path) = home_with_state(&[(COUNTER_KEY, counter())], false);
 
-    let report = downgrade::check(&config, "0.5.5");
+    let report = downgrade::check(&config, "0.5.6");
 
     assert!(report.ok);
-    assert_eq!(report.target_version, "0.5.5");
+    assert_eq!(report.target_version, "0.5.6");
     assert_eq!(report.completions_pending, Some(0));
     assert_eq!(report.reason, None);
 }
@@ -73,10 +73,10 @@ fn empty_buffer_is_safe_for_current_target() {
 fn one_buffered_file_blocks_downgrade() {
     let (_temporary, config, _database_path) = home_with_state(&[], true);
 
-    let report = downgrade::check(&config, "0.5.5");
+    let report = downgrade::check(&config, "0.5.6");
 
     assert!(!report.ok);
-    assert_eq!(report.target_version, "0.5.5");
+    assert_eq!(report.target_version, "0.5.6");
     assert_eq!(report.completions_pending, Some(1));
     assert_eq!(report.reason, Some("pending_completions"));
 }
