@@ -866,7 +866,33 @@ def test_successful_command_waits_out_two_second_gateway_database_lock(isolated_
         )
         case.gateway.start()
         case.start_executor()
-        assert wait_for(lambda: case.count("completion-count") == 1, timeout=5.0)
+
+        def command_debug():
+            state = case.home / "gateway/state.sqlite3"
+            updates = []
+            try:
+                with sqlite3.connect(state, timeout=0.2) as database:
+                    updates = database.execute(
+                        "SELECT update_id,status FROM updates ORDER BY update_id"
+                    ).fetchall()
+            except sqlite3.Error as error:
+                updates = [f"sqlite:{error}"]
+            completion_dir = case.home / "gateway/completions"
+            return {
+                "updates": updates,
+                "data": sorted(path.name for path in case.data.iterdir()),
+                "completions": sorted(path.name for path in completion_dir.iterdir())
+                if completion_dir.is_dir()
+                else [],
+                "telegram_calls": len(telegram._calls),
+                "gateway_exit": case.gateway.proc.poll() if case.gateway.proc else None,
+                "executor_exit": [process.poll() for process in case.executors],
+            }
+
+        try:
+            assert wait_for(lambda: case.count("completion-count") == 1, timeout=5.0)
+        except AssertionError as error:
+            raise AssertionError(f"{error}; command_debug={command_debug()}") from error
         assert telegram.longpoll_entered.wait(timeout=5.0), "poll lane did not settle after saving the command"
 
         state_path = case.home / "gateway/state.sqlite3"
