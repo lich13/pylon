@@ -106,22 +106,59 @@ executor 每 2 秒独立刷新任务摘要，转交结果的网络等待不会�
 
 移除 reqwest SOCKS 和 chrono-tz，Tokio 使用明确的必要 features；UTC+8 日键仍为 `%Y-%m-%d`，保留历史水位和每日摘要去重。release 仍使用 thin LTO 和 `strip = "debuginfo"`。
 
-替换为旧版之前，用候选 v0.5.7 二进制执行只读检查：
+替换为旧版之前，用当前新版二进制执行只读检查（v0.5.8 的目标为 0.5.7）：
 
 ```sh
-sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.6
+sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.7
 ```
 
 标准输出为 JSON，包含 `ok`、`target_version`、`completions_pending` 和固定短码 `reason`；通过退出 0，阻断或无法确认退出 1。命令直接检查本地状态，无需网关或联网；不初始化数据库、不转换 counter、不处理完成缓冲，也不创建缺失的数据库辅助文件。已有 WAL 必须正常读取；只有取得排他数据库锁且确认没有未归并日志时，才按静态文件读取。检查遇到竞争或需恢复的数据库时拒绝通过。
 
 | 目标 | 必要条件 |
 | --- | --- |
+| 0.5.7 | 完成缓冲为空、状态有效；无有效事件占位记录 |
 | 0.5.6 | 完成缓冲为空、状态有效；保留正常 v2 counter |
 | 0.5.5 | 完成缓冲为空、状态有效；保留正常 v2 counter |
 | 0.5.4 | 完成缓冲为空、状态有效；该版本已支持 v2 counter，不执行退役转换 |
 | 0.5.3 | 缓冲为空，无活动 v2 counter，合法旧水位已覆盖现有 uncertain 事件；存在 v3 触发器时还须保留有效 retired counter，转换另行执行 |
 | 其他版本 | 尚未核实，拒绝通过 |
 
-空缓冲但 counter 损坏、权限异常或无法读取时仍拒绝通过。先冻结新触发并等在途任务、命令和投递结束，再检查；停止核心服务后、替换旧二进制前再检查一次。此命令是部署前置门槛，不能阻止 root 绕过检查替换文件。缓冲无法清空时保留新版和冻结状态，不删除记录或恢复旧数据库快照。v0.5.7 的正常回退目标为 0.5.6。
+所有旧目标还必须没有有效的事件占位记录；存在时返回 `retained_events_require_newer_gateway`。占位状态损坏或有效期不明同样拒绝，命中计数为零不能绕过。空缓冲但 counter 损坏、权限异常或无法读取时仍拒绝通过。先冻结新触发并等在途任务、命令和投递结束，再检查；停止核心服务后、替换旧二进制前再检查一次。此命令是部署前置门槛，不能阻止 root 绕过检查替换文件。缓冲无法清空或已有有效占位时保留新版和冻结状态，优先前向修复；不删除记录或恢复旧数据库快照。
 
 版本以运行进程的二进制哈希、版本目录 `REVISION` 和诊断版本交叉核对；切换后同步根目录 `REVISION`。仅分支提交触发网关 CI，版本 tag 不重复构建。发布成品须来自对应提交的成功 CI，并核对 `REVISION` 和 `SHA256SUMS`；校验和中的路径带 `dist/` 前缀，下载至临时根下的 `dist/` 后，从临时根运行 `sha256sum -c dist/SHA256SUMS`。CI artifact 保留 14 天，tag 本身不长期保存二进制。
+
+## v0.5.8 容量治理
+
+网关与 executor 各有一个串行维护任务：启动 10 分钟后首轮，此后每小时运行。`config/bots.json` 的可选 `retention` 配置默认如下，`enabled: false` 同时停止保留清理和请求锁回收；非法或零保留值拒绝加载。冻结或退出后不开始新批次，当前事务提交或回滚；数据库忙则结束本轮。
+
+```json
+{"retention":{"enabled":true,"updates_per_bot":5000,"runs_days":30,"events_days":7,"requests_days":14,"placeholders_days":90,"expired_days":1}}
+```
+
+| 对象 | 默认清理条件及保护边界 |
+| --- | --- |
+| updates | 每机器人最新 5,000 条窗口之外的已知终态；保留 pending、running、uncertain、未知状态和去重水位 |
+| runs | 启动和可信完成时间均满 30 天的 ok／failed；保留每 job 最新启动时间的所有并列记录，关联 run_events、run-result 同事务删除 |
+| 孤儿 run-result | 每天按键分批扫描，确认 run 不存在才删除 |
+| events | 创建和更新时间均满 7 天的 delivered／failed／suppressed；保留 uncertain-summary、run_events 引用、部分回执、异常或未知结果 |
+| requests／triggers | 创建和完成更新均满 14 天，结果已补交且没有恢复输入；有不确定或缺少可信最终结果证据的记录保留，triggers 随请求同事务删除 |
+| 登录令牌／会话 | 已用令牌，或到期超过 1 天；会话到期超过 1 天 |
+| contexts | 有明确到期时间且到期超过 1 天；`expires_at=0` 的长期上下文保留 |
+
+每批扫描至多 500 个主记录，每轮每类至多删除 20,000 个、扫描 50,000 个候选；提交后让出 50 ms。游标跨轮保留，已保护的前缀不会阻塞后面的记录。单批关联记录上限为 5,000，过大的关联组保留并报短码。完成缓冲非空时，events／updates 清理暂缓，保留后台补交仍需核对的正文。进程重启从头扫描，不改变资格或重复执行任务。
+
+符合条件的 event 正文实际删除时，在同一事务写入 KV 占位记录，并从这时起再保护 90 天，通常总保护期至少约 97 天。占位记录只留模块与机器人归属、终态、必要时间、最小回执以及完整 SHA-256 摘要，不留正文、按钮文字、附件路径或任意错误字符串。后续修改配置不会缩短已写到期时间。
+
+`delivery.submit/get/cancel/clear_buttons` 识别有效占位：重复提交仍返回原终态，不再次投递；返回字段结构不变，但 receipt 为最小回执，非空 error 为 `retained_terminal`。取消墓碑仍阻止迟到提交。`delivery.lookup` 只查真实 events，需要正文的受保护历史记录仍可能返回。占位到期立即失效，不等待物理清理；原 event 也不存在时同一 ID 才能成为新事件。损坏占位拒绝操作。
+
+过期或失去归属依据的按钮只收到不带文字的 Telegram 空应答，以停止客户端转圈；不调用模块、不发送提示或回复。有效按钮仍须通过原有模块签名及业务校验，90 天占位不保证业务记录一直有效。
+
+请求锁只回收 `dispatch-<64位小写十六进制>.lock` 和 `request-<64位小写十六进制>.lock`。已知请求完成满 24 小时才具备资格；孤儿的 mtime、ctime 都须满 24 小时。每批最多检查 1,000 个目录项、让出 500 ms，每轮最多 50,000 项，跨轮继续扫描。普通文件、属主、权限、长度、链接数、flock 及取得锁后的路径身份均须通过；被持有或不安全的文件保留。其它锁、socket、`run/invocations/` 不参与回收。
+
+`diagnostics.metrics.storage` 中 database／wal／run_dir 各自给出 bytes 和错误短码；目录字节数是目录自身 stat 大小，目录项数来自低频回收扫描，附扫描起止时间，扣除本次实际删除项，扫描期间的外部变化不构成原子快照。未采样或读取失败为 null／短码。`metrics.retention` 提供清理状态、各对象删除数、占位写入数、批次数、最慢批次耗时、安全短码及占位命中数。executor 的对应结果在 `tasks.metrics.storage`，文件大小至多每分钟采样；诊断和两秒摘要不遍历目录。进程内计数重启清零。
+
+Command 空 claim 同样采用 0.5、1、2 秒退避。进程内 pending update 提交按 bot／lane 唤醒，纯 offset 或重复记录不唤醒；外部写入由最多 2 秒兜底发现，另计数据库等待与执行时间。`metrics.optimization` 增加 `command_empty_claims`、`command_wakeups`，后者仅计通知实际结束空闲等待。
+
+数据库变化限于六个索引：executor 的 `requests_state_created`、`requests_created`、`triggers_request`，网关的 `updates_pending`、`events_receipt_last`、`events_receipt_one`。查找表达式与索引一致，保留归属限制和 latest runs 并列结果；损坏 JSON 等错误不会通过删除数据来规避。
+
+删行形成可复用页，回收锁文件降低 inode 占用，两者都不保证文件或目录立即缩小。维护窗口中的 VACUUM 须在排空、停核心服务、私有一致性备份及索引创建后，由各数据库属主执行；每库至多一次、120 秒超时，锁竞争或空间不足则跳过，失败后核查完整性和 sidecar 权限，禁止手删 WAL／SHM。首次自动清理仍在新版启动 10 分钟后，因此此前 VACUUM 不会回收尚未删除的数据。锁数量、清理用时及容量预测只作估计；不自动 VACUUM 或重建运行目录。
