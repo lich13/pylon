@@ -15,6 +15,8 @@ pub(crate) struct Metrics {
     pub reload_skipped: AtomicU64,
     pub completion_scans: AtomicU64,
     pub delivery_empty_claims: AtomicU64,
+    pub command_empty_claims: AtomicU64,
+    pub command_wakeups: AtomicU64,
 }
 impl Metrics {
     pub fn snapshot(&self) -> Value {
@@ -23,6 +25,8 @@ impl Metrics {
             "reload_skipped": self.reload_skipped.load(Ordering::Relaxed),
             "completion_scans": self.completion_scans.load(Ordering::Relaxed),
             "delivery_empty_claims": self.delivery_empty_claims.load(Ordering::Relaxed),
+            "command_empty_claims": self.command_empty_claims.load(Ordering::Relaxed),
+            "command_wakeups": self.command_wakeups.load(Ordering::Relaxed),
         })
     }
 }
@@ -46,13 +50,25 @@ impl Wake {
 pub(crate) struct Runtime {
     pub metrics: Metrics,
     pub completion: Wake,
-    deliveries: Mutex<BTreeMap<(String, bool), Weak<Wake>>>,
+    deliveries: Mutex<BTreeMap<(String, Lane), Weak<Wake>>>,
+    pub retention: crate::retention::Metrics,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum Lane {
+    Telegram,
+    Bark,
+    Command,
+}
+impl Lane {
+    pub fn delivery(bark: bool) -> Self {
+        if bark { Self::Bark } else { Self::Telegram }
+    }
 }
 impl Runtime {
-    pub fn delivery_listener(&self, bot: &str, bark: bool) -> (Arc<Wake>, watch::Receiver<u64>) {
+    pub fn delivery_listener(&self, bot: &str, lane: Lane) -> (Arc<Wake>, watch::Receiver<u64>) {
         let mut deliveries = self.deliveries.lock().unwrap_or_else(|e| e.into_inner());
         deliveries.retain(|_, value| value.strong_count() > 0);
-        let entry = deliveries.entry((bot.to_owned(), bark)).or_default();
+        let entry = deliveries.entry((bot.to_owned(), lane)).or_default();
         let wake = entry.upgrade().unwrap_or_default();
         *entry = Arc::downgrade(&wake);
         let receiver = wake.subscribe();
@@ -60,12 +76,12 @@ impl Runtime {
     }
     // Notification failure must never change a committed result. Missing listeners
     // claim at startup; other Store instances/processes use the bounded timer.
-    pub fn delivery_ready(&self, bot: &str, bark: bool) {
+    pub fn delivery_ready(&self, bot: &str, lane: Lane) {
         let wake = self
             .deliveries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&(bot.to_owned(), bark))
+            .get(&(bot.to_owned(), lane))
             .and_then(Weak::upgrade);
         if let Some(wake) = wake {
             wake.notify();

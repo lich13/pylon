@@ -261,6 +261,9 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
             );
             let bot = bot.to_owned();
             drop(snapshot);
+            if let Some(event) = app.store.retained_submit(module, p)? {
+                return Ok(event);
+            }
             if p["kind"] == "document" {
                 let path = std::path::Path::new(
                     p["payload"]["path"]
@@ -275,10 +278,8 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
                 );
             }
             if p["kind"] == "bark" {
-                // Reconcile an already persisted event without depending on today's DNS.
-                if app.store.has_event(p["id"].as_str().unwrap_or(""))? {
-                    return app.store.submit(module, p, &bot);
-                }
+                // Retained and existing results were reconciled in one read
+                // snapshot above. An expired ID must validate a new destination.
                 crate::bark::validate(
                     p["payload"]["api_base"]
                         .as_str()
@@ -290,23 +291,23 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
         }
         "delivery.get" | "delivery.cancel" => {
             let id = p["id"].as_str().context("event id required")?;
-            if method == "delivery.cancel" && p["if_missing"] == true {
-                // A tombstone closes the race with an in-flight submit whose acknowledgement was lost.
-                app.store.connect()?.execute("INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'cancelled','text','{}','suppressed',0,0,?,?,?)",rusqlite::params![id,ctx["bot"].as_str().unwrap_or(""),crate::now(),crate::now(),module])?;
-            }
-            let event = app.store.event(id)?;
-            ensure!(event["module"] == module, "event belongs to another module");
             if method == "delivery.cancel" {
-                app.store.cancel(module, id)
+                app.store.cancel_or_insert(
+                    module,
+                    id,
+                    (p["if_missing"] == true).then(|| ctx["bot"].as_str().unwrap_or("")),
+                )
             } else {
+                let event = app.store.event(id)?;
+                ensure!(event["module"] == module, "event belongs to another module");
                 Ok(event)
             }
         }
         "delivery.lookup" => {
             let bot = ctx["bot"].as_str().context("bot missing")?;
             let db = app.store.connect()?;
-            let mut query=db.prepare("SELECT id,payload,receipt FROM events WHERE module=? AND profile=? AND receipt IS NOT NULL AND (json_extract(receipt,'$[#-1].message_id')=? OR json_extract(receipt,'$.message_id')=?) LIMIT 5")?;
-            let rows=query.query_map(rusqlite::params![module,bot,p["message_id"].as_i64(),p["message_id"].as_i64()],|r|Ok(json!({"id":r.get::<_,String>(0)?,"payload":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap_or(Value::Null),"receipt":serde_json::from_str::<Value>(&r.get::<_,String>(2)?).unwrap_or(Value::Null)})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            let mut query=db.prepare("SELECT id,payload,receipt FROM events WHERE id IN (SELECT id FROM events WHERE module=?1 AND profile=?2 AND receipt IS NOT NULL AND json_extract(receipt,'$[#-1].message_id')=?3 UNION SELECT id FROM events WHERE module=?1 AND profile=?2 AND receipt IS NOT NULL AND json_extract(receipt,'$.message_id')=?3) LIMIT 5")?;
+            let rows=query.query_map(rusqlite::params![module,bot,p["message_id"].as_i64()],|r|Ok(json!({"id":r.get::<_,String>(0)?,"payload":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap_or(Value::Null),"receipt":serde_json::from_str::<Value>(&r.get::<_,String>(2)?).unwrap_or(Value::Null)})))?.collect::<std::result::Result<Vec<_>,_>>()?;
             Ok(json!(rows))
         }
         "delivery.clear_buttons" => {
@@ -654,7 +655,7 @@ fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
     let deliveries=q.query_map([],|r|Ok(json!({"bot":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"count":r.get::<_,u64>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     let mut q=db.prepare("SELECT id,job_id,status,finished_at FROM runs WHERE status IN ('failed','uncertain') ORDER BY started_at DESC LIMIT 10")?;
     let failures=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"finished_at":r.get::<_,Option<f64>>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
-    let mut q=db.prepare("SELECT r.id,r.job_id,r.status,r.finished_at FROM runs r JOIN (SELECT job_id,max(started_at) AS started_at FROM runs GROUP BY job_id) latest ON r.job_id=latest.job_id AND r.started_at=latest.started_at")?;
+    let mut q=db.prepare("WITH RECURSIVE jobs(job) AS (SELECT min(job_id) FROM runs UNION ALL SELECT (SELECT min(job_id) FROM runs WHERE job_id>jobs.job) FROM jobs WHERE job IS NOT NULL) SELECT r.id,r.job_id,r.status,r.finished_at FROM jobs JOIN runs r ON r.job_id=jobs.job AND r.started_at=(SELECT max(started_at) FROM runs WHERE job_id=jobs.job)")?;
     let latest=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"finished_at":r.get::<_,Option<f64>>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     let bots=snapshot.settings.bots.iter().map(|(id,bot)|Ok(json!({"id":id,"enabled":bot.enabled,"connection":app.store.get(&format!("connection:{id}"))?,"menu":app.store.get(&format!("menu-state:{id}"))?}))).collect::<Result<Vec<_>>>()?;
     let tasks = crate::queue::public(&app.config);
@@ -686,7 +687,7 @@ fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
         .as_u64()
         .unwrap_or(0);
     let mut q = db.prepare(
-        "SELECT key,value FROM kv WHERE key LIKE 'worker:%' OR key LIKE 'delivery-timing:%'",
+        "SELECT key,value FROM kv WHERE (key>='worker:' AND key<'worker;') OR (key>='delivery-timing:' AND key<'delivery-timing;')",
     )?;
     let worker_metrics = q
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -696,7 +697,9 @@ fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
         .collect::<std::collections::BTreeMap<_, _>>();
     let (proxy_invalid, response_invalid) = crate::telegram::invalid_responses();
     let completions_pending = crate::completion::pending_count(&app.store.path)?;
+    let storage = crate::retention::gateway_storage(&app.config);
+    let retention = app.store.runtime.retention.snapshot();
     Ok(
-        json!({"api_version":2,"metrics":{"optimization":app.store.runtime.metrics.snapshot(),"sqlite_busy":crate::db::busy_count(),"telegram_proxy_invalid":proxy_invalid,"telegram_response_invalid":response_invalid,"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"completions_pending":completions_pending,"sampled_at":crate::now(),"maintenance":app.config.home.join("run/freeze").exists(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
+        json!({"api_version":2,"metrics":{"storage":storage,"retention":retention,"optimization":app.store.runtime.metrics.snapshot(),"sqlite_busy":crate::db::busy_count(),"telegram_proxy_invalid":proxy_invalid,"telegram_response_invalid":response_invalid,"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"completions_pending":completions_pending,"sampled_at":crate::now(),"maintenance":app.config.home.join("run/freeze").exists(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
     )
 }

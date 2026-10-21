@@ -27,6 +27,8 @@ fn yes() -> bool {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default)]
+    pub retention: crate::retention::Policy,
     #[serde(default = "default_web_port")]
     pub web_port: u16,
     #[serde(default = "default_ip_family")]
@@ -92,6 +94,7 @@ impl Config {
     }
     pub(crate) fn settings_from_bytes(&self, bytes: &[u8]) -> Result<Settings> {
         let s: Settings = serde_json::from_slice(bytes)?;
+        s.retention.validate()?;
         ensure!(s.web_port > 0, "invalid web port");
         ensure!(
             ["ipv4", "ipv6", "auto"].contains(&s.telegram_ip_family.as_str()),

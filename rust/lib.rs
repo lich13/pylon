@@ -9,11 +9,14 @@ pub mod daemon;
 pub mod db;
 pub mod downgrade;
 pub mod errors;
+mod event_history;
+mod lock_reaper;
 pub mod migration;
 pub mod modules;
 mod optimization;
 pub mod queue;
 mod reload;
+mod retention;
 pub mod runtime;
 pub mod telegram;
 

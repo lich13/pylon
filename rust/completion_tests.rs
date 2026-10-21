@@ -223,7 +223,9 @@ fn malformed_records_and_temporary_files_are_never_mistaken_for_idle() {
 async fn pending_and_command_completion_commit_before_delivery_wakes() {
     let (_temp, store) = new_store();
     let event = claim_delivery(&store, "retry");
-    let (_wake, mut changed) = store.runtime.delivery_listener("fixture-bot", false);
+    let (_wake, mut changed) = store
+        .runtime
+        .delivery_listener("fixture-bot", crate::optimization::Lane::Telegram);
     let path = stage(&store, delivery_record(&event, "pending", json!([])))
         .await
         .unwrap();

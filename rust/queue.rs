@@ -72,7 +72,10 @@ pub fn connect(config: &Config) -> Result<crate::db::PooledConnection> {
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
         CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY,job_id TEXT NOT NULL,module TEXT NOT NULL,topic TEXT NOT NULL,model INTEGER NOT NULL,state TEXT NOT NULL,created_at REAL NOT NULL,updated_at REAL NOT NULL,execution_status TEXT,completion_status TEXT,detail TEXT NOT NULL DEFAULT '',report TEXT,token TEXT,owner INTEGER,completion_input TEXT);
         CREATE UNIQUE INDEX IF NOT EXISTS waiting_task ON requests(job_id) WHERE state='queued';
-        CREATE TABLE IF NOT EXISTS triggers(id TEXT PRIMARY KEY,request_id TEXT NOT NULL);")?;
+        CREATE TABLE IF NOT EXISTS triggers(id TEXT PRIMARY KEY,request_id TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS requests_state_created ON requests(state,created_at);
+        CREATE INDEX IF NOT EXISTS requests_created ON requests(created_at);
+        CREATE INDEX IF NOT EXISTS triggers_request ON triggers(request_id);")?;
     initialized.insert(path, identity);
     Ok(db)
 }
@@ -128,6 +131,11 @@ pub fn admit(
 pub fn state(config: &Config, id: &str) -> Result<String> {
     Ok(connect(config)?.query_row("SELECT state FROM requests WHERE id=?", [id], |r| r.get(0))?)
 }
+pub(crate) fn optional_state(config: &Config, id: &str) -> Result<Option<String>> {
+    Ok(connect(config)?
+        .query_row("SELECT state FROM requests WHERE id=?", [id], |r| r.get(0))
+        .optional()?)
+}
 pub fn summary(config: &Config) -> Result<()> {
     let result = summary_inner(config, false, None);
     if result.is_err() {
@@ -153,7 +161,10 @@ fn summary_inner(config: &Config, force: bool, metrics: Option<Value>) -> Result
     if !force && (0.0..1.0).contains(&(now() - previous["updated_at"].as_f64().unwrap_or(0.0))) {
         return Ok(());
     }
-    let mut q=db.prepare("SELECT id,job_id,module,state,created_at,updated_at,execution_status,completion_status,owner FROM requests WHERE state!='completed' OR updated_at>? ORDER BY created_at DESC LIMIT 200")?;
+    // In a quiet mailbox the created_at index would fetch every table row to
+    // evaluate updated_at. Keep filtering sequential; unary + preserves the
+    // value ordering without fetching table rows in index order.
+    let mut q=db.prepare("SELECT id,job_id,module,state,created_at,updated_at,execution_status,completion_status,owner FROM requests WHERE state!='completed' OR updated_at>? ORDER BY +created_at DESC LIMIT 200")?;
     let rows=q.query_map([now()-86400.0], |r| Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"module":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"created_at":r.get::<_,f64>(4)?,"updated_at":r.get::<_,f64>(5)?,"execution_status":r.get::<_,Option<String>>(6)?,"completion_status":r.get::<_,Option<String>>(7)?,"owner":r.get::<_,Option<u32>>(8)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     let (queued, oldest): (u64, Option<f64>) = db.query_row(
         "SELECT count(*),min(created_at) FROM requests WHERE state='queued'",
@@ -161,7 +172,22 @@ fn summary_inner(config: &Config, force: bool, metrics: Option<Value>) -> Result
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let totals = json!({"queued_count":queued,"oldest_queued_at":oldest});
-    let metrics = metrics.unwrap_or_else(|| previous["metrics"].clone());
+    let refresh_storage = metrics.is_some() || previous["metrics"]["storage"].is_null();
+    let mut metrics = metrics.unwrap_or_else(|| previous["metrics"].clone());
+    if !metrics.is_object() {
+        metrics = json!({});
+    }
+    if refresh_storage {
+        let mut storage = crate::retention::executor_storage(config);
+        // Short-lived execute/report processes must not erase the supervisor's
+        // last low-frequency observations when publishing a request transition.
+        for field in ["retention", "locks"] {
+            if storage[field].is_null() {
+                storage[field] = previous["metrics"]["storage"][field].clone();
+            }
+        }
+        metrics["storage"] = storage;
+    }
     if previous["updated_at"].is_number()
         && previous["requests"] == json!(rows)
         && previous["metrics"] == metrics
@@ -210,45 +236,42 @@ pub async fn dispatch(config: &Config) -> Result<()> {
 async fn dispatch_inner(config: &Config) -> Result<()> {
     let rows = {
         let db = connect(config)?;
-        let mut q=db.prepare("SELECT id,job_id,state,token,execution_status FROM requests WHERE state IN ('queued','running','completing','reporting') ORDER BY created_at,id")?;
-        q.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<String>>(4)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?
+        // Mutable state and recovery fields are re-read after acquiring locks.
+        let mut q=db.prepare("SELECT id,job_id FROM requests WHERE state IN ('queued','running','completing','reporting') ORDER BY created_at,id")?;
+        q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
     };
-    for (id, job, _, _, _) in rows {
-        let dispatch_lock = crate::runtime::open_task_lock(
+    for (id, job) in rows {
+        let Some(dispatch_lock) = crate::runtime::acquire_task_lock(
             &config
                 .home
                 .join("run")
                 .join(format!("dispatch-{}.lock", crate::digest(&id))),
-        )?;
-        if !crate::runtime::try_lock(&dispatch_lock)? {
+        )?
+        else {
             continue;
-        }
+        };
         // An OS lock, not a PID/age heuristic, owns an active invocation.
-        let lock = crate::runtime::open_task_lock(
+        let Some(lock) = crate::runtime::acquire_task_lock(
             &config
                 .home
                 .join("run")
                 .join(format!("request-{}.lock", crate::digest(&id))),
-        )?;
-        if !crate::runtime::try_lock(&lock)? {
+        )?
+        else {
             continue;
-        }
+        };
         // The owner may have completed after the scan. Re-read while holding its lock.
-        let (state, token, execution_status): (String, Option<String>, Option<String>) =
-            connect(config)?.query_row(
+        let state: Option<(String, Option<String>, Option<String>)> = connect(config)?
+            .query_row(
                 "SELECT state,token,execution_status FROM requests WHERE id=?",
                 [&id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
+            )
+            .optional()?;
+        let Some((state, token, execution_status)) = state else {
+            continue;
+        };
         if state == "completed" || state == "uncertain" {
             continue;
         }

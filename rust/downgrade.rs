@@ -30,7 +30,7 @@ pub fn check(config: &Config, target: &str) -> Report {
         completions_pending: None,
         reason: None,
     };
-    if !matches!(target, "0.5.3" | "0.5.4" | "0.5.5" | "0.5.6") {
+    if !matches!(target, "0.5.3" | "0.5.4" | "0.5.5" | "0.5.6" | "0.5.7") {
         report.reason = Some("unsupported_target");
         return report;
     }
@@ -67,6 +67,13 @@ fn inspect(
     let (_lock, db) = read_only_state(&path)?;
     db.busy_timeout(Duration::from_secs(1))?;
     db.execute_batch("PRAGMA query_only=ON; BEGIN;")?;
+    let mut history = db.prepare("SELECT key,value FROM kv WHERE (key>='event-gone:' AND key<'event-gone;') OR (key>='event-gone-msg:' AND key<'event-gone-msg;')")?;
+    for row in history.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (key, raw) = row?;
+        if crate::event_history::expires(&key, &raw)? > crate::now() {
+            return Ok(Some("retained_events_require_newer_gateway"));
+        }
+    }
     let counter = state(&db, "uncertain:counter:v2")?;
     let retired = state(&db, "uncertain:counter:v2:retired")?;
     for counter in counter.iter().chain(retired.iter()) {

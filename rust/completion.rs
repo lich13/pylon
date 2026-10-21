@@ -417,7 +417,9 @@ fn apply(store: &Store, path: &Path, recovering: bool) -> Result<()> {
     }
     tx.commit()?;
     if let Some((bot, bark)) = ready {
-        store.runtime.delivery_ready(&bot, bark);
+        store
+            .runtime
+            .delivery_ready(&bot, crate::optimization::Lane::delivery(bark));
     }
     // Keep partial checkpoints until the next outcome or reconciliation. A
     // blocking writer may finish after its async waiter times out; deleting this

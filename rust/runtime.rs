@@ -69,6 +69,33 @@ pub(crate) fn open_task_lock(path: &Path) -> Result<File> {
     anyhow::bail!("task lock changed repeatedly during open")
 }
 
+pub(crate) fn task_lock_current(path: &Path, file: &File) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let actual = file.metadata()?;
+    let expected = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(actual.is_file()
+        && expected.is_file()
+        && actual.dev() == expected.dev()
+        && actual.ino() == expected.ino())
+}
+pub(crate) fn acquire_task_lock(path: &Path) -> Result<Option<File>> {
+    for _ in 0..4 {
+        let file = open_task_lock(path)?;
+        if !try_lock(&file)? {
+            return Ok(None);
+        }
+        if task_lock_current(path, &file)? {
+            return Ok(Some(file));
+        }
+        // Drop the lock and descriptor before retrying the current pathname.
+    }
+    anyhow::bail!("task lock changed repeatedly during acquisition")
+}
+
 pub fn inherited_dispatch_lock(
     config: &Config,
     run: &str,
@@ -89,7 +116,7 @@ pub fn inherited_dispatch_lock(
         .join("run")
         .join(format!("dispatch-{}.lock", crate::digest(run)));
     let actual = file.metadata()?;
-    let expected = fs::symlink_metadata(path)?;
+    let expected = fs::symlink_metadata(&path)?;
     ensure!(
         actual.is_file()
             && expected.is_file()
@@ -98,6 +125,10 @@ pub fn inherited_dispatch_lock(
         "dispatch descriptor identity mismatch"
     );
     ensure!(try_lock(&file)?, "dispatch lock is held by another process");
+    ensure!(
+        task_lock_current(&path, &file)?,
+        "dispatch descriptor identity mismatch"
+    );
     ensure!(
         unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } >= 0,
         "cannot protect dispatch descriptor"
@@ -614,7 +645,10 @@ pub async fn executor(config: Config) -> Result<()> {
         }
     });
     let closing = config.clone();
-    axum::serve(
+    let (maintenance_stop, maintenance_rx) = tokio::sync::watch::channel(false);
+    let maintenance_task = tokio::spawn(crate::retention::executor(config.clone(), maintenance_rx));
+    let stopping = maintenance_stop.clone();
+    let result = axum::serve(
         listener,
         Router::new()
             .route("/invoke", post(handle))
@@ -626,13 +660,17 @@ pub async fn executor(config: Config) -> Result<()> {
         {
             tokio::select! {_=signal.recv()=>{},_=tokio::signal::ctrl_c()=>{}}
         }
+        let _ = stopping.send(true);
         if let Err(error) = crate::blocking(move || crate::queue::summary_flush(&closing)).await {
             crate::errors::log("summary-shutdown", &error)
         }
     })
-    .await?;
+    .await;
+    let _ = maintenance_stop.send(true);
+    maintenance_task.abort();
     summary_task.abort();
     dispatch_task.abort();
+    result?;
     Ok(())
 }
 pub async fn execute(config: &Config, id: &str) -> Result<i32> {
@@ -653,22 +691,24 @@ pub async fn execute(config: &Config, id: &str) -> Result<i32> {
         &trigger,
     )?;
     let code = resume(config, &run).await?;
-    if crate::queue::state(config, &run)? == "queued" {
+    if crate::queue::optional_state(config, &run)?.as_deref() == Some("queued") {
         println!("{}", json!({"task":id,"status":"queued","request_id":run}));
     }
     Ok(code)
 }
 pub async fn resume(config: &Config, run: &str) -> Result<i32> {
-    let request_lock = open_task_lock(
+    let Some(_request_lock) = acquire_task_lock(
         &config
             .home
             .join("run")
             .join(format!("request-{}.lock", crate::digest(run))),
-    )?;
-    if !try_lock(&request_lock)? {
+    )?
+    else {
         return Ok(0);
-    }
-    if crate::queue::state(config, run)? != "queued" || config.home.join("run/freeze").exists() {
+    };
+    if crate::queue::optional_state(config, run)?.as_deref() != Some("queued")
+        || config.home.join("run/freeze").exists()
+    {
         return Ok(0);
     }
     let db = crate::queue::connect(config)?;

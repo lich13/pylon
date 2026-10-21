@@ -28,13 +28,16 @@ fn date_keys_cover_utc8_midnight_month_year_and_leap_day() {
 #[tokio::test(start_paused = true)]
 async fn notification_generation_survives_the_gap_before_wait_and_is_scoped() {
     let runtime = Runtime::default();
-    let (wake, mut telegram) = runtime.delivery_listener("one", false);
-    let (_bark_wake, bark) = runtime.delivery_listener("one", true);
-    let (_other_wake, other) = runtime.delivery_listener("two", false);
+    let (wake, mut telegram) =
+        runtime.delivery_listener("one", crate::optimization::Lane::Telegram);
+    let (_bark_wake, bark) = runtime.delivery_listener("one", crate::optimization::Lane::Bark);
+    let (_other_wake, other) =
+        runtime.delivery_listener("two", crate::optimization::Lane::Telegram);
     let isolated = Runtime::default();
-    let (_isolated_wake, isolated_rx) = isolated.delivery_listener("one", false);
+    let (_isolated_wake, isolated_rx) =
+        isolated.delivery_listener("one", crate::optimization::Lane::Telegram);
     telegram.borrow_and_update();
-    runtime.delivery_ready("one", false);
+    runtime.delivery_ready("one", crate::optimization::Lane::Telegram);
     // This notification happened before changed() was polled.
     tokio::time::timeout(Duration::from_millis(1), telegram.changed())
         .await
@@ -45,15 +48,20 @@ async fn notification_generation_survives_the_gap_before_wait_and_is_scoped() {
     assert!(!isolated_rx.has_changed().unwrap());
     drop(wake);
     assert!(telegram.changed().await.is_err());
-    let (_replacement_wake, replacement) = runtime.delivery_listener("one", false);
+    let (_replacement_wake, replacement) =
+        runtime.delivery_listener("one", crate::optimization::Lane::Telegram);
     assert!(!replacement.has_changed().unwrap());
 }
 
 #[test]
 fn all_committed_event_sources_wake_their_delivery_lane() {
     let (_temp, store) = store();
-    let (_wake, mut telegram) = store.runtime.delivery_listener("fixture", false);
-    let (_bark_wake, mut bark) = store.runtime.delivery_listener("fixture", true);
+    let (_wake, mut telegram) = store
+        .runtime
+        .delivery_listener("fixture", crate::optimization::Lane::Telegram);
+    let (_bark_wake, mut bark) = store
+        .runtime
+        .delivery_listener("fixture", crate::optimization::Lane::Bark);
     let event = json!({"id":"event","kind":"text","payload":{"text":"fixture"}});
     store.clone().submit("fixture", &event, "fixture").unwrap();
     assert!(telegram.has_changed().unwrap());

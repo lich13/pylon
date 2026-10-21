@@ -10,6 +10,10 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, time::Duration};
 use tokio::sync::watch;
 
+#[cfg(test)]
+#[path = "daemon_retention_tests.rs"]
+mod retention_tests;
+
 /// Unlike a bare JoinHandle, dropping this owner cancels its async child.
 struct Child<T>(tokio::task::JoinHandle<T>);
 impl<T> std::ops::Deref for Child<T> {
@@ -101,6 +105,7 @@ pub fn save_updates(app: &App, id: &str, bot: &Bot, updates: &[Value]) -> Result
         .unwrap_or(0.0);
     let mut db = app.store.connect()?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut inserted = false;
     for update in updates {
         let uid = update["update_id"].as_i64().context("invalid update")?;
         let callback = &update["callback_query"];
@@ -133,7 +138,7 @@ pub fn save_updates(app: &App, id: &str, bot: &Bot, updates: &[Value]) -> Result
             } else {
                 payload
             };
-            tx.execute("INSERT OR IGNORE INTO updates(profile,update_id,payload,kind,chat_id,message_id) VALUES(?,?,?,?,?,?)",params![id,uid,payload.to_string(),kind,bot.owner,message["message_id"].as_i64()])?;
+            inserted |= tx.execute("INSERT OR IGNORE INTO updates(profile,update_id,payload,kind,chat_id,message_id) VALUES(?,?,?,?,?,?)",params![id,uid,payload.to_string(),kind,bot.owner,message["message_id"].as_i64()])? > 0;
         }
     }
     if let Some(offset) = updates.iter().filter_map(|u| u["update_id"].as_i64()).max() {
@@ -143,6 +148,11 @@ pub fn save_updates(app: &App, id: &str, bot: &Bot, updates: &[Value]) -> Result
         )?;
     }
     tx.commit()?;
+    if inserted {
+        app.store
+            .runtime
+            .delivery_ready(id, crate::optimization::Lane::Command);
+    }
     Ok(())
 }
 async fn invoke(
@@ -390,6 +400,11 @@ async fn command_once_with_stop(
         Ok(row)
     }).await?;
     let Some((uid, kind, payload)) = row else {
+        app.store
+            .runtime
+            .metrics
+            .command_empty_claims
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(false);
     };
     let initial = crate::completion::Completion::command(
@@ -420,10 +435,31 @@ async fn command_once_with_stop(
         }
     }
     let mut contexts = Vec::new();
+    let callback_owned = if kind == "callback_query" && !message.is_null() {
+        let owner = app
+            .snapshot
+            .read()
+            .await
+            .settings
+            .bots
+            .get(id)
+            .context("bot missing")?
+            .owner
+            .clone();
+        let bot = id.to_owned();
+        let query = message.clone();
+        app.store
+            .blocking(move |store| store.own_callback(&bot, &owner, &query))
+            .await?
+    } else {
+        true
+    };
     let result = if *stop.borrow() {
         Err(crate::errors::ReconcileRequired.into())
     } else if message.is_null() {
         Err(anyhow::anyhow!("stored update is invalid"))
+    } else if !callback_owned {
+        Ok(Value::Null)
     } else {
         let request_id = format!("telegram:{id}:{uid}");
         let result = tokio::select! {
@@ -530,13 +566,13 @@ async fn lane_once(
                 }
             }
         }
-        "command" => Ok(LaneOutcome::Wait(
+        "command" => Ok(
             if command_once_with_stop(&app, &id, &tg, &mut stop).await? {
-                0.0
+                LaneOutcome::Worked(0.0)
             } else {
-                0.5
+                LaneOutcome::Empty(None)
             },
-        )),
+        ),
         "menu" => {
             let result = tokio::select! {
                 biased;
@@ -638,8 +674,12 @@ async fn bot_worker_client(
         lanes.spawn(async move {
             let mut failures = 0_u32;
             let mut idle = crate::optimization::Idle::default();
-            let listener = matches!(lane, "telegram" | "bark")
-                .then(|| app.store.runtime.delivery_listener(&id, lane == "bark"));
+            let listener = match lane {
+                "telegram" => Some(crate::optimization::Lane::Telegram),
+                "bark" => Some(crate::optimization::Lane::Bark),
+                "command" => Some(crate::optimization::Lane::Command),
+                _ => None,
+            }.map(|lane| app.store.runtime.delivery_listener(&id, lane));
             let (_wake, mut changed) = match listener {
                 Some((wake, changed)) => (Some(wake), Some(changed)),
                 None => (None, None),
@@ -695,7 +735,10 @@ async fn bot_worker_client(
                     if let Some(changed) = &mut changed {
                         tokio::select! {
                             _ = stop.changed() => true,
-                            _ = changed.changed() => false,
+                            _ = changed.changed() => {
+                                if lane == "command" { app.store.runtime.metrics.command_wakeups.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                                false
+                            },
                             _ = tokio::time::sleep(Duration::from_secs_f64(delay)) => *stop.borrow(),
                         }
                     } else { pause(&mut stop, delay).await }
@@ -777,6 +820,10 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
     }));
     let journal_store = app.store.clone();
     let reconciler = Child(tokio::spawn(crate::completion::run(journal_store)));
+    let maintenance = Child(tokio::spawn(crate::retention::gateway(
+        app.clone(),
+        stopping.clone(),
+    )));
     let mut rejected = app
         .store
         .blocking(|s| s.get("configuration-rejected"))
@@ -944,6 +991,7 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
     rpc.abort();
     web.abort();
     reconciler.abort();
+    maintenance.abort();
     let bot_ids = workers.keys().cloned().collect::<Vec<_>>();
     for (_, stop, _) in workers.values() {
         let _ = stop.send(true);

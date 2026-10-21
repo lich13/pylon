@@ -113,7 +113,8 @@ impl Store {
         }
         tx.commit()?;
         for (bot, _, _) in interrupted {
-            self.runtime.delivery_ready(&bot, false);
+            self.runtime
+                .delivery_ready(&bot, crate::optimization::Lane::Telegram);
         }
         Ok(())
     }
@@ -148,7 +149,8 @@ impl Store {
         tx.execute("INSERT INTO kv VALUES('uncertain:counter:v2',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [counter.to_string()])?;
         tx.commit()?;
         if inserted {
-            self.runtime.delivery_ready(target, false);
+            self.runtime
+                .delivery_ready(target, crate::optimization::Lane::Telegram);
         }
         Ok(())
     }
@@ -164,7 +166,8 @@ impl Store {
         }
         tx.commit()?;
         if let Some(target) = target {
-            self.runtime.delivery_ready(target, false);
+            self.runtime
+                .delivery_ready(target, crate::optimization::Lane::Telegram);
         }
         Ok(())
     }
@@ -190,16 +193,59 @@ impl Store {
         )?;
         tx.commit()?;
         if reply["text"].as_str().is_some_and(|s| !s.is_empty()) {
-            self.runtime.delivery_ready(bot, false);
+            self.runtime
+                .delivery_ready(bot, crate::optimization::Lane::Telegram);
         }
         Ok(())
     }
     pub fn has_event(&self, id: &str) -> Result<bool> {
-        Ok(self.connect()?.query_row(
+        let db = self.connect()?;
+        let exists: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM events WHERE id=?)",
             [id],
             |r| r.get(0),
-        )?)
+        )?;
+        Ok(exists || self.history(&db, id)?.is_some())
+    }
+    fn history(&self, db: &Connection, id: &str) -> Result<Option<crate::event_history::Gone>> {
+        let gone = crate::event_history::read(db, id, crate::now())?;
+        if gone.is_some() {
+            self.runtime.retention.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(gone)
+    }
+    pub(crate) fn retained_submit(&self, module: &str, value: &Value) -> Result<Option<Value>> {
+        let mut db = self.connect()?;
+        let tx = db.transaction()?;
+        let id = value["id"].as_str().context("event id required")?;
+        ensure!(crate::identifier(id) && id.len() <= 64, "invalid event id");
+        ensure!(
+            matches!(value["kind"].as_str(), Some("text" | "document" | "bark")),
+            "invalid event kind"
+        );
+        if let Some(gone) = self.history(&tx, id)? {
+            gone.verify_submit(module, &value["payload"])?;
+            return Ok(Some(gone.result()));
+        }
+        if value["kind"] == "bark" {
+            let existing: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT module,payload,job_id FROM events WHERE id=?",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((owner, payload, job)) = existing {
+                ensure!(owner == module, "event belongs to another module");
+                ensure!(
+                    job == "cancelled"
+                        || serde_json::from_str::<Value>(&payload)? == value["payload"],
+                    "event id already has different content"
+                );
+                return self.event_on(&tx, id);
+            }
+        }
+        Ok(None)
     }
     pub fn submit(&self, module: &str, value: &Value, bot: &str) -> Result<Value> {
         let id = value["id"].as_str().context("event id required")?;
@@ -226,31 +272,64 @@ impl Store {
                 job == "cancelled" || original == value["payload"],
                 "event id already has different content"
             );
+        } else if let Some(gone) = self.history(&tx, id)? {
+            gone.verify_submit(module, &value["payload"])?;
+            return Ok(gone.result());
         } else {
+            crate::event_history::remove_expired(&tx, id, crate::now())?;
             tx.execute("INSERT INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,?,?,?,'pending',0,?,?,?,?)",
                 params![id,bot,value["job_id"].as_str().unwrap_or("manual"),kind,value["payload"].to_string(),value["next_attempt"].as_f64().unwrap_or(0.0),value["created_at"].as_f64().unwrap_or(crate::now()),crate::now(),module])?;
         }
         tx.commit()?;
         if inserted {
-            self.runtime.delivery_ready(bot, kind == "bark");
+            self.runtime
+                .delivery_ready(bot, crate::optimization::Lane::delivery(kind == "bark"));
         }
         self.event(id)
     }
     pub fn event(&self, id: &str) -> Result<Value> {
-        self.connect()?.query_row("SELECT id,profile,status,attempts,next_attempt,updated_at,receipt,error,module FROM events WHERE id=?",[id],|r|{
+        let db = self.connect()?;
+        self.event_on(&db, id)?.context("unknown event")
+    }
+    fn event_on(&self, db: &Connection, id: &str) -> Result<Option<Value>> {
+        let event = db.query_row("SELECT id,profile,status,attempts,next_attempt,updated_at,receipt,error,module FROM events WHERE id=?",[id],|r|{
             let receipt:Option<String>=r.get(6)?;
             Ok(json!({"id":r.get::<_,String>(0)?,"profile":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"attempts":r.get::<_,i64>(3)?,"next_attempt":r.get::<_,f64>(4)?,"updated_at":r.get::<_,f64>(5)?,"receipt":receipt.and_then(|s|serde_json::from_str::<Value>(&s).ok()),"error":r.get::<_,Option<String>>(7)?,"module":r.get::<_,String>(8)?}))
-        }).optional()?.context("unknown event")
+        }).optional()?;
+        match event {
+            Some(event) => Ok(Some(event)),
+            None => Ok(self.history(db, id)?.map(|g| g.result())),
+        }
     }
     pub fn cancel(&self, module: &str, id: &str) -> Result<Value> {
-        let db = self.connect()?;
-        let current = self.event(id)?;
+        self.cancel_or_insert(module, id, None)
+    }
+    pub(crate) fn cancel_or_insert(
+        &self,
+        module: &str,
+        id: &str,
+        bot: Option<&str>,
+    ) -> Result<Value> {
+        let mut db = self.connect()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut current = self.event_on(&tx, id)?;
+        if current.is_none()
+            && let Some(bot) = bot
+        {
+            ensure!(crate::identifier(id) && id.len() <= 64, "invalid event id");
+            crate::event_history::remove_expired(&tx, id, crate::now())?;
+            tx.execute("INSERT INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'cancelled','text','{}','suppressed',0,0,?,?,?)",params![id,bot,crate::now(),crate::now(),module])?;
+            current = self.event_on(&tx, id)?;
+        }
+        let current = current.context("unknown event")?;
         ensure!(
             current["module"] == module,
             "event belongs to another module"
         );
-        db.execute("UPDATE events SET status='suppressed',error='cancelled before send',updated_at=? WHERE id=? AND status='pending' AND attempts=0 AND receipt IS NULL",params![crate::now(),id])?;
-        self.event(id)
+        tx.execute("UPDATE events SET status='suppressed',error='cancelled before send',updated_at=? WHERE id=? AND status='pending' AND attempts=0 AND receipt IS NULL",params![crate::now(),id])?;
+        let result = self.event_on(&tx, id)?.context("unknown event")?;
+        tx.commit()?;
+        Ok(result)
     }
     pub fn claim(&self, bot: &str) -> Result<Option<Value>> {
         self.claim_lane(bot, None)
@@ -329,7 +408,8 @@ impl Store {
         };
         tx.commit()?;
         if let Some((bot, bark)) = lane {
-            self.runtime.delivery_ready(&bot, bark);
+            self.runtime
+                .delivery_ready(&bot, crate::optimization::Lane::delivery(bark));
         }
         Ok(())
     }
@@ -345,8 +425,8 @@ impl Store {
             return Ok(false);
         };
         let db = self.connect()?;
-        let mut stmt=db.prepare("SELECT payload,receipt FROM events WHERE profile=? AND receipt IS NOT NULL AND (json_extract(receipt,'$[#-1].message_id')=? OR json_extract(receipt,'$.message_id')=?)")?;
-        for row in stmt.query_map(params![bot, mid, mid], |r| {
+        let mut stmt=db.prepare("SELECT payload,receipt FROM events WHERE id IN (SELECT id FROM events WHERE profile=?1 AND receipt IS NOT NULL AND json_extract(receipt,'$[#-1].message_id')=?2 UNION SELECT id FROM events WHERE profile=?1 AND receipt IS NOT NULL AND json_extract(receipt,'$.message_id')=?2)")?;
+        for row in stmt.query_map(params![bot, mid], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })? {
             let (p, r) = row?;
@@ -369,7 +449,11 @@ impl Store {
                 return Ok(true);
             }
         }
-        Ok(false)
+        let owned = crate::event_history::owns(&db, bot, owner, mid, &query["data"], crate::now())?;
+        if owned {
+            self.runtime.retention.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(owned)
     }
 }
 
