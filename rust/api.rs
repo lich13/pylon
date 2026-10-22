@@ -699,7 +699,23 @@ fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
     let completions_pending = crate::completion::pending_count(&app.store.path)?;
     let storage = crate::retention::gateway_storage(&app.config);
     let retention = app.store.runtime.retention.snapshot();
+    let freeze_path = app.config.home.join("run/freeze");
+    let freeze_present = freeze_path.is_file();
+    let freeze_age_seconds = freeze_present
+        .then(|| {
+            std::fs::symlink_metadata(&freeze_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|modified| {
+                    std::time::SystemTime::now()
+                        .duration_since(modified)
+                        .unwrap_or_default()
+                        .as_secs()
+                })
+        })
+        .flatten();
+    let freeze_alert = app.store.get("freeze-alert:last")?;
     Ok(
-        json!({"api_version":2,"metrics":{"storage":storage,"retention":retention,"optimization":app.store.runtime.metrics.snapshot(),"sqlite_busy":crate::db::busy_count(),"telegram_proxy_invalid":proxy_invalid,"telegram_response_invalid":response_invalid,"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"completions_pending":completions_pending,"sampled_at":crate::now(),"maintenance":app.config.home.join("run/freeze").exists(),"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
+        json!({"api_version":2,"metrics":{"storage":storage,"retention":retention,"optimization":app.store.runtime.metrics.snapshot(),"sqlite_busy":crate::db::busy_count(),"telegram_proxy_invalid":proxy_invalid,"telegram_response_invalid":response_invalid,"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"completions_pending":completions_pending,"sampled_at":crate::now(),"maintenance":freeze_present,"freeze":{"present":freeze_present,"age_seconds":freeze_age_seconds,"alert_after_seconds":snapshot.settings.admission.freeze_alert_after_seconds,"last_alert":freeze_alert},"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
     )
 }

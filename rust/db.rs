@@ -171,6 +171,45 @@ impl Store {
         }
         Ok(())
     }
+    /// Queue a de-duplicated ops alert while admission is frozen too long.
+    pub fn freeze_alert(&self, target: &str, age_seconds: u64, fingerprint: &str) -> Result<()> {
+        let mut db = self.connect()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let key = format!("freeze-alert:{fingerprint}");
+        let exists: bool =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM kv WHERE key=?)", [&key], |r| {
+                r.get(0)
+            })?;
+        if exists {
+            return Ok(());
+        }
+        let minutes = age_seconds / 60;
+        let id = crate::digest(&key);
+        let payload = json!({
+            "text": format!(
+                "Pylon 新触发仍处于冻结状态，已持续约 {minutes} 分钟。若升级已结束请删除 run/freeze；失败升级应保留冻结并先排查。"
+            ),
+            "expires_at": crate::now() + 600.0
+        });
+        let record =
+            json!({"at": crate::now(), "age_seconds": age_seconds, "fingerprint": fingerprint});
+        tx.execute(
+            "INSERT INTO kv VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, record.to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO kv VALUES('freeze-alert:last',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [record.to_string()],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'system','text',?,'pending',0,0,?,?,'gateway')",
+            params![&id[..32], target, payload.to_string(), crate::now(), crate::now()],
+        )?;
+        tx.commit()?;
+        self.runtime
+            .delivery_ready(target, crate::optimization::Lane::Telegram);
+        Ok(())
+    }
     pub fn complete_update(
         &self,
         bot: &str,
@@ -341,16 +380,61 @@ impl Store {
         })
     }
     pub(crate) fn claim_ready(&self, bot: &str, bark: Option<bool>) -> Result<Claim> {
+        self.claim_ready_filtered(bot, bark, false)
+    }
+    pub(crate) fn claim_ready_filtered(
+        &self,
+        bot: &str,
+        bark: Option<bool>,
+        system_only: bool,
+    ) -> Result<Claim> {
         let mut db = self.connect()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let row=tx.query_row("SELECT id,kind,payload,receipt,attempts FROM events WHERE profile=? AND status='pending' AND next_attempt<=? AND (? IS NULL OR (kind='bark')=?) ORDER BY created_at,id LIMIT 1",params![bot,crate::now(),bark,bark],|r|{
-            Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,i64>(4)?))
-        }).optional()?;
+        let row = if system_only {
+            tx.query_row(
+                "SELECT id,kind,payload,receipt,attempts FROM events WHERE profile=? AND status='pending' AND next_attempt<=? AND (? IS NULL OR (kind='bark')=?) AND module='gateway' AND job_id='system' ORDER BY created_at,id LIMIT 1",
+                params![bot, crate::now(), bark, bark],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+        } else {
+            tx.query_row(
+                "SELECT id,kind,payload,receipt,attempts FROM events WHERE profile=? AND status='pending' AND next_attempt<=? AND (? IS NULL OR (kind='bark')=?) ORDER BY created_at,id LIMIT 1",
+                params![bot, crate::now(), bark, bark],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+        };
         let Some((id, kind, payload, receipt, attempts)) = row else {
-            let due = tx.query_row(
-                "SELECT min(next_attempt) FROM events WHERE profile=? AND status='pending' AND (? IS NULL OR (kind='bark')=?)",
-                params![bot, bark, bark], |r| r.get::<_, Option<f64>>(0),
-            )?;
+            let due = if system_only {
+                tx.query_row(
+                    "SELECT min(next_attempt) FROM events WHERE profile=? AND status='pending' AND (? IS NULL OR (kind='bark')=?) AND module='gateway' AND job_id='system'",
+                    params![bot, bark, bark],
+                    |r| r.get::<_, Option<f64>>(0),
+                )?
+            } else {
+                tx.query_row(
+                    "SELECT min(next_attempt) FROM events WHERE profile=? AND status='pending' AND (? IS NULL OR (kind='bark')=?)",
+                    params![bot, bark, bark],
+                    |r| r.get::<_, Option<f64>>(0),
+                )?
+            };
             if bark.is_some() {
                 self.runtime
                     .metrics

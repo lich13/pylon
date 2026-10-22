@@ -626,11 +626,15 @@ pub(crate) async fn executor(config: Config, mut stop: watch::Receiver<bool>) {
     let mut cursors = BTreeMap::new();
     let metrics = Metrics::default();
     let mut locks = crate::lock_reaper::Scan::default();
+    let mut saw_freeze = config.home.join("run/freeze").exists();
     if wait(&mut stop, 600.0).await {
         return;
     }
     loop {
-        if !interrupted(&config, &stop) {
+        let frozen = interrupted(&config, &stop);
+        let thawed = saw_freeze && !frozen;
+        saw_freeze = frozen;
+        if !frozen {
             let read = config.clone();
             match crate::blocking(move || Ok(read.settings()?.retention)).await {
                 Ok(policy) if policy.enabled => {
@@ -646,13 +650,16 @@ pub(crate) async fn executor(config: Config, mut stop: watch::Receiver<bool>) {
                     .await;
                     let report = metrics.snapshot();
                     let completed = report["status"] == "completed";
+                    let continue_locks = locks.in_progress() || completed || thawed;
                     executor_metrics()
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .entry(config.home.clone())
                         .or_default()
                         .retention = report;
-                    if completed {
+                    // Keep reclaiming while a directory scan is unfinished, and always
+                    // after thaw so overnight freezes do not wait for the next hour.
+                    if completed || continue_locks {
                         locks = crate::lock_reaper::run(&config, locks, &mut stop).await;
                     }
                 }
@@ -668,7 +675,13 @@ pub(crate) async fn executor(config: Config, mut stop: watch::Receiver<bool>) {
                 }
             }
         }
-        if wait(&mut stop, 3600.0).await {
+        // Unfinished lock scans and post-thaw catch-up retry within a minute.
+        let pause = if locks.in_progress() || thawed {
+            60.0
+        } else {
+            3600.0
+        };
+        if wait(&mut stop, pause).await {
             break;
         }
     }

@@ -92,13 +92,14 @@ async fn command_idle_backoff_and_external_fallback_keep_bounded_waits_and_reset
     let (_stop, rx) = watch::channel(false);
     let mut idle = Idle::default();
     for delay in [0.5, 1.0, 2.0, 2.0] {
-        let outcome = lane_once(
+        let outcome = lane_once_mode(
             app.clone(),
             "fixture".into(),
             bot.clone(),
             tg.clone(),
             "command",
             rx.clone(),
+            false,
         )
         .await
         .unwrap();
@@ -115,7 +116,7 @@ async fn command_idle_backoff_and_external_fallback_keep_bounded_waits_and_reset
             [message(1)["message"].to_string()],
         )
         .unwrap();
-    let outcome = lane_once(app.clone(), "fixture".into(), bot, tg, "command", rx)
+    let outcome = lane_once_mode(app.clone(), "fixture".into(), bot, tg, "command", rx, false)
         .await
         .unwrap();
     assert!(matches!(outcome, LaneOutcome::Worked(0.0)));

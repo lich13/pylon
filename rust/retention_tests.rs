@@ -945,3 +945,46 @@ fn storage_unknown_is_explicit_and_summary_is_stable_between_samples() {
         previous["metrics"]["storage"]["locks"]
     );
 }
+
+#[test]
+fn admission_defaults_and_bounds() {
+    let settings: crate::config::Settings = serde_json::from_value(json!({"bots":{}})).unwrap();
+    assert_eq!(settings.admission.freeze_alert_after_seconds, 900);
+    assert_eq!(settings.admission.freeze_alert_repeat_seconds, 1800);
+    assert_eq!(settings.admission.recovery_concurrency, 4);
+    assert!(settings.admission.validate().is_ok());
+    let bad = crate::config::Admission {
+        freeze_alert_after_seconds: 10,
+        ..crate::config::Admission::default()
+    };
+    assert!(bad.validate().is_err());
+}
+
+#[tokio::test]
+async fn freeze_alert_is_deduped_and_system_claimable_while_frozen() {
+    let (_temp, store) = store();
+    std::fs::create_dir_all(store.path.parent().unwrap().parent().unwrap().join("run")).unwrap();
+    // store.path is gateway/state.sqlite3; home is parent of gateway
+    let home = store.path.parent().unwrap().parent().unwrap().to_path_buf();
+    std::fs::write(home.join("run/freeze"), b"").unwrap();
+    store.freeze_alert("fixture", 1200, "fp-1").unwrap();
+    store.freeze_alert("fixture", 1200, "fp-1").unwrap();
+    let count: i64 = store
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM events WHERE module='gateway' AND job_id='system'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    let claimed = store
+        .claim_ready_filtered("fixture", Some(false), true)
+        .unwrap();
+    assert!(matches!(claimed, crate::db::Claim::Event(_)));
+    let ordinary = store
+        .claim_ready_filtered("fixture", Some(false), true)
+        .unwrap();
+    assert!(matches!(ordinary, crate::db::Claim::Empty(_)));
+}

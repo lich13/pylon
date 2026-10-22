@@ -20,10 +20,15 @@ static REPORT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static SPAWN_FAILURES: AtomicU64 = AtomicU64::new(0);
 static CHILD_FAILURES: AtomicU64 = AtomicU64::new(0);
 static SUMMARY_FAILURES: AtomicU64 = AtomicU64::new(0);
+static RECOVERY_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static SKIPPED_DUPLICATE_TRIGGERS: AtomicU64 = AtomicU64::new(0);
+static LAST_FREEZE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn metrics() -> Value {
     json!({"result_transfer_failures":REPORT_FAILURES.load(Ordering::Relaxed),
         "spawn_failures":SPAWN_FAILURES.load(Ordering::Relaxed),"child_failures":CHILD_FAILURES.load(Ordering::Relaxed),
-        "summary_failures":SUMMARY_FAILURES.load(Ordering::Relaxed),"sqlite_busy":crate::db::busy_count()})
+        "summary_failures":SUMMARY_FAILURES.load(Ordering::Relaxed),"sqlite_busy":crate::db::busy_count(),
+        "recovery_active":RECOVERY_ACTIVE.load(Ordering::Relaxed) != 0,
+        "skipped_duplicate_triggers":SKIPPED_DUPLICATE_TRIGGERS.load(Ordering::Relaxed)})
 }
 pub fn connect(config: &Config) -> Result<crate::db::PooledConnection> {
     if !config.home.join("run").is_dir() {
@@ -121,9 +126,13 @@ pub fn admit(
             |r| r.get(0),
         )
         .optional()?;
+    let coalesced = queued.is_some();
     let id = queued.unwrap_or_else(|| trigger.to_owned());
     tx.execute("INSERT OR IGNORE INTO requests(id,job_id,module,topic,model,state,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?)",params![id,job_id,module,topic,model,now(),now()])?;
     tx.execute("INSERT INTO triggers VALUES(?,?)", params![trigger, id])?;
+    if coalesced {
+        SKIPPED_DUPLICATE_TRIGGERS.fetch_add(1, Ordering::Relaxed);
+    }
     tx.commit()?;
     summary(config)?;
     Ok(id)
@@ -234,14 +243,46 @@ pub async fn dispatch(config: &Config) -> Result<()> {
     crate::isolated(async move { dispatch_inner(&config).await }).await
 }
 async fn dispatch_inner(config: &Config) -> Result<()> {
+    let frozen = config.home.join("run/freeze").exists();
+    let was_frozen = LAST_FREEZE.swap(frozen, Ordering::Relaxed);
+    if was_frozen && !frozen {
+        // Thaw: force recovery drain even if the queue looks small.
+        RECOVERY_ACTIVE.store(1, Ordering::Relaxed);
+    }
+    let recovery_limit = match config.settings() {
+        Ok(settings) => settings.admission.recovery_concurrency.max(1),
+        Err(_) => 4,
+    };
     let rows = {
         let db = connect(config)?;
         // Mutable state and recovery fields are re-read after acquiring locks.
-        let mut q=db.prepare("SELECT id,job_id FROM requests WHERE state IN ('queued','running','completing','reporting') ORDER BY created_at,id")?;
-        q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?
+        let mut q=db.prepare("SELECT id,job_id,state FROM requests WHERE state IN ('queued','running','completing','reporting') ORDER BY created_at,id")?;
+        q.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?
     };
-    for (id, job) in rows {
+    let active = rows
+        .iter()
+        .filter(|(_, _, state)| *state != "queued")
+        .count() as u32;
+    let queued = rows
+        .iter()
+        .filter(|(_, _, state)| *state == "queued")
+        .count() as u32;
+    if queued == 0 && active == 0 {
+        RECOVERY_ACTIVE.store(0, Ordering::Relaxed);
+    } else if queued > recovery_limit || RECOVERY_ACTIVE.load(Ordering::Relaxed) != 0 {
+        RECOVERY_ACTIVE.store(1, Ordering::Relaxed);
+    }
+    let recovering = RECOVERY_ACTIVE.load(Ordering::Relaxed) != 0;
+    let mut launched = 0_u32;
+    for (id, job, initial_state) in rows {
+        let _ = initial_state;
         let Some(dispatch_lock) = crate::runtime::acquire_task_lock(
             &config
                 .home
@@ -281,7 +322,10 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
                 crate::errors::log("queue-report", &error);
             }
         } else if state == "queued" {
-            if config.home.join("run/freeze").exists() {
+            if frozen {
+                continue;
+            }
+            if recovering && active.saturating_add(launched) >= recovery_limit {
                 continue;
             }
             let mut command = tokio::process::Command::new(std::env::current_exe()?);
@@ -312,6 +356,7 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
                 })?;
             let supervisor = config.clone();
             let identity = crate::digest(&job);
+            launched = launched.saturating_add(1);
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let stderr = child.stderr.take();
@@ -375,4 +420,32 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
     }
     summary(config)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn coalesced_triggers_increment_skip_counter() {
+        let before = SKIPPED_DUPLICATE_TRIGGERS.load(Ordering::Relaxed);
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config::new(temp.path().to_path_buf());
+        std::fs::create_dir_all(config.home.join("run")).unwrap();
+        std::fs::create_dir_all(config.home.join("supervisor")).unwrap();
+        let first = admit(&config, "job-a", "mod", "personal", false, "trigger-1").unwrap();
+        let second = admit(&config, "job-a", "mod", "personal", false, "trigger-2").unwrap();
+        assert_eq!(first, second);
+        assert!(SKIPPED_DUPLICATE_TRIGGERS.load(Ordering::Relaxed) > before);
+        let count: i64 = connect(&config)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM triggers WHERE request_id=?",
+                [&first],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
 }

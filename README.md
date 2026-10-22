@@ -127,6 +127,30 @@ sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.7
 
 版本以运行进程的二进制哈希、版本目录 `REVISION` 和诊断版本交叉核对；切换后同步根目录 `REVISION`。仅分支提交触发网关 CI，版本 tag 不重复构建。发布成品须来自对应提交的成功 CI，并核对 `REVISION` 和 `SHA256SUMS`；校验和中的路径带 `dist/` 前缀，下载至临时根下的 `dist/` 后，从临时根运行 `sha256sum -c dist/SHA256SUMS`。CI artifact 保留 14 天，tag 本身不长期保存二进制。
 
+
+## v0.5.9 冻结告警与恢复限流
+
+部署必须使用仓库内 `scripts/deploy-gateway.sh`（或等价地调用 `pylon freeze` / `pylon thaw`）：成功结束时删除 `run/freeze`；任意失败保留冻结并由网关在冻结超过可配置阈值后告警。网关在 `run/freeze` 存在超过 `admission.freeze_alert_after_seconds`（默认 900 秒）时，向 `personal` 路由投递一次系统告警，并按 `freeze_alert_repeat_seconds`（默认 1800 秒）去重重复提醒；冻结期间仍放行 `module=gateway` 且 `job_id=system` 的投递。`diagnostics.freeze` 给出 `present`、`age_seconds`、阈值与最近告警摘要。
+
+同一 job 在已有 `queued` 请求时只合并触发（过期轮次记入 `skipped_duplicate_triggers`，仍只补跑这一次，含 daily）。解冻或重启后若积压超过 `admission.recovery_concurrency`（默认 4），调度按该全局上限放行，排空后回到主题配额。锁回收在解冻后及未完成扫描时改为约每分钟继续，并允许 root 回收同组空锁。`config/bots.json` 可选：
+
+```json
+{"admission":{"freeze_alert_after_seconds":900,"freeze_alert_repeat_seconds":1800,"recovery_concurrency":4}}
+```
+
+非法值拒绝加载。保留策略默认未变；`no_change` 运行记录是否纳入 runs 清理需另行确认。
+
+替换为旧版之前，用当前新版二进制执行只读检查（v0.5.9 的目标为 0.5.8）：
+
+```sh
+sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.8
+```
+
+| 目标 | 必要条件 |
+| --- | --- |
+| 0.5.8 | 完成缓冲为空、状态有效；无有效事件占位记录 |
+| 0.5.7 | 同 v0.5.8 文档对 0.5.7 的要求 |
+
 ## v0.5.8 容量治理
 
 网关与 executor 各有一个串行维护任务：启动 10 分钟后首轮，此后每小时运行。`config/bots.json` 的可选 `retention` 配置默认如下，`enabled: false` 同时停止保留清理和请求锁回收；非法或零保留值拒绝加载。冻结或退出后不开始新批次，当前事务提交或回滚；数据库忙则结束本轮。

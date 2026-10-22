@@ -29,6 +29,9 @@ pub(crate) struct Scan {
     finished: bool,
 }
 impl Scan {
+    pub(crate) fn in_progress(&self) -> bool {
+        self.directory.is_some()
+    }
     fn snapshot(&self) -> Value {
         json!({"checked":self.checked,"deleted":self.deleted,"skipped":self.skipped,"directory_entries":self.directory_entries,"directory_sampled_at":self.directory_sampled_at,"directory_scan_started_at":self.directory_started_at,"scan_error":self.scan_error,"sampled_at":crate::now(),"scan_in_progress":self.directory.is_some()})
     }
@@ -62,8 +65,14 @@ fn candidate(name: &str) -> Option<&str> {
     .then_some(hash)
 }
 fn safe(metadata: &fs::Metadata) -> bool {
+    // Executor runs as root:pylon and creates root-owned locks. Allow the same
+    // process to reclaim group-owned empty request/dispatch locks after a UID
+    // migration without widening to arbitrary files (name + emptiness still bind).
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    let owner_ok = metadata.uid() == euid || (euid == 0 && metadata.gid() == egid);
     metadata.is_file()
-        && metadata.uid() == unsafe { libc::geteuid() }
+        && owner_ok
         && metadata.nlink() == 1
         && metadata.len() == 0
         && metadata.mode() & 0o7007 == 0

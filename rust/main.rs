@@ -32,6 +32,10 @@ enum Command {
         dispatch_fd: Option<i32>,
     },
     Diagnose,
+    /// Create run/freeze so new triggers and non-system delivery pause.
+    Freeze,
+    /// Remove run/freeze after a successful upgrade. Refuses if the marker is absent.
+    Thaw,
     /// Inspect compatibility before replacing the gateway with an older binary.
     DowngradeCheck {
         #[arg(long)]
@@ -222,6 +226,38 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
                 &std::env::var("PYLON_CONTEXT").unwrap_or_default(),
             )
             .await?
+        }
+        Command::Freeze => {
+            ensure!(unsafe { libc::geteuid() } == 0, "freeze requires root");
+            let path = config.home.join("run/freeze");
+            std::fs::create_dir_all(path.parent().context("run directory missing")?)?;
+            if path.exists() {
+                ensure!(path.is_file(), "freeze path is not a regular file");
+                json!({"ok":true,"freeze":true,"created":false})
+            } else {
+                use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o660)
+                    .open(&path)?;
+                file.sync_all()?;
+                // Match historical deploy ownership so the gateway group can observe the marker.
+                let meta = std::fs::metadata(config.home.join("run"))?;
+                let gid = meta.gid();
+                std::os::unix::fs::chown(&path, Some(0), Some(gid))?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))?;
+                json!({"ok":true,"freeze":true,"created":true})
+            }
+        }
+        Command::Thaw => {
+            ensure!(unsafe { libc::geteuid() } == 0, "thaw requires root");
+            let path = config.home.join("run/freeze");
+            ensure!(path.is_file(), "freeze marker missing");
+            std::fs::remove_file(&path)?;
+            // Best-effort ops notice that admission resumed.
+            let _ = api::rpc(&config, "diagnostics", json!({}), "").await;
+            json!({"ok":true,"freeze":false})
         }
         Command::DowngradeCheck { .. } => anyhow::bail!("invalid command dispatch"),
         Command::Serve { id } => {

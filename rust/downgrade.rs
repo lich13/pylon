@@ -30,7 +30,10 @@ pub fn check(config: &Config, target: &str) -> Report {
         completions_pending: None,
         reason: None,
     };
-    if !matches!(target, "0.5.3" | "0.5.4" | "0.5.5" | "0.5.6" | "0.5.7") {
+    if !matches!(
+        target,
+        "0.5.3" | "0.5.4" | "0.5.5" | "0.5.6" | "0.5.7" | "0.5.8"
+    ) {
         report.reason = Some("unsupported_target");
         return report;
     }

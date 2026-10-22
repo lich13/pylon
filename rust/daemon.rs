@@ -510,13 +510,14 @@ enum LaneOutcome {
     Empty(Option<f64>),
 }
 
-async fn lane_once(
+async fn lane_once_mode(
     app: App,
     id: String,
     bot: Bot,
     tg: Telegram,
     lane: &'static str,
     mut stop: watch::Receiver<bool>,
+    system_only: bool,
 ) -> Result<LaneOutcome> {
     if *stop.borrow() {
         return Ok(LaneOutcome::Wait(0.0));
@@ -601,7 +602,9 @@ async fn lane_once(
             let claimed_bot = id.clone();
             let event = app
                 .store
-                .blocking(move |s| s.claim_ready(&claimed_bot, Some(lane == "bark")))
+                .blocking(move |s| {
+                    s.claim_ready_filtered(&claimed_bot, Some(lane == "bark"), system_only)
+                })
                 .await?;
             let event = match event {
                 crate::db::Claim::Empty(due) => return Ok(LaneOutcome::Empty(due)),
@@ -685,13 +688,15 @@ async fn bot_worker_client(
                 None => (None, None),
             };
             while !*stop.borrow() {
-                if app.config.home.join("run/freeze").exists() {
+                let frozen = app.config.home.join("run/freeze").exists();
+                // Freeze blocks ordinary work; gateway system alerts still deliver.
+                if frozen && !matches!(lane, "telegram" | "bark") {
                     if pause(&mut stop, 1.0).await { break; }
                     continue;
                 }
                 if let Some(changed) = &mut changed { changed.borrow_and_update(); }
                 // The child boundary catches a panic without cancelling another lane.
-                let result = Child(tokio::spawn(lane_once(app.clone(), id.clone(), bot.clone(), tg.clone(), lane, stop.clone())))
+                let result = Child(tokio::spawn(lane_once_mode(app.clone(), id.clone(), bot.clone(), tg.clone(), lane, stop.clone(), frozen)))
                     .await.unwrap_or_else(|_| Err(crate::errors::ReconcileRequired.into()));
                 if *stop.borrow() { break; }
                 let recovering = failures > 0;
@@ -786,6 +791,20 @@ fn configuration_fingerprint(config: &crate::config::Config) -> String {
     }
     crate::digest(bytes)
 }
+fn freeze_age_seconds(config: &crate::config::Config) -> Option<u64> {
+    let meta = std::fs::symlink_metadata(config.home.join("run/freeze")).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let modified = meta.modified().ok()?;
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+}
+
 pub fn acquire_lock(config: &crate::config::Config) -> Result<std::fs::File> {
     std::fs::create_dir_all(config.home.join("gateway"))?;
     let lock = std::fs::OpenOptions::new()
@@ -965,6 +984,32 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
                     .await
                 {
                     crate::errors::log("uncertain-summary", &error)
+                }
+            }
+            if let Some(age) = freeze_age_seconds(&app.config) {
+                let admission = snapshot.settings.admission.clone();
+                if age >= admission.freeze_alert_after_seconds {
+                    let bucket = age / admission.freeze_alert_repeat_seconds.max(1);
+                    let fingerprint = format!(
+                        "{}:{}",
+                        std::fs::metadata(app.config.home.join("run/freeze"))
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                        bucket
+                    );
+                    if let Some(target) = snapshot.settings.routes.get("personal") {
+                        let target = target.clone();
+                        if let Err(error) = app
+                            .store
+                            .blocking(move |s| s.freeze_alert(&target, age, &fingerprint))
+                            .await
+                        {
+                            crate::errors::log("freeze-alert", &error);
+                        }
+                    }
                 }
             }
             if rpc.is_finished() {

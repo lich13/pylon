@@ -25,10 +25,43 @@ fn yes() -> bool {
     true
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Admission {
+    /// Alert when run/freeze has existed at least this long (seconds).
+    pub freeze_alert_after_seconds: u64,
+    /// Minimum interval between freeze longevity alerts (seconds).
+    pub freeze_alert_repeat_seconds: u64,
+    /// Global concurrent resumes while draining a backlog after thaw/restart.
+    pub recovery_concurrency: u32,
+}
+impl Default for Admission {
+    fn default() -> Self {
+        Self {
+            freeze_alert_after_seconds: 900,
+            freeze_alert_repeat_seconds: 1800,
+            recovery_concurrency: 4,
+        }
+    }
+}
+impl Admission {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (60..=86400).contains(&self.freeze_alert_after_seconds)
+                && (60..=86400).contains(&self.freeze_alert_repeat_seconds)
+                && (1..=32).contains(&self.recovery_concurrency),
+            "invalid admission policy"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub retention: crate::retention::Policy,
+    #[serde(default)]
+    pub admission: Admission,
     #[serde(default = "default_web_port")]
     pub web_port: u16,
     #[serde(default = "default_ip_family")]
@@ -95,6 +128,7 @@ impl Config {
     pub(crate) fn settings_from_bytes(&self, bytes: &[u8]) -> Result<Settings> {
         let s: Settings = serde_json::from_slice(bytes)?;
         s.retention.validate()?;
+        s.admission.validate()?;
         ensure!(s.web_port > 0, "invalid web port");
         ensure!(
             ["ipv4", "ipv6", "auto"].contains(&s.telegram_ip_family.as_str()),
