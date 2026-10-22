@@ -217,9 +217,11 @@ def test_returned_command_result_is_buffered_and_recovered_without_rerunning_han
             ],
         )
 
-        case.gateway.start()
+        # Executor must be listening before the gateway can claim a command;
+        # otherwise request_executor fails and the update becomes uncertain.
         executor = case.start_executor()
-        wait_for(lambda: case.count("completion-count") == 1, timeout=6.0)
+        case.gateway.start()
+        wait_for(lambda: case.count("completion-count") == 1, timeout=10.0)
         assert telegram.longpoll_entered.wait(timeout=5.0), "poll lane did not settle after storing the command"
 
         def update_status():

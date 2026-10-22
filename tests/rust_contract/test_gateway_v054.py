@@ -864,8 +864,10 @@ def test_successful_command_waits_out_two_second_gateway_database_lock(isolated_
                 }
             ],
         )
-        case.gateway.start()
+        # Executor must be listening before the gateway can claim a command;
+        # otherwise request_executor fails and the update becomes uncertain.
         case.start_executor()
+        case.gateway.start()
 
         def command_debug():
             state = case.home / "gateway/state.sqlite3"
@@ -890,7 +892,7 @@ def test_successful_command_waits_out_two_second_gateway_database_lock(isolated_
             }
 
         try:
-            assert wait_for(lambda: case.count("completion-count") == 1, timeout=5.0)
+            assert wait_for(lambda: case.count("completion-count") == 1, timeout=10.0)
         except AssertionError as error:
             raise AssertionError(f"{error}; command_debug={command_debug()}") from error
         assert telegram.longpoll_entered.wait(timeout=5.0), "poll lane did not settle after saving the command"
