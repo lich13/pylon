@@ -29,28 +29,36 @@ REVISION=$(tr -d '[:space:]' <"$REV")
 TARGET_DIR="$HOME_DIR/releases/v$( "$BIN" --version | awk '{print $2}' )-$REVISION"
 CURRENT="$HOME_DIR/bin/pylon"
 SUCCESS=0
-PYLON_BIN=${CURRENT}
+# Prefer an installed binary for diagnose/thaw after switch; freeze must use a
+# binary that understands the subcommand (old installs may still be pre-0.5.9).
+PYLON_BIN=$BIN
 if [[ -x "$CURRENT" ]]; then
   PYLON_BIN=$CURRENT
-elif [[ -x "$BIN" ]]; then
-  PYLON_BIN=$BIN
+fi
+FREEZE_BIN=$BIN
+if [[ -x "$CURRENT" ]] && "$CURRENT" --help 2>/dev/null | grep -Eq '^[[:space:]]*freeze[[:space:]]'; then
+  FREEZE_BIN=$CURRENT
 fi
 
 cleanup() {
   local code=$?
+  local frozen=false
+  [[ -e "$HOME_DIR/run/freeze" ]] && frozen=true
   if [[ $SUCCESS -eq 1 ]]; then
     if [[ -e "$HOME_DIR/run/freeze" ]]; then
       "$PYLON_BIN" --home "$HOME_DIR" thaw || rm -f "$HOME_DIR/run/freeze"
     fi
-    echo "{\"phase\":\"complete\",\"revision\":\"$REVISION\",\"freeze\":false}" 
+    echo "{\"phase\":\"complete\",\"revision\":\"$REVISION\",\"freeze\":false}"
   else
-    echo "{\"phase\":\"failed\",\"revision\":\"$REVISION\",\"freeze\":true,\"exit\":$code}" >&2
-    echo "KEEPING freeze marker at $HOME_DIR/run/freeze; inspect services before thawing." >&2
+    echo "{\"phase\":\"failed\",\"revision\":\"$REVISION\",\"freeze\":$frozen,\"exit\":$code}" >&2
+    if [[ -e "$HOME_DIR/run/freeze" ]]; then
+      echo "KEEPING freeze marker at $HOME_DIR/run/freeze; inspect services before thawing." >&2
+    fi
   fi
 }
 trap cleanup EXIT
 
-"$PYLON_BIN" --home "$HOME_DIR" freeze
+"$FREEZE_BIN" --home "$HOME_DIR" freeze
 # Verify freeze exists before stopping anything.
 [[ -f "$HOME_DIR/run/freeze" ]]
 
