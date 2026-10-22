@@ -705,10 +705,7 @@ pub(crate) fn checkpoint_database(home: &Path, path: &Path, threshold: u64, forc
             Err(_) => Ok("error"),
         }
     })();
-    let status = match outcome {
-        Ok(status) => status,
-        Err(_) => "error",
-    };
+    let status = outcome.unwrap_or("error");
     record_checkpoint(
         path,
         json!({"status":status,"wal_bytes_before":wal_bytes,"sampled_at":at}),
