@@ -128,6 +128,32 @@ sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.7
 版本以运行进程的二进制哈希、版本目录 `REVISION` 和诊断版本交叉核对；切换后同步根目录 `REVISION`。仅分支提交触发网关 CI，版本 tag 不重复构建。发布成品须来自对应提交的成功 CI，并核对 `REVISION` 和 `SHA256SUMS`；校验和中的路径带 `dist/` 前缀，下载至临时根下的 `dist/` 后，从临时根运行 `sha256sum -c dist/SHA256SUMS`。CI artifact 保留 14 天，tag 本身不长期保存二进制。
 
 
+
+## v0.5.10 WAL 压缩与锁回收收紧
+
+恢复排空结束后，以及 `admission.wal_checkpoint_bytes`（默认 32 MiB）阈值触发时，网关与 executor 各自对 `gateway/state.sqlite3`、`supervisor/task-state.sqlite3` 做一次 fail-fast WAL checkpoint（先 PASSIVE 再 TRUNCATE）。冻结期跳过；SQLite busy 时放弃本轮，不阻塞调度车道。`diagnostics.metrics.storage.wal_checkpoint`（executor 侧在 `tasks.metrics.storage`）记录最近一次结果与压缩前 WAL 字节数。
+
+锁回收在原有 `request-`／`dispatch-` 规则之外，纳入 `run/` 下闲置超过 24 小时的 **job 锁**（`{job_id|job.lock}.lock`）。**故意不删**：`daemon.lock`（进程单例）、`quota-*`（主题配额槽位文件）。误删二者会打乱并发准入。
+
+`config/bots.json` 可选：
+
+```json
+{"admission":{"freeze_alert_after_seconds":900,"freeze_alert_repeat_seconds":1800,"recovery_concurrency":4,"wal_checkpoint_bytes":33554432}}
+```
+
+黑盒合约中，会预置 Telegram 命令更新的 fixture 须先起 executor 再起 gateway（`RuntimeCase.start_for_commands`），避免 command 车道在 `executor.sock` 未就绪时把更新标成 uncertain。
+
+替换为旧版之前，用当前新版二进制执行只读检查（v0.5.10 的目标为 0.5.9）：
+
+```sh
+sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.9
+```
+
+| 目标 | 必要条件 |
+| --- | --- |
+| 0.5.9 | 完成缓冲为空、状态有效；无有效事件占位记录 |
+| 0.5.8 | 同 v0.5.9 |
+
 ## v0.5.9 冻结告警与恢复限流
 
 部署必须使用仓库内 `scripts/deploy-gateway.sh`（或等价地调用 `pylon freeze` / `pylon thaw`）：成功结束时删除 `run/freeze`；任意失败保留冻结并由网关在冻结超过可配置阈值后告警。网关在 `run/freeze` 存在超过 `admission.freeze_alert_after_seconds`（默认 900 秒）时，向 `personal` 路由投递一次系统告警，并按 `freeze_alert_repeat_seconds`（默认 1800 秒）去重重复提醒；冻结期间仍放行 `module=gateway` 且 `job_id=freeze-alert` 的运维告警。`diagnostics.freeze` 给出 `present`、`age_seconds`、阈值与最近告警摘要。
@@ -177,9 +203,9 @@ sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.8
 
 过期或失去归属依据的按钮只收到不带文字的 Telegram 空应答，以停止客户端转圈；不调用模块、不发送提示或回复。有效按钮仍须通过原有模块签名及业务校验，90 天占位不保证业务记录一直有效。
 
-请求锁只回收 `dispatch-<64位小写十六进制>.lock` 和 `request-<64位小写十六进制>.lock`。已知请求完成满 24 小时才具备资格；孤儿的 mtime、ctime 都须满 24 小时。每批最多检查 1,000 个目录项、让出 500 ms，每轮最多 50,000 项，跨轮继续扫描。普通文件、属主、权限、长度、链接数、flock 及取得锁后的路径身份均须通过；被持有或不安全的文件保留。其它锁、socket、`run/invocations/` 不参与回收。
+请求／派发锁回收 `dispatch-<64位小写十六进制>.lock` 和 `request-<64位小写十六进制>.lock`：已知请求完成满 24 小时才具备资格；孤儿的 mtime、ctime 都须满 24 小时。另回收同目录下闲置超过 24 小时的 job 锁（`{job_id|job.lock}.lock`）。**不回收** `daemon.lock` 与 `quota-*`。每批最多检查 1,000 个目录项、让出 500 ms，每轮最多 50,000 项，跨轮继续扫描。普通文件、属主、权限、长度、链接数、flock 及取得锁后的路径身份均须通过；被持有或不安全的文件保留。socket、`run/invocations/` 不参与回收。
 
-`diagnostics.metrics.storage` 中 database／wal／run_dir 各自给出 bytes 和错误短码；目录字节数是目录自身 stat 大小，目录项数来自低频回收扫描，附扫描起止时间，扣除本次实际删除项，扫描期间的外部变化不构成原子快照。未采样或读取失败为 null／短码。`metrics.retention` 提供清理状态、各对象删除数、占位写入数、批次数、最慢批次耗时、安全短码及占位命中数。executor 的对应结果在 `tasks.metrics.storage`，文件大小至多每分钟采样；诊断和两秒摘要不遍历目录。进程内计数重启清零。
+`diagnostics.metrics.storage` 中 database／wal／run_dir 各自给出 bytes 和错误短码，并附最近一次 `wal_checkpoint` 结果；目录字节数是目录自身 stat 大小，目录项数来自低频回收扫描，附扫描起止时间，扣除本次实际删除项，扫描期间的外部变化不构成原子快照。未采样或读取失败为 null／短码。`metrics.retention` 提供清理状态、各对象删除数、占位写入数、批次数、最慢批次耗时、安全短码及占位命中数。executor 的对应结果在 `tasks.metrics.storage`，文件大小至多每分钟采样；诊断和两秒摘要不遍历目录。进程内计数重启清零。
 
 Command 空 claim 同样采用 0.5、1、2 秒退避。进程内 pending update 提交按 bot／lane 唤醒，纯 offset 或重复记录不唤醒；外部写入由最多 2 秒兜底发现，另计数据库等待与执行时间。`metrics.optimization` 增加 `command_empty_claims`、`command_wakeups`，后者仅计通知实际结束空闲等待。
 

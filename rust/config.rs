@@ -34,6 +34,8 @@ pub struct Admission {
     pub freeze_alert_repeat_seconds: u64,
     /// Global concurrent resumes while draining a backlog after thaw/restart.
     pub recovery_concurrency: u32,
+    /// Truncate SQLite WAL when it reaches this many bytes (default 32 MiB).
+    pub wal_checkpoint_bytes: u64,
 }
 impl Default for Admission {
     fn default() -> Self {
@@ -41,6 +43,7 @@ impl Default for Admission {
             freeze_alert_after_seconds: 900,
             freeze_alert_repeat_seconds: 1800,
             recovery_concurrency: 4,
+            wal_checkpoint_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -49,7 +52,8 @@ impl Admission {
         ensure!(
             (60..=86400).contains(&self.freeze_alert_after_seconds)
                 && (60..=86400).contains(&self.freeze_alert_repeat_seconds)
-                && (1..=32).contains(&self.recovery_concurrency),
+                && (1..=32).contains(&self.recovery_concurrency)
+                && (1_048_576..=1_073_741_824).contains(&self.wal_checkpoint_bytes),
             "invalid admission policy"
         );
         Ok(())

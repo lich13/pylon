@@ -627,6 +627,103 @@ fn connect(path: &Path, pool: &Arc<Mutex<Vec<Connection>>>) -> Result<PooledConn
     })
 }
 
+/// Fail-fast WAL maintenance. Uses a private connection so pool busy waits cannot
+/// pin a dispatch or delivery lane while checkpointing.
+pub(crate) fn checkpoint_database(home: &Path, path: &Path, threshold: u64, force: bool) -> Value {
+    let at = crate::now();
+    let mut wal_path = path.as_os_str().to_owned();
+    wal_path.push("-wal");
+    let wal_path = PathBuf::from(wal_path);
+    let wal_bytes = match std::fs::symlink_metadata(&wal_path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return record_checkpoint(path, json!({"status":"unsafe_path","wal_bytes_before":null,"sampled_at":at}));
+        }
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => {
+            return record_checkpoint(
+                path,
+                json!({"status":"stat_unavailable","wal_bytes_before":null,"sampled_at":at}),
+            );
+        }
+    };
+    if home.join("run/freeze").exists() {
+        return record_checkpoint(
+            path,
+            json!({"status":"skipped_frozen","wal_bytes_before":wal_bytes,"sampled_at":at}),
+        );
+    }
+    if !force && wal_bytes < threshold {
+        return record_checkpoint(
+            path,
+            json!({"status":"skipped_small","wal_bytes_before":wal_bytes,"sampled_at":at}),
+        );
+    }
+    if !path.is_file() {
+        return record_checkpoint(
+            path,
+            json!({"status":"missing","wal_bytes_before":wal_bytes,"sampled_at":at}),
+        );
+    }
+    let outcome = (|| -> Result<&'static str> {
+        let db = Connection::open(path)?;
+        // Abandon immediately on contention; never inherit the pool's 5s writer wait.
+        db.busy_handler(Some(|_| false))?;
+        db.execute_batch("PRAGMA query_only=OFF;")?;
+        // PASSIVE first so a quiet database shrinks without waiting on readers.
+        let _ = db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        });
+        match db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        }) {
+            Ok((busy, log, _)) if busy == 0 && log == 0 => Ok("truncated"),
+            Ok((busy, _, _)) if busy != 0 => Ok("busy"),
+            Ok(_) => Ok("partial"),
+            Err(error)
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ffi::ErrorCode::DatabaseBusy | rusqlite::ffi::ErrorCode::DatabaseLocked)
+                ) =>
+            {
+                Ok("busy")
+            }
+            Err(_) => Ok("error"),
+        }
+    })();
+    let status = match outcome {
+        Ok(status) => status,
+        Err(_) => "error",
+    };
+    record_checkpoint(
+        path,
+        json!({"status":status,"wal_bytes_before":wal_bytes,"sampled_at":at}),
+    )
+}
+
+fn record_checkpoint(path: &Path, value: Value) -> Value {
+    last_checkpoints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_owned(), value.clone());
+    value
+}
+
+fn last_checkpoints() -> &'static Mutex<std::collections::BTreeMap<PathBuf, Value>> {
+    static LAST: std::sync::OnceLock<Mutex<std::collections::BTreeMap<PathBuf, Value>>> =
+        std::sync::OnceLock::new();
+    LAST.get_or_init(Default::default)
+}
+
+pub(crate) fn last_checkpoint(path: &Path) -> Value {
+    last_checkpoints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
 pub(crate) enum Claim {
     Event(Value),
     Empty(Option<f64>),
@@ -638,4 +735,72 @@ pub(crate) fn utc8_day(time: std::time::SystemTime) -> String {
         .with_timezone(&chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid UTC+8 offset"))
         .format("%Y-%m-%d")
         .to_string()
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_shrinks_wal_and_records_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        std::fs::create_dir_all(home.join("run")).unwrap();
+        std::fs::create_dir_all(home.join("gateway")).unwrap();
+        let path = home.join("gateway/state.sqlite3");
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(x);",
+            )
+            .unwrap();
+            let tx = db.unchecked_transaction().unwrap();
+            for i in 0..4000i32 {
+                tx.execute("INSERT INTO t VALUES(?1)", [i]).unwrap();
+            }
+            tx.commit().unwrap();
+            let mut wal = path.as_os_str().to_owned();
+            wal.push("-wal");
+            let before = std::fs::metadata(PathBuf::from(wal)).unwrap().len();
+            assert!(before > 4096, "fixture must leave a WAL while writer is open: {before}");
+            // Keep the writer open so the sidecar stays large, then checkpoint via a
+            // separate fail-fast connection; busy is acceptable and retried below.
+            let first = checkpoint_database(home, &path, 1, true);
+            assert!(
+                matches!(
+                    first["status"].as_str(),
+                    Some("truncated" | "busy" | "partial")
+                ),
+                "{first}"
+            );
+        }
+        let result = checkpoint_database(home, &path, 1, true);
+        assert_eq!(result["status"], "truncated", "{result}");
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let after = match std::fs::metadata(PathBuf::from(wal)) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(after, 0, "truncated must clear the WAL sidecar");
+        assert_eq!(last_checkpoint(&path)["status"], "truncated");
+    }
+
+    #[test]
+    fn freeze_and_small_wal_skip_without_blocking() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        std::fs::create_dir_all(home.join("run")).unwrap();
+        let path = home.join("task.sqlite3");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x);")
+            .unwrap();
+        let small = checkpoint_database(home, &path, u64::MAX, false);
+        assert_eq!(small["status"], "skipped_small");
+        std::fs::File::create(home.join("run/freeze")).unwrap();
+        let frozen = checkpoint_database(home, &path, 1, true);
+        assert_eq!(frozen["status"], "skipped_frozen");
+    }
 }

@@ -23,6 +23,17 @@ static SUMMARY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static RECOVERY_ACTIVE: AtomicU64 = AtomicU64::new(0);
 static SKIPPED_DUPLICATE_TRIGGERS: AtomicU64 = AtomicU64::new(0);
 static LAST_FREEZE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static POST_RECOVERY_CHECKPOINT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub(crate) fn take_post_recovery_checkpoint() -> bool {
+    POST_RECOVERY_CHECKPOINT.swap(false, Ordering::Relaxed)
+}
+pub(crate) fn request_post_recovery_checkpoint() {
+    POST_RECOVERY_CHECKPOINT.store(true, Ordering::Relaxed);
+}
+pub(crate) fn post_recovery_checkpoint_pending() -> bool {
+    POST_RECOVERY_CHECKPOINT.load(Ordering::Relaxed)
+}
 pub fn metrics() -> Value {
     json!({"result_transfer_failures":REPORT_FAILURES.load(Ordering::Relaxed),
         "spawn_failures":SPAWN_FAILURES.load(Ordering::Relaxed),"child_failures":CHILD_FAILURES.load(Ordering::Relaxed),
@@ -274,9 +285,27 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
         .iter()
         .filter(|(_, _, state)| *state == "queued")
         .count() as u32;
+    let was_recovering = RECOVERY_ACTIVE.load(Ordering::Relaxed) != 0;
     if queued == 0 && active == 0 {
         RECOVERY_ACTIVE.store(0, Ordering::Relaxed);
-    } else if queued > recovery_limit || RECOVERY_ACTIVE.load(Ordering::Relaxed) != 0 {
+        if was_recovering {
+            // Drain finished: ask maintenance to TRUNCATE task-state WAL without blocking this lane.
+            POST_RECOVERY_CHECKPOINT.store(true, Ordering::Relaxed);
+            let path = config.home.join("supervisor/task-state.sqlite3");
+            let home = config.home.clone();
+            let threshold = config
+                .settings()
+                .map(|s| s.admission.wal_checkpoint_bytes)
+                .unwrap_or(32 * 1024 * 1024);
+            // Best-effort now; busy abandons and the retention loop retries via the flag.
+            let result = crate::db::checkpoint_database(&home, &path, threshold, true);
+            if result["status"] != "truncated" {
+                POST_RECOVERY_CHECKPOINT.store(true, Ordering::Relaxed);
+            } else {
+                POST_RECOVERY_CHECKPOINT.store(false, Ordering::Relaxed);
+            }
+        }
+    } else if queued > recovery_limit || was_recovering {
         RECOVERY_ACTIVE.store(1, Ordering::Relaxed);
     }
     let recovering = RECOVERY_ACTIVE.load(Ordering::Relaxed) != 0;

@@ -175,6 +175,15 @@ class RuntimeCase:
         wait_for(ready, timeout=8)
         return process
 
+    def start_for_commands(self) -> subprocess.Popen:
+        """Start executor before gateway so pre-seeded command updates cannot race.
+
+        Command lane claims need executor.sock; gateway-first leaves updates uncertain.
+        """
+        executor = self.start_executor()
+        self.gateway.start()
+        return executor
+
     def requests(self) -> list[dict]:
         path = self.home / "supervisor/task-state.sqlite3"
         if not path.is_file():

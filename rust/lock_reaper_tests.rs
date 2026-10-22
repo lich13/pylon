@@ -136,19 +136,51 @@ fn scan_is_bounded_continues_and_excludes_other_files_and_freeze() {
     batch(&config, &mut scan, &Requests::new(), &rx).unwrap();
     assert!(scan.finished);
     assert!(scan.checked > checked);
-    assert_eq!(scan.checked, 1200);
     assert_eq!(scan.directory_entries, Some(1201));
+    // job.lock is now a reclaimable job-lock candidate (skipped here: not old enough).
+    assert_eq!(scan.checked, 1201);
     assert_eq!(scan.deleted, 0);
     fs::write(config.home.join("run/freeze"), b"").unwrap();
     let mut frozen = Scan::default();
     batch(&config, &mut frozen, &Requests::new(), &rx).unwrap();
     assert_eq!(frozen.checked, 0);
+    assert!(matches!(candidate("software-update-review.lock"), Some(Candidate::Job)));
+    assert!(matches!(
+        candidate(&format!("request-{}.lock", "a".repeat(64))),
+        Some(Candidate::Request(_))
+    ));
     for name in [
-        "job.lock",
+        "daemon.lock",
+        "quota-personal-process-0.lock",
         "dispatch-deadbeef.lock",
         "request-XYZ.lock",
         "request-000000000000000000000000000000000000000000000000000000000000000g.lock",
     ] {
-        assert!(candidate(name).is_none());
+        assert!(candidate(name).is_none(), "{name}");
+    }
+}
+
+#[test]
+fn old_unlocked_job_locks_are_reclaimed_while_daemon_and_quota_are_not_candidates() {
+    let (_temp, config) = fixture();
+    let now = crate::now() + 86401.0;
+    let run = config.home.join("run");
+    for name in [
+        "software-update-review.lock",
+        "93e1c037c069.lock",
+        "kdocs-quotes.lock",
+    ] {
+        drop(runtime::open_task_lock(&run.join(name)).unwrap());
+        assert!(
+            remove(&config, &run.join(name), None, now).unwrap(),
+            "{name} should be reclaimed as an aged orphan job lock"
+        );
+        assert!(!run.join(name).exists());
+    }
+    for name in ["daemon.lock", "quota-trading-model-0.lock"] {
+        assert!(candidate(name).is_none(), "{name} must stay unreclaimable");
+        drop(runtime::open_task_lock(&run.join(name)).unwrap());
+        assert!(!remove(&config, &run.join(name), None, now).unwrap());
+        assert!(run.join(name).exists(), "{name} must remain");
     }
 }

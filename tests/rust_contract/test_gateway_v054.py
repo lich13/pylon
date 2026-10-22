@@ -866,8 +866,7 @@ def test_successful_command_waits_out_two_second_gateway_database_lock(isolated_
         )
         # Executor must be listening before the gateway can claim a command;
         # otherwise request_executor fails and the update becomes uncertain.
-        case.start_executor()
-        case.gateway.start()
+        case.start_for_commands()
 
         def command_debug():
             state = case.home / "gateway/state.sqlite3"

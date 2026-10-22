@@ -131,7 +131,7 @@ fn bytes(path: &Path, absent_zero: bool) -> Value {
 pub(crate) fn storage(db: &Path, run: &Path) -> Value {
     let mut wal = db.as_os_str().to_owned();
     wal.push("-wal");
-    json!({"database":bytes(db,false),"wal":bytes(Path::new(&wal),true),"run_dir":bytes(run,false),"sampled_at":crate::now()})
+    json!({"database":bytes(db,false),"wal":bytes(Path::new(&wal),true),"run_dir":bytes(run,false),"wal_checkpoint":crate::db::last_checkpoint(db),"sampled_at":crate::now()})
 }
 pub(crate) fn gateway_storage(config: &Config) -> Value {
     let mut value = storage(&config.db(), &config.home.join("run"));
@@ -581,6 +581,17 @@ async fn sweep(
     metrics.finish("completed", None);
 }
 
+
+fn wal_threshold(config: &Config) -> u64 {
+    config
+        .settings()
+        .map(|s| s.admission.wal_checkpoint_bytes)
+        .unwrap_or(32 * 1024 * 1024)
+}
+fn maybe_checkpoint(config: &Config, path: &Path, force: bool) {
+    let _ = crate::db::checkpoint_database(config.home.as_path(), path, wal_threshold(config), force);
+}
+
 pub(crate) async fn gateway(app: crate::api::App, mut stop: watch::Receiver<bool>) {
     let mut cursors = BTreeMap::new();
     let mut next_orphans = 0.0;
@@ -615,6 +626,15 @@ pub(crate) async fn gateway(app: crate::api::App, mut stop: watch::Receiver<bool
             .await;
             if scan_orphans && app.store.runtime.retention.snapshot()["status"] == "completed" {
                 next_orphans = crate::now() + 86400.0;
+            }
+            if !interrupted(&app.config, &stop) {
+                let path = app.config.db();
+                let config = app.config.clone();
+                let _ = crate::blocking(move || {
+                    maybe_checkpoint(&config, &path, false);
+                    Ok(())
+                })
+                .await;
             }
         }
         if wait(&mut stop, 3600.0).await {
@@ -662,6 +682,27 @@ pub(crate) async fn executor(config: Config, mut stop: watch::Receiver<bool>) {
                     if completed || continue_locks {
                         locks = crate::lock_reaper::run(&config, locks, &mut stop).await;
                     }
+                    let force = thawed || crate::queue::take_post_recovery_checkpoint();
+                    let path = config.home.join("supervisor/task-state.sqlite3");
+                    let config_copy = config.clone();
+                    let outcome = crate::blocking(move || {
+                        Ok(crate::db::checkpoint_database(
+                            config_copy.home.as_path(),
+                            &path,
+                            wal_threshold(&config_copy),
+                            force,
+                        ))
+                    })
+                    .await;
+                    if force
+                        && let Ok(result) = outcome
+                        && !matches!(
+                            result["status"].as_str(),
+                            Some("truncated" | "skipped_frozen" | "skipped_small" | "missing")
+                        )
+                    {
+                        crate::queue::request_post_recovery_checkpoint();
+                    }
                 }
                 Ok(_) => {}
                 Err(_) => {
@@ -675,8 +716,11 @@ pub(crate) async fn executor(config: Config, mut stop: watch::Receiver<bool>) {
                 }
             }
         }
-        // Unfinished lock scans and post-thaw catch-up retry within a minute.
-        let pause = if locks.in_progress() || thawed {
+        // Unfinished lock scans, post-thaw catch-up, and pending WAL shrink retry soon.
+        let pause = if locks.in_progress()
+            || thawed
+            || crate::queue::post_recovery_checkpoint_pending()
+        {
             60.0
         } else {
             3600.0

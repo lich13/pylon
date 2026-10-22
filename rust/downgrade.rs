@@ -32,7 +32,7 @@ pub fn check(config: &Config, target: &str) -> Report {
     };
     if !matches!(
         target,
-        "0.5.3" | "0.5.4" | "0.5.5" | "0.5.6" | "0.5.7" | "0.5.8"
+        "0.5.3" | "0.5.4" | "0.5.5" | "0.5.6" | "0.5.7" | "0.5.8" | "0.5.9"
     ) {
         report.reason = Some("unsupported_target");
         return report;
