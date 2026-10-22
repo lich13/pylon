@@ -973,7 +973,7 @@ async fn freeze_alert_is_deduped_and_system_claimable_while_frozen() {
         .connect()
         .unwrap()
         .query_row(
-            "SELECT count(*) FROM events WHERE module='gateway' AND job_id='system'",
+            "SELECT count(*) FROM events WHERE module='gateway' AND job_id='freeze-alert'",
             [],
             |r| r.get(0),
         )

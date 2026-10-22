@@ -202,7 +202,7 @@ impl Store {
             [record.to_string()],
         )?;
         tx.execute(
-            "INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'system','text',?,'pending',0,0,?,?,'gateway')",
+            "INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'freeze-alert','text',?,'pending',0,0,?,?,'gateway')",
             params![&id[..32], target, payload.to_string(), crate::now(), crate::now()],
         )?;
         tx.commit()?;
@@ -392,7 +392,7 @@ impl Store {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let row = if system_only {
             tx.query_row(
-                "SELECT id,kind,payload,receipt,attempts FROM events WHERE profile=? AND status='pending' AND next_attempt<=? AND (? IS NULL OR (kind='bark')=?) AND module='gateway' AND job_id='system' ORDER BY created_at,id LIMIT 1",
+                "SELECT id,kind,payload,receipt,attempts FROM events WHERE profile=? AND status='pending' AND next_attempt<=? AND (? IS NULL OR (kind='bark')=?) AND module='gateway' AND job_id='freeze-alert' ORDER BY created_at,id LIMIT 1",
                 params![bot, crate::now(), bark, bark],
                 |r| {
                     Ok((
@@ -424,7 +424,7 @@ impl Store {
         let Some((id, kind, payload, receipt, attempts)) = row else {
             let due = if system_only {
                 tx.query_row(
-                    "SELECT min(next_attempt) FROM events WHERE profile=? AND status='pending' AND (? IS NULL OR (kind='bark')=?) AND module='gateway' AND job_id='system'",
+                    "SELECT min(next_attempt) FROM events WHERE profile=? AND status='pending' AND (? IS NULL OR (kind='bark')=?) AND module='gateway' AND job_id='freeze-alert'",
                     params![bot, bark, bark],
                     |r| r.get::<_, Option<f64>>(0),
                 )?

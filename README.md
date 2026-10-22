@@ -130,7 +130,7 @@ sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.7
 
 ## v0.5.9 冻结告警与恢复限流
 
-部署必须使用仓库内 `scripts/deploy-gateway.sh`（或等价地调用 `pylon freeze` / `pylon thaw`）：成功结束时删除 `run/freeze`；任意失败保留冻结并由网关在冻结超过可配置阈值后告警。网关在 `run/freeze` 存在超过 `admission.freeze_alert_after_seconds`（默认 900 秒）时，向 `personal` 路由投递一次系统告警，并按 `freeze_alert_repeat_seconds`（默认 1800 秒）去重重复提醒；冻结期间仍放行 `module=gateway` 且 `job_id=system` 的投递。`diagnostics.freeze` 给出 `present`、`age_seconds`、阈值与最近告警摘要。
+部署必须使用仓库内 `scripts/deploy-gateway.sh`（或等价地调用 `pylon freeze` / `pylon thaw`）：成功结束时删除 `run/freeze`；任意失败保留冻结并由网关在冻结超过可配置阈值后告警。网关在 `run/freeze` 存在超过 `admission.freeze_alert_after_seconds`（默认 900 秒）时，向 `personal` 路由投递一次系统告警，并按 `freeze_alert_repeat_seconds`（默认 1800 秒）去重重复提醒；冻结期间仍放行 `module=gateway` 且 `job_id=freeze-alert` 的运维告警。`diagnostics.freeze` 给出 `present`、`age_seconds`、阈值与最近告警摘要。
 
 同一 job 在已有 `queued` 请求时只合并触发（过期轮次记入 `skipped_duplicate_triggers`，仍只补跑这一次，含 daily）。解冻或重启后若积压超过 `admission.recovery_concurrency`（默认 4），调度按该全局上限放行，排空后回到主题配额。锁回收在解冻后及未完成扫描时改为约每分钟继续，并允许 root 回收同组空锁。`config/bots.json` 可选：
 
