@@ -129,6 +129,21 @@ sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.7
 
 
 
+## v0.5.11 锁回收：软跳过与 completed 按锁龄回收
+
+个别 candidate 锁文件未通过安全检查（非空、模式不符等）时改为软跳过并计入 `skipped`，不再把整轮标记为 `lock_safety_check_failed`；`daemon.lock`／`quota-*` 仍永不删除。对已 `completed`（或请求已不存在）的 `request-`／`dispatch-` 锁，在 flock 成功且文件安全的前提下，若锁文件自身 mtime／ctime 均满 24 小时即可回收，即使 reconcile 把 `updated_at` 刷成较新值。未完成或仍持锁的请求保持保护。
+
+替换为旧版之前，用当前新版二进制执行只读检查（v0.5.11 的目标为 0.5.10）：
+
+```sh
+sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.10
+```
+
+| 目标 | 必要条件 |
+| --- | --- |
+| 0.5.10 | 完成缓冲为空、状态有效；无有效事件占位记录 |
+| 0.5.9 | 同 v0.5.10 |
+
 ## v0.5.10 WAL 压缩与锁回收收紧
 
 恢复排空结束后，以及 `admission.wal_checkpoint_bytes`（默认 32 MiB）阈值触发时，网关与 executor 各自对 `gateway/state.sqlite3`、`supervisor/task-state.sqlite3` 做一次 fail-fast WAL checkpoint（先 PASSIVE 再 TRUNCATE）。冻结期跳过；SQLite busy 时放弃本轮，不阻塞调度车道。`diagnostics.metrics.storage.wal_checkpoint`（executor 侧在 `tasks.metrics.storage`）记录最近一次结果与压缩前 WAL 字节数。
@@ -203,7 +218,7 @@ sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.8
 
 过期或失去归属依据的按钮只收到不带文字的 Telegram 空应答，以停止客户端转圈；不调用模块、不发送提示或回复。有效按钮仍须通过原有模块签名及业务校验，90 天占位不保证业务记录一直有效。
 
-请求／派发锁回收 `dispatch-<64位小写十六进制>.lock` 和 `request-<64位小写十六进制>.lock`：已知请求完成满 24 小时才具备资格；孤儿的 mtime、ctime 都须满 24 小时。另回收同目录下闲置超过 24 小时的 job 锁（`{job_id|job.lock}.lock`）。**不回收** `daemon.lock` 与 `quota-*`。每批最多检查 1,000 个目录项、让出 500 ms，每轮最多 50,000 项，跨轮继续扫描。普通文件、属主、权限、长度、链接数、flock 及取得锁后的路径身份均须通过；被持有或不安全的文件保留。socket、`run/invocations/` 不参与回收。
+请求／派发锁回收 `dispatch-<64位小写十六进制>.lock` 和 `request-<64位小写十六进制>.lock`：已知请求为 `completed` 且（`updated_at` 满 24 小时，或锁文件 mtime／ctime 均满 24 小时）才具备资格；请求已不存在的孤儿及 job 锁须 mtime、ctime 都满 24 小时。另回收同目录下闲置超过 24 小时的空闲 job 锁（`{job_id|job.lock}.lock`）。**不回收** `daemon.lock` 与 `quota-*`。未通过安全检查的 candidate 软跳过，不将整轮标为扫描失败。每批最多检查 1,000 个目录项、让出 500 ms，每轮最多 50,000 项，跨轮继续扫描。普通文件、属主、权限、长度、链接数、flock 及取得锁后的路径身份均须通过；被持有或不安全的文件保留。socket、`run/invocations/` 不参与回收。
 
 `diagnostics.metrics.storage` 中 database／wal／run_dir 各自给出 bytes 和错误短码，并附最近一次 `wal_checkpoint` 结果；目录字节数是目录自身 stat 大小，目录项数来自低频回收扫描，附扫描起止时间，扣除本次实际删除项，扫描期间的外部变化不构成原子快照。未采样或读取失败为 null／短码。`metrics.retention` 提供清理状态、各对象删除数、占位写入数、批次数、最慢批次耗时、安全短码及占位命中数。executor 的对应结果在 `tasks.metrics.storage`，文件大小至多每分钟采样；诊断和两秒摘要不遍历目录。进程内计数重启清零。
 

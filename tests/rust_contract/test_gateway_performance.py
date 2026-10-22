@@ -1,4 +1,4 @@
-"""Black-box contracts for the v0.5.10 gateway reload and diagnostics optimizations."""
+"""Black-box contracts for the v0.5.11 gateway reload and diagnostics optimizations."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def performance_telegram():
 
 def _diagnostics(home: Path) -> dict:
     value = rpc_value(home, "diagnostics")
-    assert value["version"] == "0.5.10"
+    assert value["version"] == "0.5.11"
     optimization = value["metrics"].get("optimization")
     assert isinstance(optimization, dict)
     assert OPTIMIZATION_KEYS <= optimization.keys()

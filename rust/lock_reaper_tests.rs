@@ -75,13 +75,13 @@ fn rejects_links_permissions_nonempty_and_rechecks_request_state() {
     assert!(remove(&config, &link, None, now).is_err());
     let hard = path(&config, "hard");
     fs::hard_link(&real, &hard).unwrap();
-    assert!(remove(&config, &real, None, now).is_err());
+    assert!(!remove(&config, &real, None, now).unwrap());
     fs::remove_file(&hard).unwrap();
     fs::set_permissions(&real, fs::Permissions::from_mode(0o666)).unwrap();
-    assert!(remove(&config, &real, None, now).is_err());
+    assert!(!remove(&config, &real, None, now).unwrap());
     fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
     fs::write(&real, b"fixture").unwrap();
-    assert!(remove(&config, &real, None, now).is_err());
+    assert!(!remove(&config, &real, None, now).unwrap());
     request(&config, "changed", "running", 1.0);
     let changed = path(&config, "changed");
     drop(runtime::open_task_lock(&changed).unwrap());
@@ -186,4 +186,42 @@ fn old_unlocked_job_locks_are_reclaimed_while_daemon_and_quota_are_not_candidate
         assert!(!remove(&config, &run.join(name), None, now).unwrap());
         assert!(run.join(name).exists(), "{name} must remain");
     }
+}
+
+#[test]
+fn completed_with_fresh_updated_at_reclaims_when_lock_file_is_old() {
+    let (_temp, config) = fixture();
+    let now = crate::now();
+    let future = now + 86401.0;
+    // Simulate reconcile bumping updated_at to "now" while the lock inode is aged.
+    request(&config, "reconciled", "completed", future);
+    let file = path(&config, "reconciled");
+    drop(runtime::open_task_lock(&file).unwrap());
+    let known = ("reconciled".into(), "completed".into(), future);
+    assert!(
+        remove(&config, &file, Some(&known), future).unwrap(),
+        "aged lock for completed request must reclaim despite fresh updated_at"
+    );
+    assert!(!file.exists());
+}
+
+#[test]
+fn nonempty_job_lock_is_soft_skipped_without_scan_error() {
+    let (_temp, config) = fixture();
+    let run = config.home.join("run");
+    fs::write(run.join("gmail-web-worker.lock"), b"holder\n").unwrap();
+    fs::set_permissions(
+        run.join("gmail-web-worker.lock"),
+        fs::Permissions::from_mode(0o660),
+    )
+    .unwrap();
+    let (_, rx) = watch::channel(false);
+    let mut scan = Scan::default();
+    batch(&config, &mut scan, &Requests::new(), &rx).unwrap();
+    assert!(scan.finished);
+    assert_eq!(scan.checked, 1);
+    assert_eq!(scan.deleted, 0);
+    assert_eq!(scan.skipped, 1);
+    assert!(scan.scan_error.is_none(), "{:?}", scan.scan_error);
+    assert!(run.join("gmail-web-worker.lock").exists());
 }

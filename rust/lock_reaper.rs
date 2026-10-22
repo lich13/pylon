@@ -121,8 +121,10 @@ pub(crate) fn remove(
     {
         return Ok(false);
     }
+    // Non-completed known requests stay; completed may reclaim even when
+    // reconcile refreshed updated_at, if the lock file itself is old enough.
     if let Some((_, state, at)) = known
-        && (state != "completed" || !at.is_finite() || *at < 0.0 || *at >= now - 86400.0)
+        && (state != "completed" || !at.is_finite() || *at < 0.0)
     {
         return Ok(false);
     }
@@ -137,8 +139,15 @@ pub(crate) fn remove(
         Err(e) => return Err(e.into()),
     };
     let metadata = file.metadata()?;
-    ensure!(safe(&metadata), "unsafe request lock");
-    if known.is_none() && !old(&metadata, now) {
+    // Candidate but unsafe (non-empty job lock, wrong mode, …): soft-skip so
+    // one file cannot mark the whole scan as lock_safety_check_failed.
+    if !safe(&metadata) {
+        return Ok(false);
+    }
+    let known_updated_old = known.map(|(_, _, at)| *at < now - 86400.0).unwrap_or(false);
+    // Orphans and completed-with-fresh-updated_at need an aged lock before flock.
+    // Completed-with-old-updated_at may reclaim without waiting on mtime/ctime.
+    if (known.is_none() || !known_updated_old) && !old(&metadata, now) {
         return Ok(false);
     }
     if !runtime::try_lock(&file)? {
@@ -148,7 +157,7 @@ pub(crate) fn remove(
         runtime::task_lock_current(path, &file)?,
         "request lock identity changed"
     );
-    let mut orphan = known.is_none();
+    let mut require_aged_lock = known.is_none();
     if let Some((id, _, _)) = known {
         let state = crate::queue::connect(config)?
             .query_row(
@@ -158,20 +167,30 @@ pub(crate) fn remove(
             )
             .optional()?;
         match state {
-            Some((state, at))
-                if state == "completed" && at.is_finite() && at >= 0.0 && at < now - 86400.0 => {}
+            Some((state, at)) if state == "completed" && at.is_finite() && at >= 0.0 => {
+                if at < now - 86400.0 {
+                    require_aged_lock = false;
+                } else if old(&metadata, now) {
+                    require_aged_lock = true;
+                } else {
+                    return Ok(false);
+                }
+            }
             None if old(&metadata, now) => {
-                orphan = true;
+                require_aged_lock = true;
             }
             _ => return Ok(false),
         }
     }
     let current = file.metadata()?;
+    if !safe(&current) {
+        return Ok(false);
+    }
     ensure!(
-        safe(&current) && runtime::task_lock_current(path, &file)?,
+        runtime::task_lock_current(path, &file)?,
         "request lock identity changed"
     );
-    if orphan && !old(&current, now) {
+    if require_aged_lock && !old(&current, now) {
         return Ok(false);
     }
     fs::remove_file(path)?;
