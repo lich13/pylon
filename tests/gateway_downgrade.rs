@@ -158,7 +158,9 @@ fn active_retained_history_blocks_every_supported_target_without_writing_state()
         let (_temporary, config, database_path) = home_with_state(&entries, false);
         let before = state_snapshot(&database_path);
 
-        for target in ["0.5.3", "0.5.4", "0.5.5", "0.5.6", "0.5.7", "0.5.8", "0.5.9"] {
+        for target in [
+            "0.5.3", "0.5.4", "0.5.5", "0.5.6", "0.5.7", "0.5.8", "0.5.9",
+        ] {
             let report = downgrade::check(&config, target);
             assert!(
                 !report.ok,

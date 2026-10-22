@@ -636,7 +636,10 @@ pub(crate) fn checkpoint_database(home: &Path, path: &Path, threshold: u64, forc
     let wal_path = PathBuf::from(wal_path);
     let wal_bytes = match std::fs::symlink_metadata(&wal_path) {
         Ok(m) if m.file_type().is_symlink() => {
-            return record_checkpoint(path, json!({"status":"unsafe_path","wal_bytes_before":null,"sampled_at":at}));
+            return record_checkpoint(
+                path,
+                json!({"status":"unsafe_path","wal_bytes_before":null,"sampled_at":at}),
+            );
         }
         Ok(m) => m.len(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
@@ -672,10 +675,18 @@ pub(crate) fn checkpoint_database(home: &Path, path: &Path, threshold: u64, forc
         db.execute_batch("PRAGMA query_only=OFF;")?;
         // PASSIVE first so a quiet database shrinks without waiting on readers.
         let _ = db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         });
         match db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         }) {
             Ok((busy, log, _)) if busy == 0 && log == 0 => Ok("truncated"),
             Ok((busy, _, _)) if busy != 0 => Ok("busy"),
@@ -683,7 +694,10 @@ pub(crate) fn checkpoint_database(home: &Path, path: &Path, threshold: u64, forc
             Err(error)
                 if matches!(
                     error.sqlite_error_code(),
-                    Some(rusqlite::ffi::ErrorCode::DatabaseBusy | rusqlite::ffi::ErrorCode::DatabaseLocked)
+                    Some(
+                        rusqlite::ffi::ErrorCode::DatabaseBusy
+                            | rusqlite::ffi::ErrorCode::DatabaseLocked
+                    )
                 ) =>
             {
                 Ok("busy")
@@ -762,7 +776,10 @@ mod checkpoint_tests {
             let mut wal = path.as_os_str().to_owned();
             wal.push("-wal");
             let before = std::fs::metadata(PathBuf::from(wal)).unwrap().len();
-            assert!(before > 4096, "fixture must leave a WAL while writer is open: {before}");
+            assert!(
+                before > 4096,
+                "fixture must leave a WAL while writer is open: {before}"
+            );
             // Keep the writer open so the sidecar stays large, then checkpoint via a
             // separate fail-fast connection; busy is acceptable and retried below.
             let first = checkpoint_database(home, &path, 1, true);

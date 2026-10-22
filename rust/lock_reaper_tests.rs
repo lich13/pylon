@@ -144,7 +144,10 @@ fn scan_is_bounded_continues_and_excludes_other_files_and_freeze() {
     let mut frozen = Scan::default();
     batch(&config, &mut frozen, &Requests::new(), &rx).unwrap();
     assert_eq!(frozen.checked, 0);
-    assert!(matches!(candidate("software-update-review.lock"), Some(Candidate::Job)));
+    assert!(matches!(
+        candidate("software-update-review.lock"),
+        Some(Candidate::Job)
+    ));
     assert!(matches!(
         candidate(&format!("request-{}.lock", "a".repeat(64))),
         Some(Candidate::Request(_))

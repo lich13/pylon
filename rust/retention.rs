@@ -581,7 +581,6 @@ async fn sweep(
     metrics.finish("completed", None);
 }
 
-
 fn wal_threshold(config: &Config) -> u64 {
     config
         .settings()
@@ -589,7 +588,8 @@ fn wal_threshold(config: &Config) -> u64 {
         .unwrap_or(32 * 1024 * 1024)
 }
 fn maybe_checkpoint(config: &Config, path: &Path, force: bool) {
-    let _ = crate::db::checkpoint_database(config.home.as_path(), path, wal_threshold(config), force);
+    let _ =
+        crate::db::checkpoint_database(config.home.as_path(), path, wal_threshold(config), force);
 }
 
 pub(crate) async fn gateway(app: crate::api::App, mut stop: watch::Receiver<bool>) {
@@ -717,14 +717,12 @@ pub(crate) async fn executor(config: Config, mut stop: watch::Receiver<bool>) {
             }
         }
         // Unfinished lock scans, post-thaw catch-up, and pending WAL shrink retry soon.
-        let pause = if locks.in_progress()
-            || thawed
-            || crate::queue::post_recovery_checkpoint_pending()
-        {
-            60.0
-        } else {
-            3600.0
-        };
+        let pause =
+            if locks.in_progress() || thawed || crate::queue::post_recovery_checkpoint_pending() {
+                60.0
+            } else {
+                3600.0
+            };
         if wait(&mut stop, pause).await {
             break;
         }
