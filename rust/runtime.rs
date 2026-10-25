@@ -96,6 +96,29 @@ pub(crate) fn acquire_task_lock(path: &Path) -> Result<Option<File>> {
     anyhow::bail!("task lock changed repeatedly during acquisition")
 }
 
+/// Inspect an existing lock without creating a missing file or changing state.
+pub(crate) fn existing_task_lock_held(path: &Path) -> Result<bool> {
+    let file = match fs::OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        file.metadata()?.is_file(),
+        "task lock is not a regular file"
+    );
+    let held = !try_lock(&file)?;
+    ensure!(
+        task_lock_current(path, &file)?,
+        "task lock changed during inspection"
+    );
+    Ok(held)
+}
+
 pub fn inherited_dispatch_lock(
     config: &Config,
     run: &str,
@@ -775,6 +798,9 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
     let Some(_quota) = quota else { return Ok(0) };
     // A waiting request may only take a quota slot after older requests in its group.
     // The dispatcher visits creation order; the lock also serializes direct triggers.
+    let Some(admission) = crate::queue::admission(config).await? else {
+        return Ok(0);
+    };
     let context = api::rpc(
         config,
         "context.open",
@@ -828,8 +854,13 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
     ] {
         env.insert(k.into(), v);
     }
+    if config.home.join("run/freeze").exists() {
+        let _ = api::rpc(config, "context.close", json!({}), token).await;
+        return Ok(0);
+    }
     api::rpc(config, "run.start", json!({"id":run}), token).await?;
     db.execute("UPDATE requests SET state='running',token=?,owner=?,updated_at=? WHERE id=? AND state='queued'",rusqlite::params![token,std::process::id(),crate::now(),run])?;
+    drop(admission);
     crate::queue::summary(config)?;
     let output = process_as(
         config,

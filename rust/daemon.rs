@@ -989,22 +989,24 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
             if let Some(age) = freeze_age_seconds(&app.config) {
                 let admission = snapshot.settings.admission.clone();
                 if age >= admission.freeze_alert_after_seconds {
-                    let bucket = age / admission.freeze_alert_repeat_seconds.max(1);
-                    let fingerprint = format!(
-                        "{}:{}",
-                        std::fs::metadata(app.config.home.join("run/freeze"))
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0),
-                        bucket
-                    );
+                    let started_at = std::fs::metadata(app.config.home.join("run/freeze"))
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
                     if let Some(target) = snapshot.settings.routes.get("personal") {
                         let target = target.clone();
                         if let Err(error) = app
                             .store
-                            .blocking(move |s| s.freeze_alert(&target, age, &fingerprint))
+                            .blocking(move |s| {
+                                s.freeze_alert(
+                                    &target,
+                                    age,
+                                    started_at,
+                                    admission.freeze_alert_repeat_seconds,
+                                )
+                            })
                             .await
                         {
                             crate::errors::log("freeze-alert", &error);

@@ -967,8 +967,8 @@ async fn freeze_alert_is_deduped_and_system_claimable_while_frozen() {
     // store.path is gateway/state.sqlite3; home is parent of gateway
     let home = store.path.parent().unwrap().parent().unwrap().to_path_buf();
     std::fs::write(home.join("run/freeze"), b"").unwrap();
-    store.freeze_alert("fixture", 1200, "fp-1").unwrap();
-    store.freeze_alert("fixture", 1200, "fp-1").unwrap();
+    store.freeze_alert("fixture", 1200, 1000, 1800).unwrap();
+    store.freeze_alert("fixture", 1200, 1000, 1800).unwrap();
     let count: i64 = store
         .connect()
         .unwrap()
@@ -987,4 +987,87 @@ async fn freeze_alert_is_deduped_and_system_claimable_while_frozen() {
         .claim_ready_filtered("fixture", Some(false), true)
         .unwrap();
     assert!(matches!(ordinary, crate::db::Claim::Empty(_)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn minute_observations_do_not_repeat_hourly_retention_and_keep_thaw_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = Config::new(temp.path().to_owned());
+    std::fs::create_dir(config.home.join("run")).unwrap();
+    std::fs::write(config.home.join("run/freeze"), "").unwrap();
+    let mut schedule = Maintenance::new(&config);
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert!(schedule.observe(false, 0.0));
+    assert!(schedule.checkpoint_pending);
+    assert!(!schedule.sweep_due());
+    tokio::time::advance(Duration::from_secs(540)).await;
+    assert!(schedule.sweep_due());
+    schedule.swept();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert!(!schedule.sweep_due());
+    schedule.checkpoint_pending = false;
+    schedule.observe(false, 123.0);
+    assert!(
+        schedule.checkpoint_pending,
+        "durable completion is noticed even if recovery was short"
+    );
+}
+
+#[tokio::test]
+async fn forced_checkpoint_retries_after_reader_releases_wal() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = Config::new(temp.path().to_owned());
+    let path = config.home.join("fixture.sqlite3");
+    let writer = Connection::open(&path).unwrap();
+    writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE data(x); INSERT INTO data VALUES(1);").unwrap();
+    let reader = Connection::open(&path).unwrap();
+    reader.execute_batch("BEGIN; SELECT * FROM data;").unwrap();
+    writer.execute("INSERT INTO data VALUES(2)", []).unwrap();
+    let mut maintenance = Maintenance::new(&config);
+    maintenance.observe(false, 1.0);
+    maintenance
+        .checkpoint(&config, path.clone(), u64::MAX)
+        .await;
+    assert_eq!(crate::db::last_checkpoint(&path)["status"], "busy");
+    assert!(maintenance.checkpoint_pending);
+    reader.execute_batch("ROLLBACK").unwrap();
+    maintenance
+        .checkpoint(&config, path.clone(), u64::MAX)
+        .await;
+    assert_eq!(crate::db::last_checkpoint(&path)["status"], "truncated");
+    assert!(!maintenance.checkpoint_pending);
+    assert_eq!(
+        writer
+            .query_row("SELECT count(*) FROM data", [], |r| r.get::<_, u64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn disabling_retention_does_not_disable_wal_maintenance() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = Config::new(temp.path().to_owned());
+    std::fs::create_dir_all(config.home.join("config")).unwrap();
+    std::fs::write(
+        config.home.join("config/bots.json"),
+        r#"{"bots":{},"retention":{"enabled":false},"admission":{"wal_checkpoint_bytes":1048576}}"#,
+    )
+    .unwrap();
+    let writer = crate::queue::connect(&config).unwrap();
+    writer.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE fixture(x); INSERT INTO fixture VALUES(zeroblob(2097152));").unwrap();
+    let path = config.home.join("supervisor/task-state.sqlite3");
+    let (stop, rx) = watch::channel(false);
+    let worker = tokio::spawn(executor(config.clone(), rx));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while crate::db::last_checkpoint(&path)["status"] != "truncated" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    assert!(executor_storage(&config)["retention"].is_null());
+    assert!(executor_storage(&config)["locks"].is_null());
 }

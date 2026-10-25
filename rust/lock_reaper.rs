@@ -1,7 +1,5 @@
-//! Reclaim unlocked request/dispatch locks and leftover job locks under run/.
-//! Never delete long-held concurrency tokens: `daemon.lock` (process singleton)
-//! and `quota-*` (topic slot files). Openers validate identity after flock, so
-//! an opener waiting on an unlinked inode cannot enter a job.
+//! Reclaim only request/dispatch locks whose openers recheck inode identity.
+//! Job, process and quota locks may have external openers and must remain.
 use crate::{config::Config, runtime};
 use anyhow::{Result, ensure};
 use rusqlite::OptionalExtension;
@@ -55,40 +53,16 @@ fn requests(config: &Config) -> Result<Requests> {
     }
     Ok(result)
 }
-enum Candidate<'a> {
-    /// digest(request_id) for request-*/dispatch-* locks.
-    Request(&'a str),
-    /// Module job lock (`{job_id|job.lock}.lock`) left after the holder exited.
-    Job,
-}
-
-fn candidate(name: &str) -> Option<Candidate<'_>> {
-    // Held for the lifetime of the gateway/executor process or a quota slot.
-    // Deleting either would race live openers and scramble admission.
-    if name == "daemon.lock" || name.starts_with("quota-") {
-        return None;
-    }
-    if let Some(hash) = name
+fn candidate(name: &str) -> Option<&str> {
+    let hash = name
         .strip_prefix("dispatch-")
-        .or_else(|| name.strip_prefix("request-"))
-    {
-        let hash = hash.strip_suffix(".lock")?;
-        return (hash.len() == 64
-            && hash
-                .bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
-        .then_some(Candidate::Request(hash));
-    }
-    let stem = name.strip_suffix(".lock")?;
-    if stem.is_empty()
-        || stem.starts_with('.')
-        || !stem
+        .or_else(|| name.strip_prefix("request-"))?
+        .strip_suffix(".lock")?;
+    (hash.len() == 64
+        && hash
             .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
-    {
-        return None;
-    }
-    Some(Candidate::Job)
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+    .then_some(hash)
 }
 fn safe(metadata: &fs::Metadata) -> bool {
     // Executor runs as root:pylon and creates root-owned locks. Allow the same
@@ -115,9 +89,11 @@ pub(crate) fn remove(
     known: Option<&(String, String, f64)>,
     now: f64,
 ) -> Result<bool> {
-    // Belt-and-braces with candidate(): never unlink process/quota tokens.
-    if let Some(name) = path.file_name().and_then(|name| name.to_str())
-        && (name == "daemon.lock" || name.starts_with("quota-"))
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(candidate)
+        .is_none()
     {
         return Ok(false);
     }
@@ -233,16 +209,11 @@ fn batch(
         let Some(name) = name.to_str() else {
             continue;
         };
-        let Some(kind) = candidate(name) else {
+        let Some(hash) = candidate(name) else {
             continue;
         };
         scan.checked += 1;
-        let known = match kind {
-            Candidate::Request(hash) => requests.get(hash),
-            // Job locks are not keyed by request digest; treat as age-gated orphans.
-            Candidate::Job => None,
-        };
-        match remove(config, &entry.path(), known, crate::now()) {
+        match remove(config, &entry.path(), requests.get(hash), crate::now()) {
             Ok(true) => {
                 scan.deleted += 1;
                 scan.entries_removed += 1;

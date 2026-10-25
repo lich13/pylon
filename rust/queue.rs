@@ -20,25 +20,95 @@ static REPORT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static SPAWN_FAILURES: AtomicU64 = AtomicU64::new(0);
 static CHILD_FAILURES: AtomicU64 = AtomicU64::new(0);
 static SUMMARY_FAILURES: AtomicU64 = AtomicU64::new(0);
-static RECOVERY_ACTIVE: AtomicU64 = AtomicU64::new(0);
 static SKIPPED_DUPLICATE_TRIGGERS: AtomicU64 = AtomicU64::new(0);
-static LAST_FREEZE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static POST_RECOVERY_CHECKPOINT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-pub(crate) fn take_post_recovery_checkpoint() -> bool {
-    POST_RECOVERY_CHECKPOINT.swap(false, Ordering::Relaxed)
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Recovery {
+    pub active: bool,
+    pub completed_at: f64,
 }
-pub(crate) fn request_post_recovery_checkpoint() {
-    POST_RECOVERY_CHECKPOINT.store(true, Ordering::Relaxed);
+
+// Persist the mode, not process identities. Every entrypoint owns its request
+// lock; the admission lock covers the gap before a request becomes running.
+fn update_recovery(config: &Config, db: &rusqlite::Connection, limit: u32) -> Result<Recovery> {
+    let (was_active, was_frozen, completed_at): (bool, bool, f64) = db.query_row(
+        "SELECT active,frozen,completed_at FROM recovery WHERE id=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let (queued, running): (u64, u64) = db.query_row(
+        "SELECT count(*) FILTER (WHERE state='queued'),count(*) FILTER (WHERE state IN ('running','completing','reporting')) FROM requests WHERE state IN ('queued','running','completing','reporting')", [],
+        |r| Ok((r.get(0)?,r.get(1)?)),
+    )?;
+    let frozen = config.home.join("run/freeze").exists();
+    let active =
+        frozen || ((was_active || was_frozen || queued > u64::from(limit)) && queued + running > 0);
+    let completed_at = if was_active && !active {
+        now()
+    } else {
+        completed_at
+    };
+    if active != was_active || frozen != was_frozen {
+        db.execute(
+            "UPDATE recovery SET active=?,frozen=?,completed_at=? WHERE id=1",
+            params![active, frozen, completed_at],
+        )?;
+    }
+    Ok(Recovery {
+        active,
+        completed_at,
+    })
 }
-pub(crate) fn post_recovery_checkpoint_pending() -> bool {
-    POST_RECOVERY_CHECKPOINT.load(Ordering::Relaxed)
+
+pub fn record_freeze(config: &Config) -> Result<()> {
+    connect(config)?.execute("UPDATE recovery SET active=1,frozen=1 WHERE id=1", [])?;
+    Ok(())
 }
+
+pub(crate) fn recovery(config: &Config) -> Result<Recovery> {
+    let limit = config.settings()?.admission.recovery_concurrency;
+    let mut db = connect(config)?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let state = update_recovery(config, &tx, limit)?;
+    tx.commit()?;
+    Ok(state)
+}
+
+pub(crate) async fn admission(config: &Config) -> Result<Option<std::fs::File>> {
+    let config = config.clone();
+    crate::blocking(move || {
+        let db = connect(&config)?;
+        let path = config.home.join("supervisor/admission.lock");
+        // This private lock is never reaped. Wait off the async workers, and
+        // retain it until the caller has registered running in the database.
+        let lock = crate::runtime::open_task_lock(&path)?;
+        crate::runtime::lock(&lock)?;
+        ensure!(
+            crate::runtime::task_lock_current(&path, &lock)?,
+            "admission lock changed"
+        );
+        if config.home.join("run/freeze").exists() {
+            return Ok(None);
+        }
+        if recovery(&config)?.active {
+            let active: u32 = db.query_row(
+                "SELECT count(*) FROM requests WHERE state IN ('running','completing','reporting')",
+                [],
+                |r| r.get(0),
+            )?;
+            if active >= config.settings()?.admission.recovery_concurrency {
+                return Ok(None);
+            }
+        }
+        Ok(Some(lock))
+    })
+    .await
+}
+
 pub fn metrics() -> Value {
     json!({"result_transfer_failures":REPORT_FAILURES.load(Ordering::Relaxed),
         "spawn_failures":SPAWN_FAILURES.load(Ordering::Relaxed),"child_failures":CHILD_FAILURES.load(Ordering::Relaxed),
         "summary_failures":SUMMARY_FAILURES.load(Ordering::Relaxed),"sqlite_busy":crate::db::busy_count(),
-        "recovery_active":RECOVERY_ACTIVE.load(Ordering::Relaxed) != 0,
         "skipped_duplicate_triggers":SKIPPED_DUPLICATE_TRIGGERS.load(Ordering::Relaxed)})
 }
 pub fn connect(config: &Config) -> Result<crate::db::PooledConnection> {
@@ -89,6 +159,8 @@ pub fn connect(config: &Config) -> Result<crate::db::PooledConnection> {
         CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY,job_id TEXT NOT NULL,module TEXT NOT NULL,topic TEXT NOT NULL,model INTEGER NOT NULL,state TEXT NOT NULL,created_at REAL NOT NULL,updated_at REAL NOT NULL,execution_status TEXT,completion_status TEXT,detail TEXT NOT NULL DEFAULT '',report TEXT,token TEXT,owner INTEGER,completion_input TEXT);
         CREATE UNIQUE INDEX IF NOT EXISTS waiting_task ON requests(job_id) WHERE state='queued';
         CREATE TABLE IF NOT EXISTS triggers(id TEXT PRIMARY KEY,request_id TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS recovery(id INTEGER PRIMARY KEY CHECK(id=1),active INTEGER NOT NULL,frozen INTEGER NOT NULL,completed_at REAL NOT NULL);
+        INSERT OR IGNORE INTO recovery VALUES(1,0,0,0);
         CREATE INDEX IF NOT EXISTS requests_state_created ON requests(state,created_at);
         CREATE INDEX IF NOT EXISTS requests_created ON requests(created_at);
         CREATE INDEX IF NOT EXISTS triggers_request ON triggers(request_id);")?;
@@ -144,6 +216,11 @@ pub fn admit(
     if coalesced {
         SKIPPED_DUPLICATE_TRIGGERS.fetch_add(1, Ordering::Relaxed);
     }
+    let limit = config
+        .settings()
+        .map(|s| s.admission.recovery_concurrency)
+        .unwrap_or(4);
+    update_recovery(config, &tx, limit)?;
     tx.commit()?;
     summary(config)?;
     Ok(id)
@@ -169,7 +246,15 @@ pub fn summary_flush(config: &Config) -> Result<()> {
     })
 }
 pub fn summary_refresh(config: &Config) -> Result<()> {
-    summary_inner(config, false, Some(metrics())).inspect_err(|_| {
+    let state: (bool, f64) = connect(config)?.query_row(
+        "SELECT active,completed_at FROM recovery WHERE id=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut metrics = metrics();
+    metrics["recovery_active"] = json!(state.0);
+    metrics["recovery_completed_at"] = json!(state.1);
+    summary_inner(config, false, Some(metrics)).inspect_err(|_| {
         SUMMARY_FAILURES.fetch_add(1, Ordering::Relaxed);
     })
 }
@@ -255,15 +340,8 @@ pub async fn dispatch(config: &Config) -> Result<()> {
 }
 async fn dispatch_inner(config: &Config) -> Result<()> {
     let frozen = config.home.join("run/freeze").exists();
-    let was_frozen = LAST_FREEZE.swap(frozen, Ordering::Relaxed);
-    if was_frozen && !frozen {
-        // Thaw: force recovery drain even if the queue looks small.
-        RECOVERY_ACTIVE.store(1, Ordering::Relaxed);
-    }
-    let recovery_limit = match config.settings() {
-        Ok(settings) => settings.admission.recovery_concurrency.max(1),
-        Err(_) => 4,
-    };
+    let recovery_limit = config.settings()?.admission.recovery_concurrency;
+    let recovering = recovery(config)?.active;
     let rows = {
         let db = connect(config)?;
         // Mutable state and recovery fields are re-read after acquiring locks.
@@ -281,37 +359,29 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
         .iter()
         .filter(|(_, _, state)| *state != "queued")
         .count() as u32;
-    let queued = rows
-        .iter()
-        .filter(|(_, _, state)| *state == "queued")
-        .count() as u32;
-    let was_recovering = RECOVERY_ACTIVE.load(Ordering::Relaxed) != 0;
-    if queued == 0 && active == 0 {
-        RECOVERY_ACTIVE.store(0, Ordering::Relaxed);
-        if was_recovering {
-            // Drain finished: ask maintenance to TRUNCATE task-state WAL without blocking this lane.
-            POST_RECOVERY_CHECKPOINT.store(true, Ordering::Relaxed);
-            let path = config.home.join("supervisor/task-state.sqlite3");
-            let home = config.home.clone();
-            let threshold = config
-                .settings()
-                .map(|s| s.admission.wal_checkpoint_bytes)
-                .unwrap_or(32 * 1024 * 1024);
-            // Best-effort now; busy abandons and the retention loop retries via the flag.
-            let result = crate::db::checkpoint_database(&home, &path, threshold, true);
-            if result["status"] != "truncated" {
-                POST_RECOVERY_CHECKPOINT.store(true, Ordering::Relaxed);
-            } else {
-                POST_RECOVERY_CHECKPOINT.store(false, Ordering::Relaxed);
+    let mut starting = 0_u32;
+    if recovering {
+        for (id, _, state) in &rows {
+            if state == "queued"
+                && ["request", "dispatch"]
+                    .iter()
+                    .try_fold(false, |held, prefix| {
+                        Ok::<_, anyhow::Error>(
+                            held || crate::runtime::existing_task_lock_held(
+                                &config
+                                    .home
+                                    .join("run")
+                                    .join(format!("{prefix}-{}.lock", crate::digest(id))),
+                            )?,
+                        )
+                    })?
+            {
+                starting = starting.saturating_add(1);
             }
         }
-    } else if queued > recovery_limit || was_recovering {
-        RECOVERY_ACTIVE.store(1, Ordering::Relaxed);
     }
-    let recovering = RECOVERY_ACTIVE.load(Ordering::Relaxed) != 0;
     let mut launched = 0_u32;
-    for (id, job, initial_state) in rows {
-        let _ = initial_state;
+    for (id, job, _) in rows {
         let Some(dispatch_lock) = crate::runtime::acquire_task_lock(
             &config
                 .home
@@ -354,7 +424,9 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
             if frozen {
                 continue;
             }
-            if recovering && active.saturating_add(launched) >= recovery_limit {
+            if recovering
+                && active.saturating_add(starting).saturating_add(launched) >= recovery_limit
+            {
                 continue;
             }
             let mut command = tokio::process::Command::new(std::env::current_exe()?);
@@ -476,5 +548,62 @@ mod recovery_tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Config) {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config::new(temp.path().to_owned());
+        std::fs::create_dir_all(config.home.join("config")).unwrap();
+        std::fs::write(
+            config.home.join("config/bots.json"),
+            r#"{"bots":{},"admission":{"recovery_concurrency":1}}"#,
+        )
+        .unwrap();
+        connect(&config).unwrap();
+        (temp, config)
+    }
+
+    #[tokio::test]
+    async fn recovery_is_shared_until_all_active_work_finishes() {
+        let (_temp, config) = fixture();
+        std::fs::write(config.home.join("run/freeze"), "").unwrap();
+        record_freeze(&config).unwrap();
+        admit(&config, "job-a", "fixture", "fixture", false, "a").unwrap();
+        admit(&config, "job-b", "fixture", "fixture", false, "b").unwrap();
+        assert!(admission(&config).await.unwrap().is_none());
+        std::fs::remove_file(config.home.join("run/freeze")).unwrap();
+        assert!(recovery(&config).unwrap().active);
+        let first = admission(&config).await.unwrap().unwrap();
+        assert!(
+            crate::runtime::existing_task_lock_held(&config.home.join("supervisor/admission.lock"))
+                .unwrap()
+        );
+        connect(&config)
+            .unwrap()
+            .execute("UPDATE requests SET state='running' WHERE id='a'", [])
+            .unwrap();
+        drop(first);
+        assert!(admission(&config.clone()).await.unwrap().is_none());
+        connect(&config)
+            .unwrap()
+            .execute("UPDATE requests SET state='completed' WHERE id='a'", [])
+            .unwrap();
+        assert!(admission(&config).await.unwrap().is_some());
+        connect(&config)
+            .unwrap()
+            .execute("UPDATE requests SET state='completed'", [])
+            .unwrap();
+        let done = recovery(&config).unwrap();
+        assert!(!done.active);
+        assert!(done.completed_at > 0.0);
+        assert_eq!(recovery(&config).unwrap().completed_at, done.completed_at);
+        // An ordinary trigger after draining uses topic quotas again.
+        admit(&config, "job-c", "fixture", "fixture", false, "c").unwrap();
+        assert!(!recovery(&config).unwrap().active);
     }
 }

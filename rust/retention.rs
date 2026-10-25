@@ -581,149 +581,193 @@ async fn sweep(
     metrics.finish("completed", None);
 }
 
-fn wal_threshold(config: &Config) -> u64 {
-    config
-        .settings()
-        .map(|s| s.admission.wal_checkpoint_bytes)
-        .unwrap_or(32 * 1024 * 1024)
+// One existing maintenance worker per process: cheap observations each minute,
+// retention at its original startup/hourly cadence. Busy checkpoints keep their
+// pending flag; neither dispatch nor a request performs WAL maintenance.
+struct Maintenance {
+    next_sweep: tokio::time::Instant,
+    saw_freeze: bool,
+    completed_at: f64,
+    checkpoint_pending: bool,
 }
-fn maybe_checkpoint(config: &Config, path: &Path, force: bool) {
-    let _ =
-        crate::db::checkpoint_database(config.home.as_path(), path, wal_threshold(config), force);
+impl Maintenance {
+    fn new(config: &Config) -> Self {
+        Self {
+            next_sweep: tokio::time::Instant::now() + Duration::from_secs(600),
+            saw_freeze: config.home.join("run/freeze").exists(),
+            completed_at: 0.0,
+            checkpoint_pending: false,
+        }
+    }
+    fn observe(&mut self, frozen: bool, completed_at: f64) -> bool {
+        let thawed = self.saw_freeze && !frozen;
+        if thawed || completed_at > self.completed_at {
+            self.checkpoint_pending = true;
+        }
+        self.saw_freeze = frozen;
+        self.completed_at = self.completed_at.max(completed_at);
+        thawed
+    }
+    fn sweep_due(&self) -> bool {
+        tokio::time::Instant::now() >= self.next_sweep
+    }
+    fn swept(&mut self) {
+        self.next_sweep = tokio::time::Instant::now() + Duration::from_secs(3600);
+    }
+    fn delay(&self, retention_enabled: bool, frozen: bool) -> f64 {
+        if retention_enabled && !frozen {
+            self.next_sweep
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_secs_f64()
+                .min(60.0)
+        } else {
+            60.0
+        }
+    }
+    async fn checkpoint(&mut self, config: &Config, path: std::path::PathBuf, threshold: u64) {
+        let config = config.clone();
+        let force = self.checkpoint_pending;
+        if let Ok(result) = crate::blocking(move || {
+            Ok(crate::db::checkpoint_database(
+                &config.home,
+                &path,
+                threshold,
+                force,
+            ))
+        })
+        .await
+            && matches!(result["status"].as_str(), Some("truncated" | "missing"))
+        {
+            self.checkpoint_pending = false;
+        }
+    }
 }
 
 pub(crate) async fn gateway(app: crate::api::App, mut stop: watch::Receiver<bool>) {
     let mut cursors = BTreeMap::new();
     let mut next_orphans = 0.0;
-    if wait(&mut stop, 600.0).await {
-        return;
-    }
-    loop {
-        let policy = app.snapshot.read().await.settings.retention.clone();
-        if policy.enabled && !interrupted(&app.config, &stop) {
-            let mut kinds = vec![
-                Kind::Updates,
-                Kind::Runs,
-                Kind::Events,
-                Kind::WebTokens,
-                Kind::WebSessions,
-                Kind::Contexts,
-                Kind::History,
-            ];
-            let scan_orphans = crate::now() >= next_orphans;
-            if scan_orphans {
-                kinds.push(Kind::Orphans);
-            }
-            sweep(
-                &app.config,
-                Some(&app.store),
-                &policy,
-                &kinds,
-                &mut cursors,
-                &app.store.runtime.retention,
-                &mut stop,
-            )
-            .await;
-            if scan_orphans && app.store.runtime.retention.snapshot()["status"] == "completed" {
-                next_orphans = crate::now() + 86400.0;
+    let mut maintenance = Maintenance::new(&app.config);
+    while !*stop.borrow() {
+        let settings = app.snapshot.read().await.settings.clone();
+        let frozen = app.config.home.join("run/freeze").exists();
+        let completed_at = crate::queue::public(&app.config)["metrics"]["recovery_completed_at"]
+            .as_f64()
+            .unwrap_or(0.0);
+        maintenance.observe(frozen, completed_at);
+        if !frozen {
+            if settings.retention.enabled && maintenance.sweep_due() {
+                let mut kinds = vec![
+                    Kind::Updates,
+                    Kind::Runs,
+                    Kind::Events,
+                    Kind::WebTokens,
+                    Kind::WebSessions,
+                    Kind::Contexts,
+                    Kind::History,
+                ];
+                let scan_orphans = crate::now() >= next_orphans;
+                if scan_orphans {
+                    kinds.push(Kind::Orphans);
+                }
+                sweep(
+                    &app.config,
+                    Some(&app.store),
+                    &settings.retention,
+                    &kinds,
+                    &mut cursors,
+                    &app.store.runtime.retention,
+                    &mut stop,
+                )
+                .await;
+                if scan_orphans && app.store.runtime.retention.snapshot()["status"] == "completed" {
+                    next_orphans = crate::now() + 86400.0;
+                }
+                maintenance.swept();
             }
             if !interrupted(&app.config, &stop) {
-                let path = app.config.db();
-                let config = app.config.clone();
-                let _ = crate::blocking(move || {
-                    maybe_checkpoint(&config, &path, false);
-                    Ok(())
-                })
-                .await;
+                maintenance
+                    .checkpoint(
+                        &app.config,
+                        app.config.db(),
+                        settings.admission.wal_checkpoint_bytes,
+                    )
+                    .await;
             }
         }
-        if wait(&mut stop, 3600.0).await {
+        if wait(
+            &mut stop,
+            maintenance.delay(settings.retention.enabled, frozen),
+        )
+        .await
+        {
             break;
         }
     }
 }
+
 pub(crate) async fn executor(config: Config, mut stop: watch::Receiver<bool>) {
     let mut cursors = BTreeMap::new();
     let metrics = Metrics::default();
     let mut locks = crate::lock_reaper::Scan::default();
-    let mut saw_freeze = config.home.join("run/freeze").exists();
-    if wait(&mut stop, 600.0).await {
-        return;
-    }
-    loop {
-        let frozen = interrupted(&config, &stop);
-        let thawed = saw_freeze && !frozen;
-        saw_freeze = frozen;
-        if !frozen {
-            let read = config.clone();
-            match crate::blocking(move || Ok(read.settings()?.retention)).await {
-                Ok(policy) if policy.enabled => {
-                    sweep(
-                        &config,
-                        None,
-                        &policy,
-                        &[Kind::Requests],
-                        &mut cursors,
-                        &metrics,
-                        &mut stop,
-                    )
-                    .await;
-                    let report = metrics.snapshot();
-                    let completed = report["status"] == "completed";
-                    let continue_locks = locks.in_progress() || completed || thawed;
-                    executor_metrics()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .entry(config.home.clone())
-                        .or_default()
-                        .retention = report;
-                    // Keep reclaiming while a directory scan is unfinished, and always
-                    // after thaw so overnight freezes do not wait for the next hour.
-                    if completed || continue_locks {
-                        locks = crate::lock_reaper::run(&config, locks, &mut stop).await;
+    let mut maintenance = Maintenance::new(&config);
+    while !*stop.borrow() {
+        let frozen = config.home.join("run/freeze").exists();
+        let read = config.clone();
+        let state =
+            crate::blocking(move || Ok((read.settings()?, crate::queue::recovery(&read)?))).await;
+        let mut retention_enabled = false;
+        match state {
+            Ok((settings, recovery)) => {
+                retention_enabled = settings.retention.enabled;
+                let thawed = maintenance.observe(frozen, recovery.completed_at);
+                if !frozen {
+                    let due = maintenance.sweep_due();
+                    if settings.retention.enabled {
+                        if due {
+                            sweep(
+                                &config,
+                                None,
+                                &settings.retention,
+                                &[Kind::Requests],
+                                &mut cursors,
+                                &metrics,
+                                &mut stop,
+                            )
+                            .await;
+                            executor_metrics()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .entry(config.home.clone())
+                                .or_default()
+                                .retention = metrics.snapshot();
+                            maintenance.swept();
+                        }
+                        if due || thawed || locks.in_progress() {
+                            locks = crate::lock_reaper::run(&config, locks, &mut stop).await;
+                        }
                     }
-                    let force = thawed || crate::queue::take_post_recovery_checkpoint();
-                    let path = config.home.join("supervisor/task-state.sqlite3");
-                    let config_copy = config.clone();
-                    let outcome = crate::blocking(move || {
-                        Ok(crate::db::checkpoint_database(
-                            config_copy.home.as_path(),
-                            &path,
-                            wal_threshold(&config_copy),
-                            force,
-                        ))
-                    })
-                    .await;
-                    if force
-                        && let Ok(result) = outcome
-                        && !matches!(
-                            result["status"].as_str(),
-                            Some("truncated" | "skipped_frozen" | "skipped_small" | "missing")
-                        )
-                    {
-                        crate::queue::request_post_recovery_checkpoint();
+                    if !interrupted(&config, &stop) {
+                        maintenance
+                            .checkpoint(
+                                &config,
+                                config.home.join("supervisor/task-state.sqlite3"),
+                                settings.admission.wal_checkpoint_bytes,
+                            )
+                            .await;
                     }
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    metrics.finish("failed", Some("configuration_invalid"));
-                    executor_metrics()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .entry(config.home.clone())
-                        .or_default()
-                        .retention = metrics.snapshot();
                 }
             }
+            Err(_) => {
+                metrics.finish("failed", Some("configuration_invalid"));
+                executor_metrics()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(config.home.clone())
+                    .or_default()
+                    .retention = metrics.snapshot();
+            }
         }
-        // Unfinished lock scans, post-thaw catch-up, and pending WAL shrink retry soon.
-        let pause =
-            if locks.in_progress() || thawed || crate::queue::post_recovery_checkpoint_pending() {
-                60.0
-            } else {
-                3600.0
-            };
-        if wait(&mut stop, pause).await {
+        if wait(&mut stop, maintenance.delay(retention_enabled, frozen)).await {
             break;
         }
     }

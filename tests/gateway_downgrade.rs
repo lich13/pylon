@@ -232,3 +232,22 @@ fn expired_retained_history_preserves_completion_and_counter_checks() {
     assert_eq!(report.reason, Some("pending_completions"));
     assert_eq!(state_snapshot(&database_path), before);
 }
+
+#[test]
+fn target_0511_accepts_valid_retained_history_but_rejects_corruption_and_buffers() {
+    let valid = gone("fixture", pylon::now() + 86400.0);
+    let (_temp, config, path) = home_with_state(
+        &[(COUNTER_KEY, counter()), ("event-gone:fixture", valid)],
+        false,
+    );
+    let before = state_snapshot(&path);
+    assert!(downgrade::check(&config, "0.5.11").ok);
+    assert_eq!(state_snapshot(&path), before);
+    let (_temp, config, _) = home_with_state(&[("event-gone:fixture", "{}".into())], false);
+    assert!(!downgrade::check(&config, "0.5.11").ok);
+    let (_temp, config, _) = home_with_state(&[(COUNTER_KEY, counter())], true);
+    assert_eq!(
+        downgrade::check(&config, "0.5.11").reason,
+        Some("pending_completions")
+    );
+}

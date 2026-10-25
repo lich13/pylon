@@ -171,40 +171,57 @@ impl Store {
         }
         Ok(())
     }
-    /// Queue a de-duplicated ops alert while admission is frozen too long.
-    pub fn freeze_alert(&self, target: &str, age_seconds: u64, fingerprint: &str) -> Result<()> {
+    /// The last alert is sufficient for both restart-safe deduplication and the
+    /// actual minimum repeat interval. Do not accumulate one KV key per bucket.
+    pub fn freeze_alert(
+        &self,
+        target: &str,
+        age_seconds: u64,
+        started_at: u64,
+        repeat: u64,
+    ) -> Result<()> {
+        self.freeze_alert_at(target, age_seconds, started_at, repeat, crate::now())
+    }
+    fn freeze_alert_at(
+        &self,
+        target: &str,
+        age_seconds: u64,
+        started_at: u64,
+        repeat: u64,
+        now: f64,
+    ) -> Result<()> {
         let mut db = self.connect()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let key = format!("freeze-alert:{fingerprint}");
-        let exists: bool =
-            tx.query_row("SELECT EXISTS(SELECT 1 FROM kv WHERE key=?)", [&key], |r| {
-                r.get(0)
-            })?;
-        if exists {
-            return Ok(());
+        let last: Option<String> = tx
+            .query_row(
+                "SELECT value FROM kv WHERE key='freeze-alert:last'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = last {
+            let last: Value = serde_json::from_str(&raw)?;
+            // Recognize the previous release's timestamp:bucket fingerprint.
+            let previous_start = last["started_at"].as_u64().or_else(|| {
+                last["fingerprint"]
+                    .as_str()?
+                    .split(':')
+                    .next()?
+                    .parse()
+                    .ok()
+            });
+            if previous_start == Some(started_at)
+                && now - last["at"].as_f64().context("invalid freeze alert time")? < repeat as f64
+            {
+                return Ok(());
+            }
         }
         let minutes = age_seconds / 60;
-        let id = crate::digest(&key);
-        let payload = json!({
-            "text": format!(
-                "Pylon 新触发仍处于冻结状态，已持续约 {minutes} 分钟。若升级已结束请删除 run/freeze；失败升级应保留冻结并先排查。"
-            ),
-            "expires_at": crate::now() + 600.0
-        });
-        let record =
-            json!({"at": crate::now(), "age_seconds": age_seconds, "fingerprint": fingerprint});
-        tx.execute(
-            "INSERT INTO kv VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![key, record.to_string()],
-        )?;
-        tx.execute(
-            "INSERT INTO kv VALUES('freeze-alert:last',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [record.to_string()],
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'freeze-alert','text',?,'pending',0,0,?,?,'gateway')",
-            params![&id[..32], target, payload.to_string(), crate::now(), crate::now()],
-        )?;
+        let id = crate::digest(format!("freeze-alert:{started_at}:{now}"));
+        let payload = json!({"text":format!("Pylon 新触发仍处于冻结状态，已持续约 {minutes} 分钟。升级成功后可解冻；失败升级应保留冻结并先排查。"),"expires_at":now+600.0});
+        let record = json!({"at":now,"age_seconds":age_seconds,"started_at":started_at,"fingerprint":format!("{started_at}:{}", age_seconds / repeat.max(1))});
+        tx.execute("INSERT INTO kv VALUES('freeze-alert:last',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [record.to_string()])?;
+        tx.execute("INSERT OR IGNORE INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'freeze-alert','text',?,'pending',0,0,?,?,'gateway')", params![&id[..32],target,payload.to_string(),now,now])?;
         tx.commit()?;
         self.runtime
             .delivery_ready(target, crate::optimization::Lane::Telegram);
@@ -390,37 +407,22 @@ impl Store {
     ) -> Result<Claim> {
         let mut db = self.connect()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let row = if system_only {
-            tx.query_row(
-                "SELECT id,kind,payload,receipt,attempts FROM events WHERE profile=? AND status='pending' AND next_attempt<=? AND (? IS NULL OR (kind='bark')=?) AND module='gateway' AND job_id='freeze-alert' ORDER BY created_at,id LIMIT 1",
-                params![bot, crate::now(), bark, bark],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                        r.get::<_, i64>(4)?,
-                    ))
-                },
-            )
-            .optional()?
+        let query = if system_only {
+            "SELECT id,kind,payload,receipt,attempts FROM events WHERE profile=? AND status='pending' AND next_attempt<=? AND (? IS NULL OR (kind='bark')=?) AND module='gateway' AND job_id='freeze-alert' ORDER BY created_at,id LIMIT 1"
         } else {
-            tx.query_row(
-                "SELECT id,kind,payload,receipt,attempts FROM events WHERE profile=? AND status='pending' AND next_attempt<=? AND (? IS NULL OR (kind='bark')=?) ORDER BY created_at,id LIMIT 1",
-                params![bot, crate::now(), bark, bark],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                        r.get::<_, i64>(4)?,
-                    ))
-                },
-            )
-            .optional()?
+            "SELECT id,kind,payload,receipt,attempts FROM events WHERE profile=? AND status='pending' AND next_attempt<=? AND (? IS NULL OR (kind='bark')=?) ORDER BY created_at,id LIMIT 1"
         };
+        let row = tx
+            .query_row(query, params![bot, crate::now(), bark, bark], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .optional()?;
         let Some((id, kind, payload, receipt, attempts)) = row else {
             let due = if system_only {
                 tx.query_row(
@@ -816,5 +818,79 @@ mod checkpoint_tests {
         std::fs::File::create(home.join("run/freeze")).unwrap();
         let frozen = checkpoint_database(home, &path, 1, true);
         assert_eq!(frozen["status"], "skipped_frozen");
+    }
+}
+
+#[cfg(test)]
+mod freeze_alert_tests {
+    use super::*;
+
+    #[test]
+    fn actual_repeat_interval_survives_reopening_and_uses_one_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite3");
+        let store = Store::new(&path).unwrap();
+        store
+            .freeze_alert_at("fixture", 900, 100, 1800, 1000.0)
+            .unwrap();
+        // The old bucket scheme sent a second alert at age 1800, only 900s later.
+        let reopened = Store::new(&path).unwrap();
+        reopened
+            .freeze_alert_at("fixture", 1800, 100, 1800, 1900.0)
+            .unwrap();
+        reopened
+            .freeze_alert_at("fixture", 2699, 100, 1800, 2799.0)
+            .unwrap();
+        let count = || {
+            reopened
+                .connect()
+                .unwrap()
+                .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert_eq!(count(), 1);
+        reopened
+            .freeze_alert_at("fixture", 2700, 100, 1800, 2800.0)
+            .unwrap();
+        assert_eq!(count(), 2);
+        reopened
+            .freeze_alert_at("fixture", 900, 2000, 1800, 2900.0)
+            .unwrap();
+        assert_eq!(count(), 3, "a different freeze has its own first alert");
+        assert_eq!(
+            reopened
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM kv WHERE key LIKE 'freeze-alert:%'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_last_alert_still_enforces_repeat_interval() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(&temp.path().join("state.sqlite3")).unwrap();
+        store
+            .put(
+                "freeze-alert:last",
+                &json!({"at":1000.0,"fingerprint":"100:0"}),
+            )
+            .unwrap();
+        store
+            .freeze_alert_at("fixture", 1800, 100, 1800, 1900.0)
+            .unwrap();
+        assert_eq!(
+            store
+                .connect()
+                .unwrap()
+                .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 }

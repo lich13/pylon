@@ -137,22 +137,16 @@ fn scan_is_bounded_continues_and_excludes_other_files_and_freeze() {
     assert!(scan.finished);
     assert!(scan.checked > checked);
     assert_eq!(scan.directory_entries, Some(1201));
-    // job.lock is now a reclaimable job-lock candidate (skipped here: not old enough).
-    assert_eq!(scan.checked, 1201);
+    assert_eq!(scan.checked, 1200);
     assert_eq!(scan.deleted, 0);
     fs::write(config.home.join("run/freeze"), b"").unwrap();
     let mut frozen = Scan::default();
     batch(&config, &mut frozen, &Requests::new(), &rx).unwrap();
     assert_eq!(frozen.checked, 0);
-    assert!(matches!(
-        candidate("software-update-review.lock"),
-        Some(Candidate::Job)
-    ));
-    assert!(matches!(
-        candidate(&format!("request-{}.lock", "a".repeat(64))),
-        Some(Candidate::Request(_))
-    ));
+    assert!(candidate(&format!("request-{}.lock", "a".repeat(64))).is_some());
     for name in [
+        "software-update-review.lock",
+        "job.lock",
         "daemon.lock",
         "quota-personal-process-0.lock",
         "dispatch-deadbeef.lock",
@@ -164,7 +158,7 @@ fn scan_is_bounded_continues_and_excludes_other_files_and_freeze() {
 }
 
 #[test]
-fn old_unlocked_job_locks_are_reclaimed_while_daemon_and_quota_are_not_candidates() {
+fn old_job_process_and_quota_locks_are_never_reclaimed() {
     let (_temp, config) = fixture();
     let now = crate::now() + 86401.0;
     let run = config.home.join("run");
@@ -175,10 +169,10 @@ fn old_unlocked_job_locks_are_reclaimed_while_daemon_and_quota_are_not_candidate
     ] {
         drop(runtime::open_task_lock(&run.join(name)).unwrap());
         assert!(
-            remove(&config, &run.join(name), None, now).unwrap(),
-            "{name} should be reclaimed as an aged orphan job lock"
+            !remove(&config, &run.join(name), None, now).unwrap(),
+            "{name} must remain for openers without inode checks"
         );
-        assert!(!run.join(name).exists());
+        assert!(run.join(name).exists());
     }
     for name in ["daemon.lock", "quota-trading-model-0.lock"] {
         assert!(candidate(name).is_none(), "{name} must stay unreclaimable");
@@ -206,15 +200,10 @@ fn completed_with_fresh_updated_at_reclaims_when_lock_file_is_old() {
 }
 
 #[test]
-fn nonempty_job_lock_is_soft_skipped_without_scan_error() {
+fn nonempty_request_lock_is_soft_skipped_without_scan_error() {
     let (_temp, config) = fixture();
-    let run = config.home.join("run");
-    fs::write(run.join("gmail-web-worker.lock"), b"holder\n").unwrap();
-    fs::set_permissions(
-        run.join("gmail-web-worker.lock"),
-        fs::Permissions::from_mode(0o660),
-    )
-    .unwrap();
+    fs::write(path(&config, "nonempty"), b"holder\n").unwrap();
+    fs::set_permissions(path(&config, "nonempty"), fs::Permissions::from_mode(0o660)).unwrap();
     let (_, rx) = watch::channel(false);
     let mut scan = Scan::default();
     batch(&config, &mut scan, &Requests::new(), &rx).unwrap();
@@ -223,5 +212,5 @@ fn nonempty_job_lock_is_soft_skipped_without_scan_error() {
     assert_eq!(scan.deleted, 0);
     assert_eq!(scan.skipped, 1);
     assert!(scan.scan_error.is_none(), "{:?}", scan.scan_error);
-    assert!(run.join("gmail-web-worker.lock").exists());
+    assert!(path(&config, "nonempty").exists());
 }

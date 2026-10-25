@@ -2,6 +2,20 @@
 
 Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、共享网页登录、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
+## v0.5.12 运行与升级
+
+本版修正 v0.5.9–v0.5.11 的部署、恢复限流及维护行为；以下约定优先于后文历史版本说明。
+
+- 升级脚本先校验 CI 产物，再冻结新准入，并等待所有在途任务、启动中的请求、命令、投递和完成缓冲排空，默认 300 秒。排空使用完整状态，不以任务摘要的 200 条展示窗口代替。
+- 新版三个核心服务 active、网关诊断版本一致、executor／broker socket 可连接后才解冻，健康等待默认 60 秒。失败返回非零；开始停服务后的失败自动恢复上一版二进制与 REVISION，保持冻结，不恢复旧数据库、不自动重试切换。回退兼容检查受阻时保留冻结并报告 blocked。
+- `scripts/deploy-gateway.sh` 支持 `--drain-timeout`、`--health-timeout`；成功解冻才报告 complete。`pylon drain-status` 是 root 只读检查，输出冻结状态及 tasks／starting／commands／deliveries／completions 全量计数；仅冻结且全部为零时退出 0。
+- 锁回收仅处理 request／dispatch 锁。job、daemon、quota 及其它锁均保留；已有外部持有者不一定会复核文件身份。保留 completed 请求按锁龄回收和不安全文件软跳过行为。
+- execute、resume 和后台派发共用恢复准入，启动登记前也受保护。恢复模式与完成时间保存在任务库的单行 recovery 表；新增表兼容旧版本，不改变请求字段。诊断任务 metrics 保留 recovery_active，并增加 recovery_completed_at；排空后恢复原主题配额。
+- 两个既有维护任务每分钟检查冻结、恢复完成和 WAL 阈值，普通保留清理仍在启动 10 分钟后开始、每小时一轮。checkpoint 在维护路径执行；冻结时跳过，busy 后下轮重试，retention.enabled=false 不停止 WAL 维护。解冻后的锁回收在下次分钟检查执行。
+- 冻结提醒从实际发送入队时间计算重复间隔，复用 freeze-alert:last；兼容旧记录，停止新增逐时间桶的 KV 键。原冻结提醒白名单保持不变。
+
+v0.5.12 的 `downgrade-check --target-version 0.5.11` 接受该版本已支持的有效事件占位记录，仍拒绝损坏状态和未处理完成缓冲。新增恢复状态不会阻止 v0.5.11 读取原请求数据。生产发布继续使用 main 提交对应的成功 CI 成品，标签不另行构建。
+
 ## 本机开发
 
 本机 `rust-toolchain.toml`、最低支持版本与 CI 均固定为 Rust 1.99.0，edition 为 2024；依赖沿用 `Cargo.lock`，日常工作不依赖云端开发环境。

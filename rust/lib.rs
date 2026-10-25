@@ -7,6 +7,7 @@ mod completion;
 pub mod config;
 pub mod daemon;
 pub mod db;
+pub mod deployment;
 pub mod downgrade;
 pub mod errors;
 mod event_history;

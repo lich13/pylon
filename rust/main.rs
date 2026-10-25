@@ -32,6 +32,8 @@ enum Command {
         dispatch_fd: Option<i32>,
     },
     Diagnose,
+    /// Inspect all in-flight work without modifying state; exits 0 only when drained and frozen.
+    DrainStatus,
     /// Create run/freeze so new triggers and non-system delivery pause.
     Freeze,
     /// Remove run/freeze after a successful upgrade. Refuses if the marker is absent.
@@ -144,6 +146,23 @@ enum Modules {
 }
 fn main() {
     let args = Args::parse();
+    if matches!(args.command, Command::DrainStatus) {
+        let mut config = Config::new(args.home.clone());
+        config.offline = args.offline;
+        match pylon::deployment::drain_status(&config) {
+            Ok(status) => {
+                println!(
+                    "{}",
+                    serde_json::to_string(&status).expect("drain status serializes")
+                );
+                std::process::exit(i32::from(!status.ready));
+            }
+            Err(error) => {
+                pylon::errors::log("drain-status", &error);
+                std::process::exit(1);
+            }
+        }
+    }
     if let Command::DowngradeCheck { target_version } = &args.command {
         let report = pylon::downgrade::check(&Config::new(args.home.clone()), target_version);
         match serde_json::to_string(&report) {
@@ -231,7 +250,7 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
             ensure!(unsafe { libc::geteuid() } == 0, "freeze requires root");
             let path = config.home.join("run/freeze");
             std::fs::create_dir_all(path.parent().context("run directory missing")?)?;
-            if path.exists() {
+            let result = if path.exists() {
                 ensure!(path.is_file(), "freeze path is not a regular file");
                 json!({"ok":true,"freeze":true,"created":false})
             } else {
@@ -248,18 +267,24 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
                 std::os::unix::fs::chown(&path, Some(0), Some(gid))?;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))?;
                 json!({"ok":true,"freeze":true,"created":true})
+            };
+            std::fs::File::open(path.parent().context("run directory missing")?)?.sync_all()?;
+            if config.home.join("supervisor/task-state.sqlite3").is_file() {
+                pylon::queue::record_freeze(&config)?;
             }
+            result
         }
         Command::Thaw => {
             ensure!(unsafe { libc::geteuid() } == 0, "thaw requires root");
             let path = config.home.join("run/freeze");
             ensure!(path.is_file(), "freeze marker missing");
             std::fs::remove_file(&path)?;
-            // Best-effort ops notice that admission resumed.
-            let _ = api::rpc(&config, "diagnostics", json!({}), "").await;
+            std::fs::File::open(path.parent().context("run directory missing")?)?.sync_all()?;
             json!({"ok":true,"freeze":false})
         }
-        Command::DowngradeCheck { .. } => anyhow::bail!("invalid command dispatch"),
+        Command::DowngradeCheck { .. } | Command::DrainStatus => {
+            anyhow::bail!("invalid command dispatch")
+        }
         Command::Serve { id } => {
             let code = pylon::runtime::service(&config, &id).await?;
             if code != 0 {
