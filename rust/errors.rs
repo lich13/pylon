@@ -26,6 +26,37 @@ impl std::fmt::Display for ReconcileRequired {
 }
 impl std::error::Error for ReconcileRequired {}
 
+/// A lost write response is not evidence that the operation did not run.
+/// Share this classification across the executor and privileged broker clients.
+pub(crate) async fn rpc_response(
+    response: Result<reqwest::Response, reqwest::Error>,
+) -> anyhow::Result<Value> {
+    use anyhow::{Context, ensure};
+    let response = response.map_err(|error| {
+        if error.is_connect() {
+            Error::from(error).context(RemoteFailure { retryable: true })
+        } else {
+            Error::from(error).context(ReconcileRequired)
+        }
+    })?;
+    ensure!(response.status().is_success(), ReconcileRequired);
+    let value: Value = response.json().await.context(ReconcileRequired)?;
+    match value["ok"].as_bool() {
+        Some(true) => value.get("value").cloned().context(ReconcileRequired),
+        Some(false) => {
+            if value["error"] == "operation result uncertain; inspect retained state" {
+                return Err(ReconcileRequired.into());
+            }
+            ensure!(value["error"].is_string(), ReconcileRequired);
+            Err(RemoteFailure {
+                retryable: value["retryable"].as_bool().context(ReconcileRequired)?,
+            }
+            .into())
+        }
+        None => Err(ReconcileRequired.into()),
+    }
+}
+
 pub fn retryable(error: &Error) -> bool {
     // Never let a lower-level I/O cause turn an already-started privileged action into a retry.
     if error.is::<ReconcileRequired>() {
@@ -160,6 +191,42 @@ pub fn log(scope: &'static str, error: &Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn timeout_after_request_is_uncertain() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let request = client
+            .post(format!("http://{address}/rpc"))
+            .body("fixture")
+            .send();
+        let accepted = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                request.push(stream.read_u8().await.unwrap());
+                if request.ends_with(b"fixture") {
+                    break;
+                }
+            }
+            stream
+        };
+        // Keep the accepted connection open until the client times out.
+        let (_stream, response) = tokio::join!(accepted, request);
+        assert!(response.as_ref().unwrap_err().is_timeout());
+        let error = rpc_response(response).await.unwrap_err();
+        assert!(error.is::<ReconcileRequired>());
+        assert!(!retryable(&error));
+    }
+
     #[test]
     fn redact_untrusted_context_without_losing_classification() {
         let e = Error::from(std::io::Error::new(

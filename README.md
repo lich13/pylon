@@ -2,9 +2,13 @@
 
 Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、共享网页登录、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
-## v0.5.12 运行与升级
+## v0.5.13 运行与升级
 
-本版修正 v0.5.9–v0.5.11 的部署、恢复限流及维护行为；以下约定优先于后文历史版本说明。
+本版修正附件读取、RPC 错误分类和特权 helper 生命周期，并沿用 v0.5.12 的部署、恢复限流及维护行为；以下约定优先于后文历史版本说明。
+
+- 附件入队及发送时均从受信任目录句柄逐级打开，只允许 `data/attachments/` 内的普通、单链接文件；拒绝符号链接和路径越界。摘要校验和上传使用同一次读取的内容，验证失败进入 failed，不自动重发。
+- executor／broker 连接前失败可重试；发送后断连、超时或响应无效表示结果不确定，不自动重试。命令和扩展调用在结果不确定时保留运行上下文，供仍在执行的进程使用及后续核对。
+- root helper 的 timeout 覆盖输入写入、输出读取和进程等待；并发处理管道，stdout 上限 8 MiB。超时或超限会终止整个进程组并回收，返回不可自动重试的不确定结果。
 
 - 升级脚本先校验 CI 产物，再冻结新准入，并等待所有在途任务、启动中的请求、命令、投递和完成缓冲排空，默认 300 秒。排空使用完整状态，不以任务摘要的 200 条展示窗口代替。
 - 新版三个核心服务 active、网关诊断版本一致、executor／broker socket 可连接后才解冻，健康等待默认 60 秒。失败返回非零；开始停服务后的失败自动恢复上一版二进制与 REVISION，保持冻结，不恢复旧数据库、不自动重试切换。回退兼容检查受阻时保留冻结并报告 blocked。
@@ -14,11 +18,11 @@ Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人�
 - 两个既有维护任务每分钟检查冻结、恢复完成和 WAL 阈值，普通保留清理仍在启动 10 分钟后开始、每小时一轮。checkpoint 在维护路径执行；冻结时跳过，busy 后下轮重试，retention.enabled=false 不停止 WAL 维护。解冻后的锁回收在下次分钟检查执行。
 - 冻结提醒从实际发送入队时间计算重复间隔，复用 freeze-alert:last；兼容旧记录，停止新增逐时间桶的 KV 键。原冻结提醒白名单保持不变。
 
-v0.5.12 的 `downgrade-check --target-version 0.5.11` 接受该版本已支持的有效事件占位记录，仍拒绝损坏状态和未处理完成缓冲。新增恢复状态不会阻止 v0.5.11 读取原请求数据。生产发布继续使用 main 提交对应的成功 CI 成品，标签不另行构建。
+`downgrade-check --target-version 0.5.12` 和目标 0.5.11 均接受其已支持的有效事件占位记录，仍拒绝损坏状态和未处理完成缓冲。API v2、数据库格式和执行幂等规则保持兼容。生产发布继续使用 main 提交对应的成功 CI 成品，标签不另行构建。
 
 ## 本机开发
 
-本机 `rust-toolchain.toml`、最低支持版本与 CI 均固定为 Rust 1.99.0，edition 为 2024；依赖沿用 `Cargo.lock`，日常工作不依赖云端开发环境。
+本机与 CI 共用 `rust-toolchain.toml` 的固定工具链版本，最低支持版本在 `Cargo.toml` 中维护，edition 为 2024；依赖沿用 `Cargo.lock`，日常工作不依赖云端开发环境。
 
 ```sh
 cargo build --locked
@@ -30,9 +34,17 @@ cargo test --locked
 
 Python 3.12 和测试依赖仅用于黑盒契约测试。正式网关是单一 Rust 可执行文件，不需要 Python 网关包。外置 Python 业务使用自己的锁文件及 `pylon_sdk`。
 
-首次准备契约测试环境时运行 `.venv/bin/python -m pip install --require-hashes -r tests/rust_contract/requirements.lock`。CI 使用相同锁文件，并用固定版本的 cargo-audit 检查 Cargo.lock。
+首次准备契约测试环境时运行 `.venv/bin/python -m pip install --require-hashes -r tests/rust_contract/requirements.txt`；使用 uv 管理的环境可运行 `uv pip install --python .venv/bin/python --require-hashes -r tests/rust_contract/requirements.txt`。CI 使用相同哈希锁文件，并用固定版本的 cargo-audit 检查 Cargo.lock。
 
 GitHub Actions 执行完整网关检查与 Linux root 权限测试，产出 `pylon-linux-x86_64`、`SHA256SUMS` 和 `REVISION`。生产使用对应提交的 CI 成品。
+
+## 依赖维护
+
+Dependabot 每周一 09:00（Asia/Taipei）检查 Cargo、Python 契约测试和 GitHub Actions，普通更新冷却 7 天，只接受 minor／patch，每类最多一个分组 PR；安全更新独立分组，不受普通更新类型和冷却限制。Cargo 同时覆盖直接、开发和间接依赖，采用 `lockfile-only`，合并前核对锁文件仍满足清单约束。所有 PR 均由人工合并；合并后删除分支。CI 在 main push 和 PR 上运行，机器人分支 push 不重复执行。
+
+Rust 工具链每月由 Dependabot 检查；更新后同时核对最低支持版本。每月人工检查 Python、Node、cargo-audit，以及外置模块检查工作流中的独立工具版本。Actions 继续固定提交 SHA，同一 Action 使用同一引用。外置业务模块及其依赖由各自目录维护，不进入核心依赖更新范围。
+
+依赖更新须通过哈希安装、Cargo 审计及既有 CI。`serde_json/float_roundtrip` 必须保留，以维持持久化完成记录的校验一致性。reqwest、rusqlite、sha2／hmac 跨兼容线升级单独评估，有安全必要时优先处理。
 
 ## 扩展边界
 

@@ -62,6 +62,7 @@ pub struct Telegram {
     http: reqwest::Client,
     token: String,
     base: String,
+    config: Config,
 }
 impl Telegram {
     #[cfg(test)]
@@ -78,6 +79,7 @@ impl Telegram {
                 .unwrap(),
             token: "fixture".into(),
             base,
+            config: Config::new(Default::default()),
         }
     }
     pub fn new(config: &Config, bot: &Bot) -> Result<Self> {
@@ -109,7 +111,12 @@ impl Telegram {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(45))
             .build()?;
-        Ok(Self { http, token, base })
+        Ok(Self {
+            http,
+            token,
+            base,
+            config: config.clone(),
+        })
     }
     async fn response(
         &self,
@@ -189,12 +196,27 @@ impl Telegram {
         .await
     }
     pub async fn document(&self, chat: &str, payload: &Value) -> Result<Value> {
-        let path = std::path::Path::new(payload["path"].as_str().context("attachment missing")?);
-        let bytes = tokio::fs::read(path).await?;
-        anyhow::ensure!(
-            crate::digest(&bytes) == payload["sha256"].as_str().unwrap_or(""),
-            "attachment checksum mismatch"
-        );
+        let path =
+            std::path::PathBuf::from(payload["path"].as_str().context("attachment missing")?);
+        let config = self.config.clone();
+        let expected = payload["sha256"].as_str().unwrap_or("").to_owned();
+        let (bytes, name) = crate::blocking(move || {
+            use std::io::Read;
+            let mut file = config.attachment(&path)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                crate::digest(&bytes) == expected,
+                "attachment checksum mismatch"
+            );
+            let name = path
+                .file_name()
+                .context("invalid attachment")?
+                .to_string_lossy()
+                .into_owned();
+            Ok((bytes, name))
+        })
+        .await?;
         let form = reqwest::multipart::Form::new()
             .text("chat_id", chat.to_owned())
             .text(
@@ -208,12 +230,7 @@ impl Telegram {
             )
             .part(
                 "document",
-                reqwest::multipart::Part::bytes(bytes).file_name(
-                    path.file_name()
-                        .context("invalid attachment")?
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
+                reqwest::multipart::Part::bytes(bytes).file_name(name),
             );
         Ok(self
             .response(
@@ -615,6 +632,7 @@ mod stability_tests {
             http: reqwest::Client::builder().no_proxy().build().unwrap(),
             token: "fixture".into(),
             base: format!("http://{address}"),
+            config: Config::new(Default::default()),
         };
         let bot = Bot {
             require_start: false,

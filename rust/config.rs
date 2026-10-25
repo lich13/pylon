@@ -286,6 +286,61 @@ impl Config {
     pub fn db(&self) -> PathBuf {
         self.home.join("gateway/state.sqlite3")
     }
+    /// Open beneath the trusted home using directory descriptors. No path
+    /// component supplied by a module may redirect the eventual read.
+    pub(crate) fn attachment(&self, path: &Path) -> Result<fs::File> {
+        use std::{
+            ffi::CString,
+            os::{
+                fd::{AsRawFd, FromRawFd},
+                unix::ffi::OsStrExt,
+            },
+            path::Component,
+        };
+        let home = std::path::absolute(&self.home)?;
+        let canonical_home = home.canonicalize()?;
+        let path = std::path::absolute(path)?;
+        let relative = path
+            .strip_prefix(home.join("data/attachments"))
+            .or_else(|_| path.strip_prefix(canonical_home.join("data/attachments")))
+            .context("attachment outside delivery spool")?;
+        ensure!(
+            !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|c| matches!(c, Component::Normal(_))),
+            "invalid attachment path"
+        );
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(canonical_home)?;
+        let components = Path::new("data/attachments").join(relative);
+        let mut parts = components.components().peekable();
+        while let Some(part) = parts.next() {
+            let name = CString::new(part.as_os_str().as_bytes())?;
+            let flags = libc::O_RDONLY
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
+                | if parts.peek().is_some() {
+                    libc::O_DIRECTORY
+                } else {
+                    0
+                };
+            let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            file = unsafe { fs::File::from_raw_fd(fd) };
+        }
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file() && metadata.nlink() == 1,
+            "unsafe attachment file"
+        );
+        Ok(file)
+    }
     pub fn socket(&self) -> PathBuf {
         self.home.join("run/gateway.sock")
     }

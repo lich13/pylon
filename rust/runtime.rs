@@ -569,20 +569,14 @@ pub async fn request_executor(config: &Config, request: &Value) -> Result<Value>
         .unix_socket(config.home.join("run/executor.sock"))
         .timeout(Duration::from_secs(180))
         .build()?;
-    let value: Value = client
-        .post("http://localhost/invoke")
-        .json(request)
-        .send()
-        .await
-        .context("business executor unavailable")?
-        .json()
-        .await?;
-    ensure!(
-        value["ok"] == true,
-        "{}",
-        value["error"].as_str().unwrap_or("executor failed")
-    );
-    Ok(value["value"].clone())
+    crate::errors::rpc_response(
+        client
+            .post("http://localhost/invoke")
+            .json(request)
+            .send()
+            .await,
+    )
+    .await
 }
 pub async fn executor(config: Config) -> Result<()> {
     use axum::{Json, Router, extract::State, routing::post};

@@ -64,6 +64,8 @@
 
 业务先在自己的事务中记录结果与待投递事件，再转交核心。同一事件 ID 的所有权和投递目标固定。发送失败可以退避重试；发送中重启、网络回执丢失或部分投递不确定时保留证据，不自动重发。取消接口对尚未出现的事件保留取消标记，防止迟到转交重新入队。
 
+document 的 payload 沿用 path、sha256 和可选 caption。文件须位于 `data/attachments/`，入队和发送时均拒绝路径越界、符号链接及非普通或多硬链接文件；发送时校验实际读取内容的摘要。路径或内容验证失败为明确失败终态，不自动重发。
+
 v0.5.8 默认仅清理创建和最后更新均满 7 天且无安全保留理由的终态事件正文；正文实际删除时再保留 90 天最小占位记录。有效占位仍满足 submit／get／cancel／clear_buttons 的归属和幂等规则，返回原有字段结构及终态，但 receipt 仅含必要回执，非空 error 为安全短码 `retained_terminal`；不保证原 receipt／error 逐字复现。Bark 保留 code，Telegram 保留最后消息的 message_id／chat_id；文本分片早期回执不再保留。
 
 `delivery.lookup` 仅查真实 events，不查占位。占位到期立即失效；原事件也不存在时，同一 ID 可重新提交。过期或无归属依据的 callback 由网关空应答后静默完成，不调用模块；有效 callback 继续模块的签名、业务和权限校验。占位只保证归属依据，不延长模块业务记录寿命。长期服务 `expires_at=0` 上下文不由保留任务回收。
@@ -85,6 +87,8 @@ manifest 的 `capabilities` 只是申请。管理员还须在独立 root 配置�
 `runtime.complete` 返回 v2 envelope，value.status 必须为 ok、failed 或 uncertain；可附 execution_status、completion_status、notification_status。核心分别记录执行、结束处理、通知状态，失败不能被成功退出码覆盖。回报先保存在监督进程的持久信箱；断线只续交已完成结果，不再次执行完成钩子或任务。
 
 RPC 错误保留字符串 error，新增 error_code 和 retryable，旧客户端仍可解析。永久单事件错误需要处理后明确解除阻塞；不把不确定事件重新提交为新事件。
+
+executor／broker 连接前失败返回 retryable=true；发送后断连、超时、无效响应或远端明确报告结果不确定时，返回 `operation result uncertain; inspect retained state` 和 retryable=false。命令与扩展调用保留不确定执行的上下文，不据此撤销仍可能运行的业务或自动重放。特权 helper 的时限包含输入、输出和等待，输出上限 8 MiB；超时或超限后回收进程组，并按不确定结果处理。
 
 `diagnostics` 提供脱敏的连接、投递计数、任务概要、最近结果和模块版本。扩展需要 diagnostics:read；无上下文的 CLI 仅允许可信 root 监督者。原始消息、凭据、上下文和业务数据不在响应中。
 

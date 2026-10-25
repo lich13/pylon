@@ -265,17 +265,11 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
                 return Ok(event);
             }
             if p["kind"] == "document" {
-                let path = std::path::Path::new(
+                app.config.attachment(std::path::Path::new(
                     p["payload"]["path"]
                         .as_str()
                         .context("attachment path required")?,
-                )
-                .canonicalize()?;
-                let root = app.config.home.join("data/attachments").canonicalize()?;
-                ensure!(
-                    path.starts_with(root) && path.is_file(),
-                    "attachment outside delivery spool"
-                );
+                ))?;
             }
             if p["kind"] == "bark" {
                 // Retained and existing results were reconciled in one read
@@ -377,7 +371,12 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
                     &format!("hook:{action}"),
                 )?;
                 let result=crate::runtime::request_executor(&app.config,&json!({"module":target.manifest.id,"context":context,"action":action,"payload":p["payload"]})).await;
-                crate::auth::revoke(&app.store, &context)?;
+                if !result
+                    .as_ref()
+                    .is_err_and(|error| error.is::<crate::errors::ReconcileRequired>())
+                {
+                    crate::auth::revoke(&app.store, &context)?;
+                }
                 let output = result?;
                 if !output.is_null() {
                     value = output;

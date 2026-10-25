@@ -32,7 +32,16 @@ pub fn check(config: &Config, target: &str) -> Report {
     };
     if !matches!(
         target,
-        "0.5.3" | "0.5.4" | "0.5.5" | "0.5.6" | "0.5.7" | "0.5.8" | "0.5.9" | "0.5.10" | "0.5.11"
+        "0.5.3"
+            | "0.5.4"
+            | "0.5.5"
+            | "0.5.6"
+            | "0.5.7"
+            | "0.5.8"
+            | "0.5.9"
+            | "0.5.10"
+            | "0.5.11"
+            | "0.5.12"
     ) {
         report.reason = Some("unsupported_target");
         return report;
@@ -73,8 +82,10 @@ fn inspect(
     let mut history = db.prepare("SELECT key,value FROM kv WHERE (key>='event-gone:' AND key<'event-gone;') OR (key>='event-gone-msg:' AND key<'event-gone-msg;')")?;
     for row in history.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
         let (key, raw) = row?;
-        // v0.5.11 already understands these records. Still validate their shape.
-        if crate::event_history::expires(&key, &raw)? > crate::now() && target != "0.5.11" {
+        // These releases understand retained records. Still validate their shape.
+        if crate::event_history::expires(&key, &raw)? > crate::now()
+            && !matches!(target, "0.5.11" | "0.5.12")
+        {
             return Ok(Some("retained_events_require_newer_gateway"));
         }
     }

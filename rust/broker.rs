@@ -26,31 +26,14 @@ pub async fn invoke(config: &Config, token: &str, params: &Value) -> Result<Valu
         .unix_socket(config.home.join("run/broker.sock"))
         .timeout(Duration::from_secs(180))
         .build()?;
-    let result: Value = client
-        .post("http://localhost/capability")
-        .json(&json!({"context":token,"request":params}))
-        .send()
-        .await
-        .map_err(|error| {
-            if error.is_connect() {
-                anyhow::Error::from(error).context("privileged broker unavailable")
-            } else {
-                anyhow::Error::from(error).context(crate::errors::ReconcileRequired)
-            }
-        })?
-        .json()
-        .await
-        .context(crate::errors::ReconcileRequired)?;
-    if result["ok"] != true {
-        if result["error"] == "operation result uncertain; inspect retained state" {
-            return Err(crate::errors::ReconcileRequired.into());
-        }
-        return Err(crate::errors::RemoteFailure {
-            retryable: result["retryable"].as_bool().unwrap_or(false),
-        }
-        .into());
-    }
-    Ok(result["value"].clone())
+    crate::errors::rpc_response(
+        client
+            .post("http://localhost/capability")
+            .json(&json!({"context":token,"request":params}))
+            .send()
+            .await,
+    )
+    .await
 }
 pub async fn dispatch(config: &Config, request: &Value) -> Result<Value> {
     ensure!(unsafe { libc::geteuid() } == 0, "broker requires root");
@@ -97,7 +80,8 @@ pub async fn dispatch(config: &Config, request: &Value) -> Result<Value> {
         trusted(Path::new(path.as_str().context("invalid trusted path")?))?;
     }
     let input = json!({"api_version":2,"capability":name,"module":ctx["module"],"bot":ctx["bot"],"workspace":ctx["workspace"],"origin":ctx["origin"],"params":request["request"]["params"]});
-    let mut child = tokio::process::Command::new(args[0])
+    let mut command = tokio::process::Command::new(args[0]);
+    command
         .args(&args[1..])
         .env_clear()
         .env(
@@ -106,38 +90,79 @@ pub async fn dispatch(config: &Config, request: &Value) -> Result<Value> {
         )
         .env("HOME", "/root")
         .env("PYLON_HOME", &config.home)
-        .env("LANG", "C.UTF-8")
+        .env("LANG", "C.UTF-8");
+    run_helper(
+        &mut command,
+        serde_json::to_vec(&input)?,
+        Duration::from_secs(grant["timeout"].as_u64().unwrap_or(150)),
+    )
+    .await
+}
+
+async fn run_helper(
+    command: &mut tokio::process::Command,
+    input: Vec<u8>,
+    timeout: Duration,
+) -> Result<Value> {
+    use crate::errors::ReconcileRequired;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
+
+    // Cancellation must also stop descendants that inherited the pipes.
+    struct Group(u32);
+    impl Drop for Group {
+        fn drop(&mut self) {
+            if self.0 != 0 {
+                unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) };
+            }
+        }
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
+        .process_group(0)
         .spawn()?;
-    use tokio::io::AsyncWriteExt;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context(crate::errors::ReconcileRequired)?;
-    stdin
-        .write_all(input.to_string().as_bytes())
+    let mut group = Group(child.id().context(ReconcileRequired)?);
+    let mut stdin = child.stdin.take().context(ReconcileRequired)?;
+    let stdout = child.stdout.take().context(ReconcileRequired)?;
+    let operation = async {
+        let (_, bytes, status) = tokio::try_join!(
+            async move {
+                stdin.write_all(&input).await.context(ReconcileRequired)?;
+                stdin.shutdown().await.context(ReconcileRequired)
+            },
+            async move {
+                let mut bytes = Vec::new();
+                stdout
+                    .take(OUTPUT_LIMIT + 1)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .context(ReconcileRequired)?;
+                ensure!(bytes.len() as u64 <= OUTPUT_LIMIT, ReconcileRequired);
+                Ok(bytes)
+            },
+            async { child.wait().await.context(ReconcileRequired) },
+        )?;
+        ensure!(
+            status.success(),
+            "privileged helper rejected or failed; inspect retained state"
+        );
+        serde_json::from_slice(&bytes).context(ReconcileRequired)
+    };
+    let result = tokio::time::timeout(timeout, operation)
         .await
-        .context(crate::errors::ReconcileRequired)?;
-    stdin
-        .shutdown()
-        .await
-        .context(crate::errors::ReconcileRequired)?;
-    drop(stdin);
-    let output = tokio::time::timeout(
-        Duration::from_secs(grant["timeout"].as_u64().unwrap_or(150)),
-        child.wait_with_output(),
-    )
-    .await
-    .context(crate::errors::ReconcileRequired)?
-    .context(crate::errors::ReconcileRequired)?;
-    ensure!(
-        output.status.success(),
-        "privileged helper rejected or failed; inspect retained state"
-    );
-    serde_json::from_slice(&output.stdout).context(crate::errors::ReconcileRequired)
+        .context(ReconcileRequired)
+        .and_then(|result| result);
+    if result.is_err() {
+        unsafe { libc::kill(-(group.0 as i32), libc::SIGTERM) };
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        unsafe { libc::kill(-(group.0 as i32), libc::SIGKILL) };
+        let _ = child.wait().await;
+    }
+    group.0 = 0;
+    result
 }
 pub async fn serve(config: Config) -> Result<()> {
     use axum::{Json, Router, extract::State, routing::post};
@@ -170,3 +195,7 @@ pub async fn serve(config: Config) -> Result<()> {
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "broker_tests.rs"]
+mod tests;
