@@ -266,6 +266,15 @@ fn summary_flush_repairs_a_stale_cross_process_file_without_rewriting_stable_byt
 
     let id = queue::admit(&config, "fixture-job", "fixture", "topic", false, "trigger").unwrap();
     assert_eq!(id, "trigger");
+    // This epoch value loses one ULP with serde_json's approximate parser.
+    // Reading an unchanged summary must preserve its exact SQLite timestamps.
+    queue::connect(&config)
+        .unwrap()
+        .execute(
+            "UPDATE requests SET created_at=?,updated_at=? WHERE id=?",
+            params![1792908531.0390239_f64, 1792908531.0390239_f64, id],
+        )
+        .unwrap();
     queue::summary_flush(&config).unwrap();
     let expected: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(expected["requests"].as_array().unwrap().len(), 1);
