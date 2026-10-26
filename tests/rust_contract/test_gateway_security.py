@@ -38,6 +38,7 @@ from test_gateway_contract import (
     rpc_value,
     seed_home,
     wait_for,
+    _UnixHTTPConnection,
 )
 
 
@@ -609,6 +610,35 @@ def test_root_broker_uses_trusted_helper_and_module_uid_cannot_write_protected_f
             )
             assert privileged == {"ran": True}
             assert proof.read_bytes() == b"broker-ran\n"
+
+            def broker_request():
+                connection = _UnixHTTPConnection(home / "run/broker.sock", timeout=2.0)
+                try:
+                    connection.request("POST", "/capability", body=json.dumps({
+                        "context": context,
+                        "request": {"capability": "fixture.write", "params": {}},
+                    }), headers={"Content-Type": "application/json"})
+                    return json.loads(connection.getresponse().read())
+                finally:
+                    connection.close()
+
+            # A pending writer must not force schema initialization per request.
+            with sqlite3.connect(home / "gateway/state.sqlite3") as database:
+                database.execute("BEGIN IMMEDIATE")
+                assert broker_request() == {"ok": True, "value": {"ran": True}}
+                database.rollback()
+            accepted = proof.read_bytes()
+
+            capability_path.write_text("{}", encoding="utf-8")
+            assert broker_request()["ok"] is False
+            capability_path.write_text(json.dumps(grant), encoding="utf-8")
+            helper.chmod(0o777)
+            assert broker_request()["ok"] is False
+            helper.chmod(0o755)
+            with sqlite3.connect(home / "gateway/state.sqlite3") as database:
+                database.execute("DELETE FROM contexts WHERE hash=?", (hashlib.sha256(context.encode()).hexdigest(),))
+            assert broker_request()["ok"] is False
+            assert proof.read_bytes() == accepted
 
             offline_env = {
                 key: value

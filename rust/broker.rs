@@ -35,13 +35,24 @@ pub async fn invoke(config: &Config, token: &str, params: &Value) -> Result<Valu
     )
     .await
 }
-pub async fn dispatch(config: &Config, request: &Value) -> Result<Value> {
+async fn dispatch(config: &Config, store: &Store, request: &Value) -> Result<Value> {
+    let (config, store, request) = (config.clone(), store.clone(), request.clone());
+    let (mut command, input, timeout) =
+        crate::blocking(move || prepare(&config, &store, &request)).await?;
+    run_helper(&mut command, input, timeout).await
+}
+
+fn prepare(
+    config: &Config,
+    store: &Store,
+    request: &Value,
+) -> Result<(tokio::process::Command, Vec<u8>, Duration)> {
     ensure!(unsafe { libc::geteuid() } == 0, "broker requires root");
     let path = config.home.join("config/capabilities.json");
     trusted(&path)?;
     let grants: Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let token = request["context"].as_str().context("context required")?;
-    let ctx = crate::auth::inspect(&Store::new(&config.db())?, token)?;
+    let ctx = crate::auth::inspect(store, token)?;
     let name = request["request"]["capability"]
         .as_str()
         .context("capability required")?;
@@ -91,12 +102,11 @@ pub async fn dispatch(config: &Config, request: &Value) -> Result<Value> {
         .env("HOME", "/root")
         .env("PYLON_HOME", &config.home)
         .env("LANG", "C.UTF-8");
-    run_helper(
-        &mut command,
+    Ok((
+        command,
         serde_json::to_vec(&input)?,
         Duration::from_secs(grant["timeout"].as_u64().unwrap_or(150)),
-    )
-    .await
+    ))
 }
 
 async fn run_helper(
@@ -167,8 +177,11 @@ async fn run_helper(
 pub async fn serve(config: Config) -> Result<()> {
     use axum::{Json, Router, extract::State, routing::post};
     ensure!(unsafe { libc::geteuid() } == 0, "broker requires root");
-    async fn handle(State(config): State<Config>, Json(request): Json<Value>) -> Json<Value> {
-        match dispatch(&config, &request).await {
+    async fn handle(
+        State((config, store)): State<(Config, Store)>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        match dispatch(&config, &store, &request).await {
             Ok(value) => Json(json!({"ok":true,"value":value})),
             Err(e) => {
                 crate::errors::log("broker", &e);
@@ -176,6 +189,8 @@ pub async fn serve(config: Config) -> Result<()> {
             }
         }
     }
+    let database = config.db();
+    let store = crate::blocking(move || Store::new(&database)).await?;
     let path = config.home.join("run/broker.sock");
     if path.exists() {
         ensure!(
@@ -190,7 +205,7 @@ pub async fn serve(config: Config) -> Result<()> {
         listener,
         Router::new()
             .route("/capability", post(handle))
-            .with_state(config),
+            .with_state((config, store)),
     )
     .await?;
     Ok(())
