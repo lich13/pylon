@@ -49,7 +49,7 @@ def performance_telegram():
 
 def _diagnostics(home: Path) -> dict:
     value = rpc_value(home, "diagnostics")
-    assert value["version"] == "0.5.14"
+    assert value["version"] == "0.5.15"
     optimization = value["metrics"].get("optimization")
     assert isinstance(optimization, dict)
     assert OPTIMIZATION_KEYS <= optimization.keys()

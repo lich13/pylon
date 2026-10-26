@@ -1,9 +1,21 @@
 """Package the verified private input only after the module matrix has passed."""
 import hashlib
+import json
 import os
 from pathlib import Path
 import sys
 import tarfile
+
+
+def select_runtime(candidates):
+    for version in ('3.14.10', '3.12.16'):
+        matches = [path.parent for path in candidates.glob('*/runtime.json')
+                   if json.loads(path.read_text())['python'] == version]
+        if len(matches) > 1:
+            raise ValueError('ambiguous runtime candidate')
+        if matches:
+            return matches[0]
+    raise ValueError('no compatible runtime')
 
 
 def main():
@@ -31,7 +43,11 @@ def main():
             target.chmod(0o755 if member.mode & 0o111 else 0o644)
     sys.path.insert(0, str(source / "sdk/src"))
     from pylon_sdk.ci import package
-    package(source, temporary / "external-dist", os.environ["CORE_SHA"], checksum)
+    # Only successful compatibility jobs upload candidates. Prefer the GIL 3.14 build.
+    candidates = Path(os.environ['RUNTIMES_DIR'])
+    selected = select_runtime(candidates)
+    metadata = package(source, temporary / "external-dist", os.environ["CORE_SHA"], checksum, selected)
+    print('Selected Python ' + metadata['runtime']['python'])
 
 
 if __name__ == "__main__":

@@ -42,7 +42,7 @@ if sys.argv[1:] == ["--version"]:
 home = pathlib.Path(sys.argv[2])
 command = sys.argv[3]
 control = json.loads((home / "fixture.json").read_text())
-new = VERSION == "0.5.14"
+new = VERSION == "0.5.15"
 with (home / "calls").open("a") as log: log.write(VERSION + " " + command + "\\n")
 freeze = home / "run/freeze"
 if command == "freeze":
@@ -58,15 +58,15 @@ elif command == "diagnose":
     version = "0.0.0" if new and control.get("wrong_version") else VERSION
     print(json.dumps({{"version":version,"maintenance":freeze.exists()}}))
 elif command == "downgrade-check":
-    switched = "v0.5.14-" in str((home / "bin/pylon").resolve())
+    switched = "v0.5.15-" in str((home / "bin/pylon").resolve())
     if switched and control.get("rollback_blocked"): sys.exit(1)
 else:
     sys.exit(2)
 '''
         old = home / "old/pylon"
         old.parent.mkdir()
-        executable(old, program.format(version="0.5.13"))
-        executable(dist / "pylon-linux-x86_64", program.format(version="0.5.14"))
+        executable(old, program.format(version="0.5.14"))
+        executable(dist / "pylon-linux-x86_64", program.format(version="0.5.15"))
         (home / "bin/pylon").symlink_to(old)
         (dist / "REVISION").write_text(NEW + "\n")
         digest = hashlib.sha256((dist / "pylon-linux-x86_64").read_bytes()).hexdigest()
@@ -85,7 +85,7 @@ home = pathlib.Path(os.environ["PYLON_DEPLOY_FIXTURE"])
 control = json.loads((home / "fixture.json").read_text())
 command = sys.argv[1]
 with (home / "calls").open("a") as log: log.write("systemctl " + command + "\\n")
-new = "v0.5.14-" in str((home / "bin/pylon").resolve())
+new = "v0.5.15-" in str((home / "bin/pylon").resolve())
 if new and ((command == "start" and control.get("start_fail")) or (command == "is-active" and control.get("inactive"))): sys.exit(1)
 ''')
         stopping = threading.Event()
@@ -139,7 +139,7 @@ def test_success_requires_new_version_and_thaws(deployment):
     result, summary = run()
     assert result.returncode == 0, result.stderr
     assert summary["phase"] == "complete"
-    assert summary["active_version"] == "0.5.14"
+    assert summary["active_version"] == "0.5.15"
     assert summary["health"] == "target_healthy"
     assert not summary["freeze"]
     assert not (home / "run/freeze").exists()
@@ -164,7 +164,7 @@ def test_failed_cutover_restores_previous_binary_and_keeps_frozen(deployment, fa
     assert result.returncode != 0
     assert summary["phase"] == "failed"
     assert summary["rollback"] == "restored", (result.stderr, summary)
-    assert summary["active_version"] == "0.5.13"
+    assert summary["active_version"] == "0.5.14"
     assert summary["health"] == "previous_healthy"
     assert summary["freeze"]
     assert (home / "run/freeze").is_file()
