@@ -6,10 +6,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
-    body::{Body, to_bytes},
-    extract::{DefaultBodyLimit, Request, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    extract::{DefaultBodyLimit, State},
     routing::post,
 };
 use serde_json::{Value, json};
@@ -20,7 +17,6 @@ use std::{
 };
 use tokio::sync::{Mutex, RwLock};
 
-#[derive(Clone)]
 pub struct Snapshot {
     pub settings: Settings,
     pub catalog: Catalog,
@@ -30,7 +26,7 @@ pub struct Snapshot {
 pub struct App {
     pub config: Config,
     pub store: Store,
-    pub snapshot: Arc<RwLock<Snapshot>>,
+    pub snapshot: Arc<RwLock<Arc<Snapshot>>>,
     pub(crate) reload_guard: Arc<Mutex<Option<Arc<crate::reload::Inputs>>>>,
 }
 impl App {
@@ -45,7 +41,7 @@ impl App {
         Ok(Self {
             config,
             store,
-            snapshot: Arc::new(RwLock::new(snapshot)),
+            snapshot: Arc::new(RwLock::new(Arc::new(snapshot))),
             reload_guard: Arc::new(Mutex::new(Some(Arc::new(inputs)))),
         })
     }
@@ -58,13 +54,13 @@ impl App {
     async fn reload_inner(&self, force: bool) -> Result<bool> {
         let mut guard = self.reload_guard.lock().await;
         let previous = guard.clone();
-        let settings = self.snapshot.read().await.settings.clone();
+        let snapshot = self.snapshot.read().await.clone();
         let config = self.config.clone();
         let runtime = self.store.runtime.clone();
         let candidate = crate::blocking(move || {
             if !force
                 && let Some(previous) = previous
-                && previous.unchanged(&config, &settings)?
+                && previous.unchanged(&config, &snapshot.settings)?
             {
                 runtime
                     .metrics
@@ -79,11 +75,7 @@ impl App {
         let Some((snapshot, inputs)) = candidate else {
             return Ok(false);
         };
-        ensure!(
-            snapshot.settings.web_port == self.snapshot.read().await.settings.web_port,
-            "web port requires restart"
-        );
-        *self.snapshot.write().await = snapshot;
+        *self.snapshot.write().await = Arc::new(snapshot);
         *guard = Some(Arc::new(inputs));
         Ok(true)
     }
@@ -136,6 +128,9 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
     if method == "admin.reload" {
         app.reload().await?;
         return Ok(json!({"ok":true}));
+    }
+    if method == "context.retire_service" {
+        return crate::auth::retire_service(&app.store, p);
     }
     if method == "context.open" {
         let snapshot = app.snapshot.read().await.clone();
@@ -505,8 +500,10 @@ async fn handler(
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<Peer>,
     Json(r): Json<Value>,
 ) -> Json<Value> {
-    if (matches!(r["method"].as_str(), Some("context.open" | "admin.reload"))
-        || (r["method"] == "diagnostics" && r["context"].as_str().unwrap_or("").is_empty()))
+    if (matches!(
+        r["method"].as_str(),
+        Some("context.open" | "context.retire_service" | "admin.reload")
+    ) || (r["method"] == "diagnostics" && r["context"].as_str().unwrap_or("").is_empty()))
         && !app.config.offline
         && peer.0 != 0
     {
@@ -546,98 +543,6 @@ pub async fn serve_socket(app: App) -> Result<()> {
     .await?;
     Ok(())
 }
-async fn proxy(State(app): State<App>, request: Request) -> Response {
-    if app.config.home.join("run/freeze").is_file() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "服务正在切换，请稍后重试。",
-        )
-            .into_response();
-    }
-
-    async fn forward(app: App, request: Request) -> Result<Response> {
-        let path = request.uri().path();
-        let route = path
-            .strip_prefix("/pylon/")
-            .and_then(|s| s.split('/').next())
-            .context("unknown workspace")?;
-        let snapshot = app.snapshot.read().await.clone();
-        let (module, web) = snapshot
-            .catalog
-            .modules
-            .values()
-            .find_map(|m| m.manifest.web.get(route).map(|w| (m, w)))
-            .context("unknown workspace")?;
-        if app
-            .config
-            .home
-            .join("run/drain")
-            .join(&module.manifest.id)
-            .exists()
-        {
-            return Ok((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "工作区正在切换，请稍后重试。",
-            )
-                .into_response());
-        }
-        let url = format!(
-            "{}{}",
-            web.upstream.trim_end_matches('/'),
-            request
-                .uri()
-                .path_and_query()
-                .map(|s| s.as_str())
-                .unwrap_or(path)
-        );
-        let (parts, body) = request.into_parts();
-        let body = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            to_bytes(body, 16 * 1024 * 1024),
-        )
-        .await
-        .context("workspace request body timed out")??;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(180))
-            .build()?;
-        let mut headers = parts.headers;
-        for key in [
-            "connection",
-            "transfer-encoding",
-            "upgrade",
-            "x-pylon-context",
-            "x-forwarded-for",
-        ] {
-            headers.remove(key);
-        }
-        drop(snapshot);
-        let response = client
-            .request(parts.method, url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await?;
-        let mut output = Response::builder().status(response.status());
-        for (key, value) in response.headers() {
-            if !["connection", "transfer-encoding"].contains(&key.as_str()) {
-                output = output.header(key, value)
-            }
-        }
-        Ok(output.body(Body::from(response.bytes().await?))?)
-    }
-    match forward(app, request).await {
-        Ok(r) => r,
-        Err(_) => (StatusCode::BAD_GATEWAY, "工作区暂时不可用，请稍后重试。").into_response(),
-    }
-}
-pub async fn serve_web(app: App, port: u16) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
-    axum::serve(listener, Router::new().fallback(proxy).with_state(app)).await?;
-    Ok(())
-}
-
 /// Public operational summary. Never expose credentials, message payloads, or context tokens.
 pub async fn diagnostics(app: &App) -> Result<Value> {
     let snapshot = app.snapshot.read().await.clone();

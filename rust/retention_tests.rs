@@ -520,23 +520,6 @@ fn update_window_and_expiring_auth_keep_watermarks_and_service_contexts() {
         .unwrap(),
         1
     );
-    db.execute(
-        "INSERT INTO web_tokens VALUES('used','101','bot','fixture',?,?)",
-        params![crate::now() + 1000.0, crate::now()],
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO web_tokens VALUES('expired','101','bot','fixture',1,NULL)",
-        [],
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO web_sessions VALUES('expired','101','bot','fixture',1)",
-        [],
-    )
-    .unwrap();
-    assert_eq!(clean(&store, Kind::WebTokens).deleted["web_tokens"], 2);
-    assert_eq!(clean(&store, Kind::WebSessions).deleted["web_sessions"], 1);
 }
 
 #[test]
@@ -841,11 +824,11 @@ async fn maintenance_waits_ten_minutes_then_skips_frozen_hourly_rounds() {
     let app = crate::api::App {
         config: config.clone(),
         store: store.clone(),
-        snapshot: Arc::new(tokio::sync::RwLock::new(crate::api::Snapshot {
+        snapshot: Arc::new(tokio::sync::RwLock::new(Arc::new(crate::api::Snapshot {
             settings: crate::config::Settings::default(),
             catalog: crate::catalog::Catalog::default(),
             credentials: BTreeMap::new(),
-        })),
+        }))),
         reload_guard: Arc::default(),
     };
     let (stop, receiver) = watch::channel(false);

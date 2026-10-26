@@ -42,7 +42,7 @@ if sys.argv[1:] == ["--version"]:
 home = pathlib.Path(sys.argv[2])
 command = sys.argv[3]
 control = json.loads((home / "fixture.json").read_text())
-new = VERSION == "0.5.13"
+new = VERSION == "0.5.14"
 with (home / "calls").open("a") as log: log.write(VERSION + " " + command + "\\n")
 freeze = home / "run/freeze"
 if command == "freeze":
@@ -58,15 +58,15 @@ elif command == "diagnose":
     version = "0.0.0" if new and control.get("wrong_version") else VERSION
     print(json.dumps({{"version":version,"maintenance":freeze.exists()}}))
 elif command == "downgrade-check":
-    switched = "v0.5.13-" in str((home / "bin/pylon").resolve())
+    switched = "v0.5.14-" in str((home / "bin/pylon").resolve())
     if switched and control.get("rollback_blocked"): sys.exit(1)
 else:
     sys.exit(2)
 '''
         old = home / "old/pylon"
         old.parent.mkdir()
-        executable(old, program.format(version="0.5.12"))
-        executable(dist / "pylon-linux-x86_64", program.format(version="0.5.13"))
+        executable(old, program.format(version="0.5.13"))
+        executable(dist / "pylon-linux-x86_64", program.format(version="0.5.14"))
         (home / "bin/pylon").symlink_to(old)
         (dist / "REVISION").write_text(NEW + "\n")
         digest = hashlib.sha256((dist / "pylon-linux-x86_64").read_bytes()).hexdigest()
@@ -85,7 +85,7 @@ home = pathlib.Path(os.environ["PYLON_DEPLOY_FIXTURE"])
 control = json.loads((home / "fixture.json").read_text())
 command = sys.argv[1]
 with (home / "calls").open("a") as log: log.write("systemctl " + command + "\\n")
-new = "v0.5.13-" in str((home / "bin/pylon").resolve())
+new = "v0.5.14-" in str((home / "bin/pylon").resolve())
 if new and ((command == "start" and control.get("start_fail")) or (command == "is-active" and control.get("inactive"))): sys.exit(1)
 ''')
         stopping = threading.Event()
@@ -112,11 +112,12 @@ if new and ((command == "start" and control.get("start_fail")) or (command == "i
             thread.start()
             threads.append(thread)
 
-        def run(**settings):
+        def run(keep_frozen=False, **settings):
             control.write_text(json.dumps(settings))
             result = subprocess.run(
                 ["bash", str(ROOT / "scripts/deploy-gateway.sh"), "--home", str(home),
-                 "--release-dir", str(dist), "--drain-timeout", "1", "--health-timeout", "3"],
+                 "--release-dir", str(dist), "--drain-timeout", "1", "--health-timeout", "3",
+                 *(["--keep-frozen"] if keep_frozen else [])],
                 env={**os.environ, "PATH": str(commands) + os.pathsep + os.environ["PATH"],
                      "PYLON_DEPLOY_FIXTURE": str(home), "TMPDIR": str(root / "tmp")},
                 capture_output=True, text=True, timeout=20,
@@ -138,13 +139,22 @@ def test_success_requires_new_version_and_thaws(deployment):
     result, summary = run()
     assert result.returncode == 0, result.stderr
     assert summary["phase"] == "complete"
-    assert summary["active_version"] == "0.5.13"
+    assert summary["active_version"] == "0.5.14"
     assert summary["health"] == "target_healthy"
     assert not summary["freeze"]
     assert not (home / "run/freeze").exists()
     assert (home / "REVISION").read_text().strip() == NEW
     assert (home / "bin/pylon").resolve() != old
     assert old.exists()
+
+
+def test_coordinated_upgrade_keeps_frozen_until_external_health_passes(deployment):
+    home, _, _, run = deployment
+    result, summary = run(keep_frozen=True)
+    assert result.returncode == 0
+    assert summary["phase"] == "complete" and summary["freeze"]
+    assert (home / "run/freeze").is_file()
+    assert "thaw" not in (home / "calls").read_text()
 
 
 @pytest.mark.parametrize("failure", ["health_fail", "wrong_version", "inactive", "start_fail", "thaw_fail", "thaw_remove_then_fail"])
@@ -154,7 +164,7 @@ def test_failed_cutover_restores_previous_binary_and_keeps_frozen(deployment, fa
     assert result.returncode != 0
     assert summary["phase"] == "failed"
     assert summary["rollback"] == "restored", (result.stderr, summary)
-    assert summary["active_version"] == "0.5.12"
+    assert summary["active_version"] == "0.5.13"
     assert summary["health"] == "previous_healthy"
     assert summary["freeze"]
     assert (home / "run/freeze").is_file()

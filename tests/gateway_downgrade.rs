@@ -235,7 +235,7 @@ fn expired_retained_history_preserves_completion_and_counter_checks() {
 
 #[test]
 fn recent_targets_accept_valid_retained_history_but_reject_corruption_and_buffers() {
-    for target in ["0.5.11", "0.5.12"] {
+    for target in ["0.5.11", "0.5.12", "0.5.13"] {
         let valid = gone("fixture", pylon::now() + 86400.0);
         let (_temp, config, path) = home_with_state(
             &[(COUNTER_KEY, counter()), ("event-gone:fixture", valid)],

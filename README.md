@@ -1,24 +1,27 @@
 # Pylon
 
-Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、共享网页登录、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
+Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
-## v0.5.13 运行与升级
+## v0.5.14 运行与升级
 
-本版修正附件读取、RPC 错误分类和特权 helper 生命周期，并沿用 v0.5.12 的部署、恢复限流及维护行为；以下约定优先于后文历史版本说明。
+本版退役网页代理、网页登录与旧架构导入工具，保留 Telegram 鉴权和按钮、Linux.do 专用导入、HTML 归档、附件、Bark、调度及诊断。
 
-- 附件入队及发送时均从受信任目录句柄逐级打开，只允许 `data/attachments/` 内的普通、单链接文件；拒绝符号链接和路径越界。摘要校验和上传使用同一次读取的内容，验证失败进入 failed，不自动重发。
-- executor／broker 连接前失败可重试；发送后断连、超时或响应无效表示结果不确定，不自动重试。命令和扩展调用在结果不确定时保留运行上下文，供仍在执行的进程使用及后续核对。
-- root helper 的 timeout 覆盖输入写入、输出读取和进程等待；并发处理管道，stdout 上限 8 MiB。超时或超限会终止整个进程组并回收，返回不可自动重试的不确定结果。
+- 网关仅提供 Unix socket API。旧网页路径由 HTTPS 服务直接返回已下线；不再转发到网关。升级事务移除旧网页令牌和会话表，保留业务、任务、回执、幂等占位与执行上下文。
+- 摘要查询使用未完成与近期完成的两个部分索引，展示窗口仍为 200 条，完整队列统计独立计算；相同创建时间沿用原表扫描顺序。输出使用有界环形缓冲，任务与命令仍保留各 8 MiB，常驻服务只保留各 64 KiB 诊断尾部。
+- 附件最多 50 MiB，打开后先检查大小，读取期间继续限制；摘要与上传使用同一份字节。符号链接、越界、多硬链接和内容校验失败均拒绝发送。
+- 业务进程启动后的输入、读取、等待与响应错误均视为结果待核对，不自动重试。模块健康检查保留 60 秒／1 MiB、停止准备保留 30 秒／64 KiB 上限；失败回收检查进程组并保留原服务。
+- 服务新凭据先写入已有私有缓存，再撤销经缓存与进程引用核对的旧哈希；撤销失败保留待办，下次安全启动续办。无法确认无人使用时保留。
+- 请求共享不可变配置快照；热加载整体替换，旧请求继续原快照，无效配置仍保留上次有效版本。
 
 - 升级脚本先校验 CI 产物，再冻结新准入，并等待所有在途任务、启动中的请求、命令、投递和完成缓冲排空，默认 300 秒。排空使用完整状态，不以任务摘要的 200 条展示窗口代替。
 - 新版三个核心服务 active、网关诊断版本一致、executor／broker socket 可连接后才解冻，健康等待默认 60 秒。失败返回非零；开始停服务后的失败自动恢复上一版二进制与 REVISION，保持冻结，不恢复旧数据库、不自动重试切换。回退兼容检查受阻时保留冻结并报告 blocked。
-- `scripts/deploy-gateway.sh` 支持 `--drain-timeout`、`--health-timeout`；成功解冻才报告 complete。`pylon drain-status` 是 root 只读检查，输出冻结状态及 tasks／starting／commands／deliveries／completions 全量计数；仅冻结且全部为零时退出 0。
+- `scripts/deploy-gateway.sh` 支持 `--drain-timeout`、`--health-timeout`；独立升级成功后解冻，协调升级使用 `--keep-frozen` 留给外置部署入口核验受影响服务并解冻。`pylon drain-status` 是 root 只读检查，输出冻结状态及 tasks／starting／commands／deliveries／completions 全量计数；仅冻结且全部为零时退出 0。
 - 锁回收仅处理 request／dispatch 锁。job、daemon、quota 及其它锁均保留；已有外部持有者不一定会复核文件身份。保留 completed 请求按锁龄回收和不安全文件软跳过行为。
 - execute、resume 和后台派发共用恢复准入，启动登记前也受保护。恢复模式与完成时间保存在任务库的单行 recovery 表；新增表兼容旧版本，不改变请求字段。诊断任务 metrics 保留 recovery_active，并增加 recovery_completed_at；排空后恢复原主题配额。
 - 两个既有维护任务每分钟检查冻结、恢复完成和 WAL 阈值，普通保留清理仍在启动 10 分钟后开始、每小时一轮。checkpoint 在维护路径执行；冻结时跳过，busy 后下轮重试，retention.enabled=false 不停止 WAL 维护。解冻后的锁回收在下次分钟检查执行。
 - 冻结提醒从实际发送入队时间计算重复间隔，复用 freeze-alert:last；兼容旧记录，停止新增逐时间桶的 KV 键。原冻结提醒白名单保持不变。
 
-`downgrade-check --target-version 0.5.12` 和目标 0.5.11 均接受其已支持的有效事件占位记录，仍拒绝损坏状态和未处理完成缓冲。API v2、数据库格式和执行幂等规则保持兼容。生产发布继续使用 main 提交对应的成功 CI 成品，标签不另行构建。
+`downgrade-check --target-version 0.5.13` 及目标 0.5.11、0.5.12 均接受其已支持的有效事件占位记录，仍拒绝损坏状态和未处理完成缓冲。API v2、数据库格式和执行幂等规则保持兼容。生产发布继续使用 main 提交对应的成功 CI 成品，标签不另行构建。
 
 ## 本机开发
 
@@ -48,20 +51,21 @@ Rust 工具链每月由 Dependabot 检查；更新后同时核对最低支持版
 
 ## 扩展边界
 
-`module.json` v2 注册命令、回调、生命周期钩子、任务、服务、网页路径、通知主题与权限申请。注册表冲突、依赖循环或配置不兼容时保留上次有效版本。协议见 [扩展协议](docs/extensions.md)。
+`module.json` v2 注册命令、回调、生命周期钩子、任务、服务、通知主题与权限申请。注册表冲突、依赖循环或配置不兼容时保留上次有效版本。协议见 [扩展协议](docs/extensions.md)。
 
-业务通过 Unix socket 上的 JSON API 调用投递、回执、任务与登录能力，不能连接网关数据库。业务结果及本地待投递记录在同一业务事务中提交，再按事件 ID 幂等转交；结果不确定时只核对，不自动重放。
+业务通过 Unix socket 上的 JSON API 调用投递、回执、任务与本人鉴权能力，不能连接网关数据库。业务结果及本地待投递记录在同一业务事务中提交，再按事件 ID 幂等转交；结果不确定时只核对，不自动重放。
 
 ```sh
 target/debug/pylon modules check example --directory ../pylon-tasks
-target/debug/pylon modules preview example --directory ../pylon-tasks --port 8795
-target/debug/pylon modules deploy example --directory ../pylon-tasks --host production-alias
+target/debug/pylon modules deploy example --directory ../pylon-tasks --host production-alias --artifacts ./external-dist
 target/debug/pylon modules ci example --directory ../pylon-tasks --gateway .
 ```
 
+`modules ci all` 在既有私有矩阵全部通过后生成匹配提交的 SDK、模块与必要 helper 部署成品。单模块 CI 只做针对性检查；部署入口使用已验证的成品目录，不在本机重新打包。协调升级保留匹配的 SDK、模块、helper 和配置用于回退，旧版所需运行依赖在回退窗口内保留。
+
 服务器上 `pylon modules rollback example --activate` 回到上一模块版本。普通部署只重启该模块的服务；网关进程和其他模块保持运行。在途任务固定启动时的源码版本。停止准备钩子会等待本模块在途工作；数据版本变化还要求冻结新触发。
 
-外置源码需要 CI 时使用私有仓库的临时哈希校验包，运行后删除输入包，不把业务源码提交回网关仓库。
+外置源码需要 CI 时使用私有仓库的临时哈希校验包，运行后删除输入包。既有检查通过后生成 SDK、模块包及校验清单，部署直接使用 CI 字节，不在本机重新打包；不把业务源码提交回网关仓库。
 
 ## 机器人与路由
 
@@ -77,15 +81,13 @@ pylon bots disable example
 
 `bots add` 从隐藏的终端输入读取 token，也支持受控标准输入；不要把 token 放入命令参数。重复凭据拒绝注册。配置约五秒内生效，无需编译或重启。新增机器人等待本人先发起私聊后才投递，待发事件保持在队列。
 
-机器人各自保留 Telegram 游标、退避及队列。主题路由变更只影响新事件，旧消息和待发记录仍属于原机器人。网页登录按同一本人共享；机器人归属与业务数据工作区相互独立。
+机器人各自保留 Telegram 游标、退避及队列。主题路由变更只影响新事件，旧消息和待发记录仍属于原机器人。机器人归属与业务数据工作区相互独立。
 
-## 运行与迁移
+## 运行与升级
 
 `pylon modules render <目录>` 生成通用 systemd 模板。网关使用专用普通用户；Rust executor 以受控监督进程运行，所有扩展子进程切换到模块各自的普通 UID。root broker 只执行管理员明确授权、root 持有的固定 helper，不接收任意 root 命令。
 
-HTTPS 代理统一转发 `/pylon/` 到回环网关，网页路径由注册表决定；模块网页仅监听回环地址。共享登录、CSRF 和回调签名通过 SDK 访问。
-
-升级前保留生产状态并冻结新触发。一次性 `pylon migrate --source <业务数据库> --mapping <归属映射>` 要求目标为空及在途任务已结束，保留事件 ID、回执、不确定状态、游标和登录会话。业务表留在业务数据库。收到新流量后不能直接恢复旧数据库快照，必须先保留并合并新增状态。
+旧 `/pylon/` 入口直接返回已下线。升级前冻结并排空，失败保留数据库与冻结状态；回退同步恢复匹配的 SDK 与模块版本，不自动重试切换。数据库内部初始化随网关启动完成，不再提供旧架构导入命令。
 
 只读诊断使用 `pylon diagnose`。普通扩展通过 `diagnostics:read` 能力查看运行摘要；任务拥塞、结果续交、停止准备与兼容契约见扩展协议。
 
@@ -96,8 +98,7 @@ HTTPS 代理统一转发 `/pylon/` 到回环网关，网页路径由注册表决
 SQLite 操作在有界阻塞执行层处理，已确认的远端回执只重试本地保存，不重复发送。
 请求已发出但结果无法确认时保留 `uncertain`，包括返回 HTML 的 HTTP 5xx。
 
-`config/bots.json` 可选 `web_port`（默认 8793，仅回环监听，修改后重启）和
-`telegram_ip_family`（`ipv4`、`ipv6` 或 `auto`，默认 `ipv4`）。无效重载保留整个旧配置。
+`config/bots.json` 可选 `telegram_ip_family`（`ipv4`、`ipv6` 或 `auto`，默认 `ipv4`）。无效重载保留整个旧配置。
 诊断提供队列等待时间、worker 故障次数、投递耗时及配置拒绝摘要，不包含消息或凭据。
 
 网关系统恢复提醒按机器人合并，系统提醒有效期为 10 分钟；业务消息仅遵循其显式有效期。
@@ -108,7 +109,7 @@ SQLite 操作在有界阻塞执行层处理，已确认的远端回执只重试�
 
 ## v0.5.5 运行边界
 
-Telegram 轮询、命令、投递和 Bark 使用独立异步循环；慢 RPC 使用独立的 64 个许可，等待准入超过 1 秒返回可重试的 unavailable。健康检查不占用慢请求许可。配置快照不会跨网络等待持锁，网页请求正文读取上限为 30 秒。
+Telegram 轮询、命令、投递和 Bark 使用独立异步循环；慢 RPC 使用独立的 64 个许可，等待准入超过 1 秒返回可重试的 unavailable。健康检查不占用慢请求许可。配置快照不会跨网络等待持锁，RPC 请求正文读取上限为 30 秒。
 
 SQLite 单次写冲突最多等待 5 秒；已执行命令的结果、回复和上下文撤销一起提交。投递回执及命令完成结果先原子写入 `gateway/completions/` 私有缓冲（目录 0700、文件 0600，写入及目录变更均 fsync），前台补存数据库最多等待 60 秒，并响应停止信号。后台和重启恢复只补交结果，不再次发送或执行命令；记录核对原事件、机器人、内容和尝试编号，提交后才移除。完整有效回执可恢复为 delivered，部分投递或未知结果保持 uncertain。Telegram 成功投递必须有有效消息编号和正确的目标会话；无效回执、HTML 5xx 和发送后中断继续保持 uncertain，不自动重发。业务消息沿用自行声明的有效期，不新增统一过期或重试次数上限。
 
@@ -233,7 +234,6 @@ sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.8
 | 孤儿 run-result | 每天按键分批扫描，确认 run 不存在才删除 |
 | events | 创建和更新时间均满 7 天的 delivered／failed／suppressed；保留 uncertain-summary、run_events 引用、部分回执、异常或未知结果 |
 | requests／triggers | 创建和完成更新均满 14 天，结果已补交且没有恢复输入；有不确定或缺少可信最终结果证据的记录保留，triggers 随请求同事务删除 |
-| 登录令牌／会话 | 已用令牌，或到期超过 1 天；会话到期超过 1 天 |
 | contexts | 有明确到期时间且到期超过 1 天；`expires_at=0` 的长期上下文保留 |
 
 每批扫描至多 500 个主记录，每轮每类至多删除 20,000 个、扫描 50,000 个候选；提交后让出 50 ms。游标跨轮保留，已保护的前缀不会阻塞后面的记录。单批关联记录上限为 5,000，过大的关联组保留并报短码。完成缓冲非空时，events／updates 清理暂缓，保留后台补交仍需核对的正文。进程重启从头扫描，不改变资格或重复执行任务。
@@ -244,12 +244,12 @@ sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.8
 
 过期或失去归属依据的按钮只收到不带文字的 Telegram 空应答，以停止客户端转圈；不调用模块、不发送提示或回复。有效按钮仍须通过原有模块签名及业务校验，90 天占位不保证业务记录一直有效。
 
-请求／派发锁回收 `dispatch-<64位小写十六进制>.lock` 和 `request-<64位小写十六进制>.lock`：已知请求为 `completed` 且（`updated_at` 满 24 小时，或锁文件 mtime／ctime 均满 24 小时）才具备资格；请求已不存在的孤儿及 job 锁须 mtime、ctime 都满 24 小时。另回收同目录下闲置超过 24 小时的空闲 job 锁（`{job_id|job.lock}.lock`）。**不回收** `daemon.lock` 与 `quota-*`。未通过安全检查的 candidate 软跳过，不将整轮标为扫描失败。每批最多检查 1,000 个目录项、让出 500 ms，每轮最多 50,000 项，跨轮继续扫描。普通文件、属主、权限、长度、链接数、flock 及取得锁后的路径身份均须通过；被持有或不安全的文件保留。socket、`run/invocations/` 不参与回收。
+请求／派发锁回收 `dispatch-<64位小写十六进制>.lock` 和 `request-<64位小写十六进制>.lock`：已知请求为 `completed` 且（`updated_at` 满 24 小时，或锁文件 mtime／ctime 均满 24 小时）才具备资格；请求已不存在的孤儿锁须 mtime、ctime 都满 24 小时。**不回收** job 锁、`daemon.lock` 与 `quota-*`。未通过安全检查的 candidate 软跳过，不将整轮标为扫描失败。每批最多检查 1,000 个目录项、让出 500 ms，每轮先收集最多 50,000 个目录项，再流式读取任务库，仅保留候选锁对应的记录，跨轮继续扫描。普通文件、属主、权限、长度、链接数、flock 及取得锁后的路径身份均须通过；被持有或不安全的文件保留。socket、`run/invocations/` 不参与回收。
 
 `diagnostics.metrics.storage` 中 database／wal／run_dir 各自给出 bytes 和错误短码，并附最近一次 `wal_checkpoint` 结果；目录字节数是目录自身 stat 大小，目录项数来自低频回收扫描，附扫描起止时间，扣除本次实际删除项，扫描期间的外部变化不构成原子快照。未采样或读取失败为 null／短码。`metrics.retention` 提供清理状态、各对象删除数、占位写入数、批次数、最慢批次耗时、安全短码及占位命中数。executor 的对应结果在 `tasks.metrics.storage`，文件大小至多每分钟采样；诊断和两秒摘要不遍历目录。进程内计数重启清零。
 
 Command 空 claim 同样采用 0.5、1、2 秒退避。进程内 pending update 提交按 bot／lane 唤醒，纯 offset 或重复记录不唤醒；外部写入由最多 2 秒兜底发现，另计数据库等待与执行时间。`metrics.optimization` 增加 `command_empty_claims`、`command_wakeups`，后者仅计通知实际结束空闲等待。
 
-数据库变化限于六个索引：executor 的 `requests_state_created`、`requests_created`、`triggers_request`，网关的 `updates_pending`、`events_receipt_last`、`events_receipt_one`。查找表达式与索引一致，保留归属限制和 latest runs 并列结果；损坏 JSON 等错误不会通过删除数据来规避。
+原有查询索引包括：executor 的 `requests_state_created`、`requests_created`、`triggers_request`，网关的 `updates_pending`、`events_receipt_last`、`events_receipt_one`。查找表达式与索引一致，保留归属限制和 latest runs 并列结果；损坏 JSON 等错误不会通过删除数据来规避。
 
 删行形成可复用页，回收锁文件降低 inode 占用，两者都不保证文件或目录立即缩小。维护窗口中的 VACUUM 须在排空、停核心服务、私有一致性备份及索引创建后，由各数据库属主执行；每库至多一次、120 秒超时，锁竞争或空间不足则跳过，失败后核查完整性和 sidecar 权限，禁止手删 WAL／SHM。首次自动清理仍在新版启动 10 分钟后，因此此前 VACUUM 不会回收尚未删除的数据。锁数量、清理用时及容量预测只作估计；不自动 VACUUM 或重建运行目录。

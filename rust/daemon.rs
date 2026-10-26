@@ -827,8 +827,6 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
             .await?;
     }
     let mut rpc = Child(tokio::spawn(crate::api::serve_socket(app.clone())));
-    let port = app.snapshot.read().await.settings.web_port;
-    let mut web = Child(tokio::spawn(crate::api::serve_web(app.clone(), port)));
     type BotWorker = (String, watch::Sender<bool>, Child<Result<()>>);
     let mut workers: BTreeMap<String, BotWorker> = BTreeMap::new();
     let mut shutdown = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1018,10 +1016,6 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
                 (&mut rpc).await.context("gateway RPC listener failed")??;
                 anyhow::bail!("gateway RPC listener stopped")
             }
-            if web.is_finished() {
-                (&mut web).await.context("gateway web listener failed")??;
-                anyhow::bail!("gateway web listener stopped")
-            }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
         #[allow(unreachable_code)]
@@ -1036,7 +1030,6 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
     // runtime shutdown in main, within the global eight-second gateway budget.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     rpc.abort();
-    web.abort();
     reconciler.abort();
     maintenance.abort();
     let bot_ids = workers.keys().cloned().collect::<Vec<_>>();
@@ -1112,11 +1105,11 @@ mod tests {
         let app = App {
             config,
             store: store.clone(),
-            snapshot: Arc::new(tokio::sync::RwLock::new(Snapshot {
+            snapshot: Arc::new(tokio::sync::RwLock::new(Arc::new(Snapshot {
                 settings: crate::config::Settings::default(),
                 catalog: crate::catalog::Catalog::default(),
                 credentials: BTreeMap::new(),
-            })),
+            }))),
             reload_guard: Arc::default(),
         };
         let wanted = menu(&*app.snapshot.read().await, "fixture");

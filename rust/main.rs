@@ -64,12 +64,6 @@ enum Command {
         #[command(subcommand)]
         action: Modules,
     },
-    Migrate {
-        #[arg(long)]
-        source: PathBuf,
-        #[arg(long)]
-        mapping: PathBuf,
-    },
 }
 #[derive(Subcommand)]
 enum Bots {
@@ -96,15 +90,10 @@ enum Modules {
         #[arg(long)]
         directory: Option<PathBuf>,
     },
-    Preview {
-        module: String,
-        #[arg(long, default_value_t = 8795)]
-        port: u16,
-        #[arg(long)]
-        directory: Option<PathBuf>,
-    },
     Deploy {
         module: String,
+        #[arg(long)]
+        artifacts: PathBuf,
         #[arg(long)]
         host: String,
         #[arg(long)]
@@ -413,20 +402,9 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
                             )?
                         }
                     }
-                    Modules::Preview {
-                        module,
-                        port,
-                        directory,
-                    } => {
-                        developer_tool(
-                            directory,
-                            "preview",
-                            &[module, "--port".into(), port.to_string()],
-                        )?;
-                        Value::Null
-                    }
                     Modules::Deploy {
                         module,
+                        artifacts,
                         host,
                         directory,
                     } => {
@@ -437,8 +415,8 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
                                 module,
                                 "--host".into(),
                                 host,
-                                "--binary".into(),
-                                std::env::current_exe()?.to_string_lossy().into_owned(),
+                                "--artifacts".into(),
+                                artifacts.to_string_lossy().into_owned(),
                             ],
                         )?;
                         Value::Null
@@ -489,9 +467,6 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
                 })
             })
             .await?
-        }
-        Command::Migrate { source, mapping } => {
-            pylon::migration::import(&config, &source, &mapping)?
         }
     };
     if !result.is_null() {

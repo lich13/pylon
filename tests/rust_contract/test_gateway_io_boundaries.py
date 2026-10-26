@@ -185,7 +185,7 @@ def test_attachment_boundary_is_also_enforced_before_enqueue(home, telegram, pat
             assert db.execute("SELECT COUNT(*) FROM events WHERE id='fixture_document'").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("replacement", ["none", "file-link", "directory-link", "hard-link", "fifo", "changed-content"])
+@pytest.mark.parametrize("replacement", ["none", "file-link", "directory-link", "hard-link", "fifo", "changed-content", "too-large"])
 def test_document_is_opened_safely_at_send_time(home, telegram, replacement):
     seed(home, telegram)
     received = []
@@ -232,6 +232,9 @@ def test_document_is_opened_safely_at_send_time(home, telegram, replacement):
         elif replacement == "fifo":
             attachment.unlink()
             os.mkfifo(attachment)
+        elif replacement == "too-large":
+            with attachment.open("wb") as output:
+                output.truncate(50 * 1024 * 1024 + 1)
         elif replacement == "changed-content":
             attachment.write_bytes(b"different-fixture")
         with sqlite3.connect(home / "gateway/state.sqlite3") as db:

@@ -350,6 +350,47 @@ fn counter_migration_is_atomic_idempotent_and_does_not_count_receipt_retries() {
 }
 
 #[test]
+fn upgrade_retires_only_web_tables_and_preserves_existing_gateway_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.sqlite3");
+    let store = Store::new(&path).unwrap();
+    let db = store.connect().unwrap();
+    insert_uncertain_event(&db, "fixture-existing", "fixture");
+    db.execute_batch("CREATE TABLE web_tokens(hash TEXT); CREATE TABLE web_sessions(hash TEXT);
+        INSERT INTO web_tokens VALUES('fixture'); INSERT INTO web_sessions VALUES('fixture');
+        INSERT INTO contexts VALUES('fixture-context','fixture','fixture','[]',0,'service:relay','fixture');
+        INSERT INTO kv VALUES('legacy_import_completed','true');").unwrap();
+    drop(db);
+    drop(store);
+    for _ in 0..2 {
+        let store = Store::new(&path).unwrap();
+        let db = store.connect().unwrap();
+        let tables: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name IN ('web_tokens','web_sessions')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
+        assert_eq!(
+            store.event("fixture-existing").unwrap()["status"],
+            "uncertain"
+        );
+        assert_eq!(store.get("legacy_import_completed").unwrap(), true);
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM contexts WHERE hash='fixture-context'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
 fn configuration_rejection_is_transactional_deduplicated_and_expires() {
     let temp = tempfile::tempdir().unwrap();
     let store = Store::new(&temp.path().join("state.sqlite3")).unwrap();

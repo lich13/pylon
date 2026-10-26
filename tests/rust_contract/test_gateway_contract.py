@@ -106,7 +106,6 @@ def _module_manifest(
     *,
     command_name: str | None = None,
     job_id: str | None = None,
-    web: bool = False,
     lock: str = "",
     model: bool = False,
 ) -> dict:
@@ -118,7 +117,6 @@ def _module_manifest(
         "commands": [],
         "jobs": {},
         "services": {},
-        "web": {},
     }
     if command_name:
         manifest["commands"].append(
@@ -141,16 +139,6 @@ def _module_manifest(
             "lock": lock,
             "model": model,
         }
-    if web:
-        manifest["services"]["web"] = {
-            "entry": ["bash", "service.sh"],
-            "workspace": "default",
-            "topic": topic,
-        }
-        manifest["web"]["market"] = {
-            "service": "web",
-            "upstream": "http://127.0.0.1:18080/",
-        }
     return manifest
 
 
@@ -161,7 +149,6 @@ def write_module(
     *,
     command_name: str | None = None,
     job_id: str | None = None,
-    web: bool = False,
     lock: str = "",
     model: bool = False,
 ) -> Path:
@@ -171,7 +158,6 @@ def write_module(
         topic,
         command_name=command_name,
         job_id=job_id,
-        web=web,
         lock=lock,
         model=model,
     )
@@ -253,7 +239,6 @@ def seed_home(
             spec["topic"],
             command_name=spec.get("command_name"),
             job_id=spec.get("job_id"),
-            web=spec.get("web", False),
             lock=spec.get("lock", ""),
             model=spec.get("model", False),
         )
@@ -265,7 +250,6 @@ def seed_home(
         "workspaces": {
             "default": {"root": "profiles/default", "env": "profiles/default/.env"}
         },
-        "public_origin": "https://example.invalid",
     }
     (home / "config/bots.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -839,67 +823,6 @@ def test_owner_updates_and_bot_scoped_menus(workdir, telegram):
         assert telegram.sent_text("GROUP-MESSAGE") is False
 
 
-def test_web_login_is_single_use_and_bound_to_the_authenticated_owner(workdir, telegram):
-    home = workdir / "home"
-    seed_home(
-        home,
-        telegram,
-        [("bot_one", "101"), ("bot_two", "202")],
-        [
-            {"id": "alpha", "topic": "topic_alpha", "job_id": "job_alpha", "web": True},
-            {"id": "beta", "topic": "topic_beta", "job_id": "job_beta"},
-        ],
-        {"topic_alpha": "bot_one", "topic_beta": "bot_two"},
-    )
-
-    with running_gateway(home, telegram):
-        alpha = open_context(home, "alpha", "job_alpha")["token"]
-        beta = open_context(home, "beta", "job_beta")["token"]
-        blocked = rpc(home, "auth.issue", {"workspace": "market"}, alpha)
-        assert_rpc_rejected(blocked)
-
-        context_hash = hashlib.sha256(alpha.encode()).hexdigest()
-        with sqlite3.connect(home / "gateway/state.sqlite3", timeout=3) as database:
-            database.execute(
-                "UPDATE contexts SET origin='command' WHERE hash=?", (context_hash,)
-            )
-            database.commit()
-
-        token = rpc_value(home, "auth.issue", {"workspace": "market"}, alpha)
-        rejected_owner = rpc(home, "auth.redeem", {"token": token}, beta)
-        assert_rpc_rejected(rejected_owner)
-        with sqlite3.connect(home / "gateway/state.sqlite3", timeout=3) as database:
-            token_row = database.execute(
-                "SELECT hash,used_at FROM web_tokens"
-            ).fetchone()
-        assert token_row == (hashlib.sha256(token.encode()).hexdigest(), None)
-
-        login = rpc_value(home, "auth.redeem", {"token": token}, alpha)
-        assert len(login["cookie"]) == 64 and len(login["csrf"]) == 64
-        with sqlite3.connect(home / "gateway/state.sqlite3", timeout=3) as database:
-            session_row = database.execute(
-                "SELECT hash,owner,bot,csrf FROM web_sessions"
-            ).fetchone()
-        assert session_row == (
-            hashlib.sha256(login["cookie"].encode()).hexdigest(),
-            "101",
-            "bot_one",
-            login["csrf"],
-        )
-        assert rpc_value(
-            home,
-            "auth.session",
-            {"workspace": "market", "cookie": login["cookie"]},
-            alpha,
-        )["owner"] == "101"
-        assert rpc_value(
-            home,
-            "auth.session",
-            {"workspace": "market", "cookie": login["cookie"]},
-            beta,
-        ) is None
-        repeated = rpc(home, "auth.redeem", {"token": token}, alpha)
-        assert_rpc_rejected(repeated)
 
 
 def test_capability_rpc_requires_valid_context_and_fails_closed_without_broker(workdir, telegram):

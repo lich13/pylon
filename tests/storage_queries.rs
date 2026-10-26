@@ -276,9 +276,9 @@ fn queue_summary_preserves_recent_and_active_rows_in_busy_quiet_and_sparse_mailb
     let config = Config::new(temporary.path().to_owned());
     let db = queue::connect(&config).unwrap();
     let now = pylon::now();
-    for n in 0..215 {
+    for n in 0..615 {
         let state = if n % 3 == 0 { "running" } else { "completed" };
-        let created = now - 172800.0 + f64::from(n);
+        let created = now - 172800.0 + f64::from(n / 3);
         let updated = if n % 3 == 1 { now } else { created };
         db.execute("INSERT INTO requests(id,job_id,module,topic,model,state,created_at,updated_at) VALUES(?,?,'fixture','fixture',0,?,?,?)", params![format!("request-{n}"),format!("job-{n}"),state,created,updated]).unwrap();
     }
@@ -306,7 +306,7 @@ fn queue_summary_preserves_recent_and_active_rows_in_busy_quiet_and_sparse_mailb
             )
             .unwrap();
         }
-        let expected = db.prepare("SELECT id FROM requests WHERE state!='completed' OR updated_at>? ORDER BY created_at DESC LIMIT 200").unwrap().query_map([now-86400.0], |r| r.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let expected = db.prepare("SELECT id FROM requests WHERE state!='completed' OR updated_at>? ORDER BY +created_at DESC LIMIT 200").unwrap().query_map([now-86400.0], |r| r.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         queue::summary_flush(&config).unwrap();
         let actual = queue::public(&config)["requests"]
             .as_array()

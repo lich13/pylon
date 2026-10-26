@@ -23,11 +23,11 @@ fn fixture() -> (tempfile::TempDir, App, Bot) {
     let app = App {
         store: crate::db::Store::new(&config.db()).unwrap(),
         config,
-        snapshot: Arc::new(tokio::sync::RwLock::new(Snapshot {
+        snapshot: Arc::new(tokio::sync::RwLock::new(Arc::new(Snapshot {
             settings,
             catalog: crate::catalog::Catalog::default(),
             credentials: BTreeMap::new(),
-        })),
+        }))),
         reload_guard: Arc::default(),
     };
     (temp, app, bot)

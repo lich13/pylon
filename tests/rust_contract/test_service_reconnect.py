@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import stat
@@ -112,7 +113,13 @@ printf '%s,%s,%s,%s\\n' "$context" "$bot_token" "$test_endpoint" "$PYLON_MODULE_
     assert reconnected.returncode == 0, reconnected.stderr or reconnected.stdout
     replacement = json.loads(cached_path.read_text(encoding="utf-8"))
     assert replacement["module_hash"] != old_module_hash
-    assert_rpc_rejected(rpc(case.home, "context.inspect", context=old_token))
+    old_hash = hashlib.sha256(old_token.encode()).hexdigest()
+    pending = replacement.get("pending_retirements", [])
+    if old_hash in pending:
+        # A non-root host or missing /proc cannot prove that no process uses it.
+        assert rpc_value(case.home, "context.inspect", context=old_token)["origin"] == "service:observer"
+    else:
+        assert_rpc_rejected(rpc(case.home, "context.inspect", context=old_token))
     replacement_context = rpc_value(
         case.home, "context.inspect", context=replacement["token"]
     )
@@ -123,3 +130,14 @@ printf '%s,%s,%s,%s\\n' "$context" "$bot_token" "$test_endpoint" "$PYLON_MODULE_
         ["present", "absent", "absent", replacement["module_hash"]],
     ]
 
+
+    case.gateway.stop()
+    disconnected = _run_service(case)
+    assert disconnected.returncode == 0, disconnected.stderr
+    assert json.loads(cached_path.read_text())["pending_retirements"] == pending
+    case.gateway.start()
+    assert _run_service(case).returncode == 0
+    after_recovery = json.loads(cached_path.read_text())
+    assert after_recovery["module_hash"] == replacement["module_hash"]
+    for retained in after_recovery.get("pending_retirements", []):
+        assert retained in pending or retained == hashlib.sha256(replacement["token"].encode()).hexdigest()

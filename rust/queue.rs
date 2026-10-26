@@ -163,7 +163,9 @@ pub fn connect(config: &Config) -> Result<crate::db::PooledConnection> {
         INSERT OR IGNORE INTO recovery VALUES(1,0,0,0);
         CREATE INDEX IF NOT EXISTS requests_state_created ON requests(state,created_at);
         CREATE INDEX IF NOT EXISTS requests_created ON requests(created_at);
-        CREATE INDEX IF NOT EXISTS triggers_request ON triggers(request_id);")?;
+        CREATE INDEX IF NOT EXISTS triggers_request ON triggers(request_id);
+        CREATE INDEX IF NOT EXISTS requests_open_summary ON requests(created_at) WHERE state!='completed';
+        CREATE INDEX IF NOT EXISTS requests_completed_updated ON requests(updated_at) WHERE state='completed';")?;
     initialized.insert(path, identity);
     Ok(db)
 }
@@ -266,10 +268,9 @@ fn summary_inner(config: &Config, force: bool, metrics: Option<Value>) -> Result
     if !force && (0.0..1.0).contains(&(now() - previous["updated_at"].as_f64().unwrap_or(0.0))) {
         return Ok(());
     }
-    // In a quiet mailbox the created_at index would fetch every table row to
-    // evaluate updated_at. Keep filtering sequential; unary + preserves the
-    // value ordering without fetching table rows in index order.
-    let mut q=db.prepare("SELECT id,job_id,module,state,created_at,updated_at,execution_status,completion_status,owner FROM requests WHERE state!='completed' OR updated_at>? ORDER BY +created_at DESC LIMIT 200")?;
+    // Explicit partial indexes avoid scanning historical completed requests.
+    // The outer rowid membership keeps the previous scan order for timestamp ties.
+    let mut q=db.prepare("SELECT id,job_id,module,state,created_at,updated_at,execution_status,completion_status,owner FROM requests WHERE rowid IN (SELECT rowid FROM requests INDEXED BY requests_open_summary WHERE state!='completed' UNION ALL SELECT rowid FROM requests INDEXED BY requests_completed_updated WHERE state='completed' AND updated_at>?) ORDER BY +created_at DESC,rowid ASC LIMIT 200")?;
     let rows=q.query_map([now()-86400.0], |r| Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"module":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"created_at":r.get::<_,f64>(4)?,"updated_at":r.get::<_,f64>(5)?,"execution_status":r.get::<_,Option<String>>(6)?,"completion_status":r.get::<_,Option<String>>(7)?,"owner":r.get::<_,Option<u32>>(8)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     let (queued, oldest): (u64, Option<f64>) = db.query_row(
         "SELECT count(*),min(created_at) FROM requests WHERE state='queued'",
@@ -462,21 +463,17 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
                 use tokio::io::AsyncReadExt;
                 let stderr = child.stderr.take();
                 let capture = tokio::spawn(async move {
-                    let mut tail = Vec::new();
+                    let mut tail = crate::output::Tail::new(65536);
                     if let Some(mut stream) = stderr {
                         let mut bytes = [0; 8192];
                         while let Ok(n) = stream.read(&mut bytes).await {
                             if n == 0 {
                                 break;
                             }
-                            tail.extend_from_slice(&bytes[..n]);
-                            if tail.len() > 65536 {
-                                let excess = tail.len() - 65536;
-                                tail.drain(..excess);
-                            }
+                            tail.append(&bytes[..n]);
                         }
                     }
-                    tail
+                    tail.last(65536)
                 });
                 let status = child.wait().await;
                 let tail = capture.await.unwrap_or_default();

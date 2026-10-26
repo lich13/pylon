@@ -45,11 +45,42 @@ pub fn revoke(store: &Store, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// The root supervisor verifies caches and process ownership under its service
+/// lock. The gateway only deletes the exact hashes for the specified service.
+pub(crate) fn retire_service(store: &Store, p: &Value) -> Result<Value> {
+    let module = p["module"].as_str().context("module required")?;
+    let service = p["service"].as_str().context("service required")?;
+    ensure!(
+        crate::identifier(module) && crate::identifier(service),
+        "invalid service identity"
+    );
+    let hashes = p["hashes"].as_array().context("context hashes required")?;
+    ensure!(hashes.len() <= 1000, "too many contexts");
+    let mut db = store.connect()?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut removed = 0;
+    for value in hashes {
+        let hash = value.as_str().context("invalid context hash")?;
+        ensure!(
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid context hash"
+        );
+        removed += tx.execute(
+            "DELETE FROM contexts WHERE hash=? AND module=? AND origin=?",
+            params![hash, module, format!("service:{service}")],
+        )?;
+    }
+    tx.commit()?;
+    Ok(json!({"removed":removed}))
+}
+
 pub async fn request(app: &App, ctx: &Value, method: &str, p: &Value) -> Result<Value> {
     let snapshot = app.snapshot.read().await.clone();
     let bot_id = ctx["bot"].as_str().context("bot missing")?;
     let bot = snapshot.settings.bots.get(bot_id).context("bot removed")?;
-    let workspace = p["workspace"].as_str().unwrap_or("");
     match method {
         "auth.owner" => Ok(json!({"owner":bot.owner,"bot":bot_id})),
         "auth.sign" => {
@@ -88,120 +119,49 @@ pub async fn request(app: &App, ctx: &Value, method: &str, p: &Value) -> Result<
                 &p["query"]
             )?))
         }
-        "auth.url" => {
-            ensure!(
-                snapshot
-                    .catalog
-                    .modules
-                    .values()
-                    .any(|m| m.manifest.web.contains_key(workspace)),
-                "unknown workspace"
-            );
-            ensure!(
-                !snapshot.settings.public_origin.is_empty(),
-                "public origin not configured"
-            );
-            Ok(json!(format!(
-                "{}/pylon/{workspace}/",
-                snapshot.settings.public_origin.trim_end_matches('/')
-            )))
-        }
-        "auth.issue" => {
-            ensure!(
-                ctx["origin"] == "command"
-                    || ctx["origin"] == "callback"
-                    || ctx["origin"] == "document",
-                "login requires an authenticated owner request"
-            );
-            ensure!(
-                snapshot
-                    .catalog
-                    .modules
-                    .values()
-                    .any(|m| m.manifest.web.contains_key(workspace)),
-                "unknown workspace"
-            );
-            let token = nonce();
-            app.store.connect()?.execute(
-                "INSERT INTO web_tokens VALUES(?,?,?,?,?,NULL)",
-                params![
-                    crate::digest(&token),
-                    bot.owner,
-                    bot_id,
-                    workspace,
-                    crate::now() + 600.0
-                ],
-            )?;
-            Ok(json!(token))
-        }
-        "auth.redeem" => {
-            let token = p["token"].as_str().context("login token required")?;
-            ensure!((32..=100).contains(&token.len()), "invalid login token");
-            let mut db = app.store.connect()?;
-            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let row:Option<(String,String)>=tx.query_row("SELECT owner,bot FROM web_tokens WHERE hash=? AND used_at IS NULL AND expires_at>?",params![crate::digest(token),crate::now()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-            let (owner, source) = row.context("login expired or already used")?;
-            ensure!(
-                snapshot
-                    .settings
-                    .bots
-                    .get(&source)
-                    .is_some_and(|b| b.owner == owner)
-                    && owner == bot.owner,
-                "login owner changed"
-            );
-            let session = nonce();
-            let csrf = nonce();
-            tx.execute(
-                "UPDATE web_tokens SET used_at=? WHERE hash=?",
-                params![crate::now(), crate::digest(token)],
-            )?;
-            tx.execute(
-                "INSERT INTO web_sessions VALUES(?,?,?,?,?)",
-                params![
-                    crate::digest(&session),
-                    owner,
-                    source,
-                    csrf,
-                    crate::now() + 7.0 * 86400.0
-                ],
-            )?;
-            tx.commit()?;
-            Ok(json!({"cookie":session,"csrf":csrf}))
-        }
-        "auth.session" => {
-            ensure!(
-                snapshot
-                    .catalog
-                    .modules
-                    .values()
-                    .any(|m| m.manifest.web.contains_key(workspace)),
-                "unknown workspace"
-            );
-            let row:Option<(String,String,String,f64)>=app.store.connect()?.query_row("SELECT owner,bot,csrf,expires_at FROM web_sessions WHERE hash=? AND expires_at>?",params![crate::digest(p["cookie"].as_str().unwrap_or("")),crate::now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-            let Some((owner, source, csrf, expires_at)) = row else {
-                return Ok(Value::Null);
-            };
-            if owner != bot.owner
-                || snapshot
-                    .settings
-                    .bots
-                    .get(&source)
-                    .is_none_or(|b| b.owner != owner)
-            {
-                return Ok(Value::Null);
-            }
-            Ok(
-                json!({"profile":ctx["workspace"],"bot":source,"owner":owner,"csrf":csrf,"expires_at":expires_at}),
-            )
-        }
-        "auth.logout" => {
-            app.store.connect()?.execute(
-                "DELETE FROM web_sessions WHERE hash=?",
-                [crate::digest(p["cookie"].as_str().unwrap_or(""))],
-            )?;
-            Ok(Value::Null)
-        }
         _ => anyhow::bail!("unknown auth method"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retirement_is_exact_scoped_and_atomic_on_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::new(&temporary.path().join("state.sqlite3")).unwrap();
+        let db = store.connect().unwrap();
+        for (token, module, origin) in [
+            ("old", "fixture", "service:relay"),
+            ("active", "fixture", "service:relay"),
+            ("job", "fixture", "job:fixture"),
+            ("other", "other", "service:relay"),
+        ] {
+            db.execute(
+                "INSERT INTO contexts VALUES(?,?, 'fixture','[]',0,?,'fixture')",
+                params![crate::digest(token), module, origin],
+            )
+            .unwrap();
+        }
+        let valid = json!({"module":"fixture","service":"relay","hashes":[crate::digest("old"), crate::digest("job"), crate::digest("other")]});
+        let mut invalid = valid.clone();
+        invalid["hashes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("invalid"));
+        assert!(retire_service(&store, &invalid).is_err());
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM contexts", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            4
+        );
+        assert_eq!(retire_service(&store, &valid).unwrap()["removed"], 1);
+        assert_eq!(retire_service(&store, &valid).unwrap()["removed"], 0);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM contexts", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            3
+        );
     }
 }

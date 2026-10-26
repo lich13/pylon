@@ -557,12 +557,7 @@ fn health_candidate(
     catalog: &crate::catalog::Catalog,
     id: &str,
 ) -> Result<()> {
-    use std::{
-        io::Write,
-        os::unix::fs::PermissionsExt,
-        process::Stdio,
-        time::{Duration, Instant},
-    };
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
     let module = &catalog.modules[id];
     let root = config
         .home
@@ -651,32 +646,15 @@ fn health_candidate(
                 .collect::<Vec<_>>()
                 .join(":"),
             );
-        let output = root.join("health.json");
-        cmd.current_dir(&root)
-            .stdin(Stdio::piped())
-            .stdout(std::fs::File::create(&output)?)
-            .stderr(Stdio::null());
+        cmd.current_dir(&root);
         crate::child_identity(&mut cmd, user.uid, user.gid);
-        let mut child = cmd.spawn()?;
-        child.stdin.take().context("health input unavailable")?.write_all(serde_json::json!({"api_version":2,"action":"health","profile":module.manifest.workspace,"payload":{}}).to_string().as_bytes())?;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if let Some(status) = child.try_wait()? {
-                ensure!(status.success(), "module health check failed");
-                break;
-            }
-            if Instant::now() >= deadline {
-                child.kill()?;
-                child.wait()?;
-                anyhow::bail!("module health check timed out")
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        ensure!(
-            std::fs::metadata(&output)?.len() < 1024 * 1024,
-            "module health response too large"
-        );
-        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&output)?)?;
+        let input = serde_json::to_vec(
+            &serde_json::json!({"api_version":2,"action":"health","profile":module.manifest.workspace,"payload":{}}),
+        )?;
+        let output =
+            crate::check_process::run(&mut cmd, input, Duration::from_secs(60), 1024 * 1024)
+                .context("module health check failed")?;
+        let value: serde_json::Value = serde_json::from_slice(&output)?;
         ensure!(
             value["api_version"] == 2 && value["value"]["status"] == "ok",
             "module health check rejected"
@@ -697,7 +675,6 @@ fn prepare_stop(
     catalog: &crate::catalog::Catalog,
     id: &str,
 ) -> Result<DrainGuard> {
-    use std::process::Stdio;
     let path = config.home.join("run/drain").join(id);
     std::fs::create_dir_all(path.parent().context("destination parent missing")?)?;
     // A previous interrupted deployment intentionally leaves admission frozen for inspection.
@@ -755,45 +732,18 @@ fn prepare_stop(
                 .get(id)
                 .ok_or_else(|| anyhow::anyhow!("runtime identity missing"))?;
             crate::child_identity(&mut command, user.uid, user.gid);
-            let output = config
-                .home
-                .join("run")
-                .join(format!(".drain-{}.json", uuid::Uuid::new_v4()));
-            let result = (|| -> Result<bool> {
-                let mut child = command
-                    .env_clear()
-                    .envs(env)
-                    .stdin(Stdio::null())
-                    .stdout(std::fs::File::create(&output)?)
-                    .stderr(Stdio::null())
-                    .spawn()?;
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                loop {
-                    if let Some(status) = child.try_wait()? {
-                        ensure!(status.success(), "module stop preparation failed");
-                        break;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        child.kill()?;
-                        child.wait()?;
-                        anyhow::bail!(
-                            "module stop preparation did not respond; existing service retained"
-                        )
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                ensure!(
-                    std::fs::metadata(&output)?.len() < 65536,
-                    "invalid stop preparation response"
-                );
-                let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&output)?)?;
-                value["ready"]
-                    .as_bool()
-                    .ok_or_else(|| anyhow::anyhow!("invalid stop preparation response"))
-            })();
-            if output.exists() {
-                std::fs::remove_file(output)?;
-            }
+            command.env_clear().envs(env);
+            let output = crate::check_process::run(
+                &mut command,
+                Vec::new(),
+                std::time::Duration::from_secs(30),
+                65536,
+            )
+            .context("module stop preparation failed")?;
+            let value: serde_json::Value = serde_json::from_slice(&output)?;
+            let result = value["ready"]
+                .as_bool()
+                .context("invalid stop preparation response");
             active = !result?;
         }
         if !active {

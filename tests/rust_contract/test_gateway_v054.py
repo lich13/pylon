@@ -45,18 +45,8 @@ def isolated_root():
         yield Path(directory)
 
 
-def _free_loopback_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
 
 
-def _set_random_web_port(home: Path) -> int:
-    path = home / "config/bots.json"
-    settings = json.loads(path.read_text(encoding="utf-8"))
-    settings["web_port"] = _free_loopback_port()
-    path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
-    return settings["web_port"]
 
 
 def _seed_home(
@@ -67,7 +57,6 @@ def _seed_home(
     routes: dict[str, str],
 ) -> dict[str, str]:
     tokens = seed_home(home, telegram, bots, modules, routes)
-    _set_random_web_port(home)
     return tokens
 
 
@@ -118,7 +107,7 @@ def _rpc_value(
 
 
 class _GatewayProcess:
-    """Start an isolated gateway whose web port was selected for this test."""
+    """Start an isolated gateway with its own Unix socket."""
 
     def __init__(self, home: Path, telegram: "_LocalTelegram"):
         self.home = home
@@ -357,61 +346,14 @@ class _LocalTelegram:
         self.thread.join(timeout=2.0)
 
 
-class _CountingHTTPUpstream:
-    """A loopback-only upstream that records any forwarded request."""
-
-    def __init__(self):
-        owner = self
-        self._lock = threading.Lock()
-        self.requests: list[tuple[str, str]] = []
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *_args):
-                pass
-
-            def _respond(self):
-                with owner._lock:
-                    owner.requests.append((self.command, self.path))
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.send_header("Content-Length", "2")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(b"ok")
-
-            do_GET = _respond
-            do_POST = _respond
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
-        self.url = f"http://127.0.0.1:{self.server.server_port}"
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-
-    @property
-    def request_count(self) -> int:
-        with self._lock:
-            return len(self.requests)
-
-    def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2.0)
 
 
 def _runtime_case(home: Path, telegram: _LocalTelegram) -> RuntimeCase:
     case = RuntimeCase(home, telegram)
-    _set_random_web_port(home)
     case.gateway = _GatewayProcess(home, telegram)
     return case
 
 
-def _loopback_accepts(port: int) -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
-            return True
-    except OSError:
-        return False
 
 
 def _task_summary_database_state(home: Path) -> tuple[list[dict], dict]:
@@ -592,63 +534,6 @@ def test_64_slow_clear_buttons_calls_do_not_starve_three_bot_deliveries(isolated
     assert all(response.get("ok") is True for response in responses), responses
 
 
-def test_partial_web_body_does_not_block_admin_reload_or_health(isolated_root):
-    telegram = _LocalTelegram()
-    upstream = _CountingHTTPUpstream()
-    home = isolated_root / "home"
-    _seed_home(
-        home,
-        telegram,
-        [("bot_one", "101")],
-        [{"id": "alpha", "topic": "topic_alpha", "job_id": "job_alpha", "web": True}],
-        {"topic_alpha": "bot_one"},
-    )
-    manifest_path = home / "modules/alpha/module.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["web"]["market"]["upstream"] = upstream.url
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    gateway = _GatewayProcess(home, telegram)
-    web_port = json.loads((home / "config/bots.json").read_text(encoding="utf-8"))["web_port"]
-    partial_request = None
-    try:
-        gateway.start()
-        wait_for(lambda: _loopback_accepts(web_port), timeout=3.0)
-        partial_request = socket.create_connection(("127.0.0.1", web_port), timeout=2.0)
-        partial_request.sendall(
-            b"POST /pylon/market/slow?fixture=partial HTTP/1.1\r\n"
-            b"Host: 127.0.0.1\r\n"
-            b"Content-Type: application/octet-stream\r\n"
-            b"Content-Length: 128\r\n"
-            b"Connection: keep-alive\r\n\r\n"
-            b"unfinished request body"
-        )
-        # The declared body is deliberately incomplete. Let the proxy handler
-        # wait on the client body while reload and health contend for snapshot access.
-        time.sleep(5.5)
-        assert upstream.request_count == 0, "incomplete request body was forwarded upstream"
-
-        failures = []
-        values = {}
-        for method in ("admin.reload", "health"):
-            started = time.monotonic()
-            try:
-                values[method] = _rpc_value(home, method, timeout=2.0)
-            except Exception as error:
-                failures.append((method, repr(error)))
-            elapsed = time.monotonic() - started
-            if elapsed >= 2.0:
-                failures.append((method, f"took {elapsed:.3f}s while the web body was incomplete"))
-        assert not failures, failures
-        assert values["admin.reload"] == {"ok": True}
-        assert values["health"]["api_version"] == 2
-    finally:
-        if partial_request is not None:
-            partial_request.close()
-        gateway.stop()
-        upstream.close()
-        telegram.close()
-    assert upstream.request_count == 0, "incomplete request body reached the loopback upstream"
 
 
 def test_empty_success_payload_for_send_message_is_uncertain_and_not_replayed(isolated_root):
@@ -1042,15 +927,16 @@ def test_idle_longpoll_shutdown_closes_listener_within_three_seconds(isolated_ro
         [{"id": "alpha", "topic": "topic_alpha", "job_id": "job_alpha"}],
         {"topic_alpha": "bot_one"},
     )
-    port = json.loads((home / "config/bots.json").read_text(encoding="utf-8"))["web_port"]
     gateway = _GatewayProcess(home, telegram)
     try:
         gateway.start()
         assert telegram.longpoll_entered.wait(timeout=5.0), "gateway did not enter the fake idle long poll"
-        wait_for(lambda: _loopback_accepts(port), timeout=3.0)
+        assert _rpc_value(home, "health")["api_version"] == 2
         elapsed = gateway.stop(timeout=3.0)
         assert elapsed < 3.0
-        assert not _loopback_accepts(port), "gateway web listener remained open after SIGTERM"
+        with socket.socket(socket.AF_UNIX) as probe:
+            with pytest.raises(OSError):
+                probe.connect(str(home / "run/gateway.sock"))
     finally:
         telegram.release_longpoll()
         gateway.stop()

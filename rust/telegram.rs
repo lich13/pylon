@@ -203,8 +203,11 @@ impl Telegram {
         let (bytes, name) = crate::blocking(move || {
             use std::io::Read;
             let mut file = config.attachment(&path)?;
+            const LIMIT: u64 = 50 * 1024 * 1024;
+            anyhow::ensure!(file.metadata()?.len() <= LIMIT, "attachment too large");
             let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
+            (&mut file).take(LIMIT + 1).read_to_end(&mut bytes)?;
+            anyhow::ensure!(bytes.len() as u64 <= LIMIT, "attachment too large");
             anyhow::ensure!(
                 crate::digest(&bytes) == expected,
                 "attachment checksum mismatch"

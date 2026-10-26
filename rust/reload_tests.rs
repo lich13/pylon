@@ -39,6 +39,29 @@ async fn hash(app: &App) -> String {
 }
 
 #[tokio::test]
+async fn reload_replaces_the_snapshot_without_changing_inflight_requests() {
+    let (temp, app) = fixture();
+    let original = app.snapshot.read().await.clone();
+    assert!(std::sync::Arc::ptr_eq(
+        &original,
+        &*app.snapshot.read().await
+    ));
+    fs::write(temp.path().join("modules/fixture/handler.sh"), "echo two\n").unwrap();
+    app.reload().await.unwrap();
+    let current = app.snapshot.read().await.clone();
+    assert!(!std::sync::Arc::ptr_eq(&original, &current));
+    assert_ne!(original.catalog.hash, current.catalog.hash);
+    let expected = original.catalog.modules["fixture"].hash.clone();
+    fs::write(temp.path().join("config/bots.json"), "invalid fixture").unwrap();
+    assert!(app.reload().await.is_err());
+    assert!(std::sync::Arc::ptr_eq(
+        &current,
+        &*app.snapshot.read().await
+    ));
+    assert_eq!(original.catalog.modules["fixture"].hash, expected);
+}
+
+#[tokio::test]
 async fn unchanged_checks_do_not_read_source_or_credentials_and_force_still_does() {
     let (temp, app) = fixture();
     let root = temp.path().join("modules/fixture");

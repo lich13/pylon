@@ -126,17 +126,12 @@ jobs:
           MODULE: ${{ inputs.module }}
         run: python -m pylon_sdk.tools check "$MODULE"
       - name: Browser runtime
-        if: inputs.module == 'all' || inputs.module == 'content' || inputs.module == 'software' || inputs.module == 'gmail'
+        if: inputs.module == 'all' || inputs.module == 'content' || inputs.module == 'software'
         run: python -m playwright install --with-deps --only-shell chromium
       - name: Browser acceptance
         if: inputs.module == 'all' || inputs.module == 'content' || inputs.module == 'software'
         run: |
           python "$PYLON_MODULES_DIR/content/ci/browser-smoke.py"
-          python "$PYLON_MODULES_DIR/content/ci/intelligence-web.py"
-          python "$PYLON_MODULES_DIR/content/ci/daily-review-web.py"
-      - name: Gmail browser acceptance
-        if: inputs.module == 'all' || inputs.module == 'gmail'
-        run: python "$PYLON_MODULES_DIR/gmail/ci/browser.py"
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         if: inputs.router
         with:
@@ -146,9 +141,39 @@ jobs:
       - name: Router images
         if: inputs.router
         run: bash "$PYLON_MODULES_DIR/content/tools/chiphell/cloud/build-router-images.sh" "$PYLON_MODULES_DIR/content/tools/chiphell" "$RUNNER_TEMP/router-artifacts"
+  package:
+    if: inputs.module == 'all'
+    needs: [input, checks]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.core_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: module-input-${{ inputs.job }}
+          path: ${{ runner.temp }}/input
+      - name: Package verified SDK and modules
+        env:
+          SOURCE_SHA: ${{ inputs.sha256 }}
+          CORE_SHA: ${{ inputs.core_sha }}
+        run: python scripts/package-external.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pylon-external-${{ inputs.job }}
+          path: ${{ runner.temp }}/external-dist
+          retention-days: 30
+          if-no-files-found: error
   cleanup:
     if: always()
-    needs: [input, checks]
+    needs: [input, checks, package]
     runs-on: ubuntu-24.04
     permissions:
       actions: write

@@ -5,7 +5,7 @@ use anyhow::{Result, ensure};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, ReadDir},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
@@ -16,6 +16,8 @@ type Requests = BTreeMap<String, (String, String, f64)>;
 #[derive(Default)]
 pub(crate) struct Scan {
     directory: Option<ReadDir>,
+    pending: VecDeque<std::path::PathBuf>,
+    exhausted: bool,
     identity: Option<(u64, u64)>,
     entries_seen: u64,
     entries_removed: u64,
@@ -37,19 +39,35 @@ impl Scan {
     }
 }
 
-fn requests(config: &Config) -> Result<Requests> {
+fn requests(
+    config: &Config,
+    candidates: &BTreeSet<String>,
+    stop: &watch::Receiver<bool>,
+) -> Result<Requests> {
+    if candidates.is_empty() {
+        return Ok(Requests::new());
+    }
     let db = crate::queue::connect(config)?;
     let mut q = db.prepare("SELECT id,state,updated_at FROM requests")?;
     let mut result = BTreeMap::new();
-    for row in q.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, f64>(2)?,
-        ))
-    })? {
+    for (n, row) in q
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+            ))
+        })?
+        .enumerate()
+    {
         let (id, state, at) = row?;
-        result.insert(crate::digest(&id), (id, state, at));
+        if n % 500 == 0 && (*stop.borrow() || config.home.join("run/freeze").exists()) {
+            anyhow::bail!("lock scan interrupted");
+        }
+        let hash = crate::digest(&id);
+        if candidates.contains(&hash) {
+            result.insert(hash, (id, state, at));
+        }
     }
     Ok(result)
 }
@@ -173,12 +191,11 @@ pub(crate) fn remove(
     Ok(true)
 }
 
-fn batch(
+fn collect(
     config: &Config,
     scan: &mut Scan,
-    requests: &Requests,
     stop: &watch::Receiver<bool>,
-) -> Result<()> {
+) -> Result<BTreeSet<String>> {
     let run = config.home.join("run");
     let metadata = fs::symlink_metadata(&run)?;
     ensure!(metadata.is_dir(), "unsafe run directory");
@@ -189,23 +206,55 @@ fn batch(
         scan.entries_seen = 0;
         scan.entries_removed = 0;
         scan.directory_started_at = Some(crate::now());
+        scan.exhausted = false;
     }
     ensure!(scan.identity == Some(identity), "run directory changed");
+    while scan.pending.len() < 50_000 && !scan.exhausted {
+        if *stop.borrow() || run.join("freeze").exists() {
+            break;
+        }
+        match scan.directory.as_mut().expect("scan open").next() {
+            Some(entry) => scan.pending.push_back(entry?.path()),
+            None => scan.exhausted = true,
+        }
+    }
+    Ok(scan
+        .pending
+        .iter()
+        .filter_map(|p| candidate(p.file_name()?.to_str()?).map(str::to_owned))
+        .collect())
+}
+
+fn batch(
+    config: &Config,
+    scan: &mut Scan,
+    requests: &Requests,
+    stop: &watch::Receiver<bool>,
+) -> Result<()> {
+    let run = config.home.join("run");
+    let metadata = fs::symlink_metadata(&run)?;
+    ensure!(
+        metadata.is_dir() && scan.identity == Some((metadata.dev(), metadata.ino())),
+        "run directory changed"
+    );
     for _ in 0..1000 {
         if *stop.borrow() || run.join("freeze").exists() {
             break;
         }
-        let entry = scan.directory.as_mut().expect("scan open").next();
-        let Some(entry) = entry else {
-            scan.directory = None;
-            scan.directory_entries = Some(scan.entries_seen.saturating_sub(scan.entries_removed));
-            scan.directory_sampled_at = Some(crate::now());
-            scan.finished = true;
+        let Some(path) = scan.pending.pop_front() else {
+            if scan.exhausted {
+                scan.directory = None;
+                scan.directory_entries =
+                    Some(scan.entries_seen.saturating_sub(scan.entries_removed));
+                scan.directory_sampled_at = Some(crate::now());
+                scan.finished = true;
+            }
             break;
         };
-        let entry = entry?;
         scan.entries_seen += 1;
-        let name = entry.file_name();
+        let Some(name) = path.file_name() else {
+            continue;
+        };
         let Some(name) = name.to_str() else {
             continue;
         };
@@ -213,7 +262,7 @@ fn batch(
             continue;
         };
         scan.checked += 1;
-        match remove(config, &entry.path(), requests.get(hash), crate::now()) {
+        match remove(config, &path, requests.get(hash), crate::now()) {
             Ok(true) => {
                 scan.deleted += 1;
                 scan.entries_removed += 1;
@@ -239,12 +288,28 @@ pub(crate) async fn run(config: &Config, mut scan: Scan, stop: &mut watch::Recei
     scan.finished = false;
     scan.scan_error = None;
     let read = config.clone();
-    let requests = match crate::blocking(move || requests(&read)).await {
-        Ok(requests) => std::sync::Arc::new(requests),
+    let stopping = stop.clone();
+    let prepared = crate::blocking(move || {
+        let result = collect(&read, &mut scan, &stopping)
+            .and_then(|candidates| requests(&read, &candidates, &stopping));
+        Ok((scan, result))
+    })
+    .await;
+    let requests = match prepared {
+        Ok((saved, Ok(requests))) => {
+            scan = saved;
+            std::sync::Arc::new(requests)
+        }
+        Ok((mut saved, Err(_))) => {
+            saved.scan_error = Some("request_state_unavailable");
+            crate::retention::publish_locks(config, saved.snapshot());
+            return saved;
+        }
         Err(_) => {
-            scan.scan_error = Some("request_state_unavailable");
-            crate::retention::publish_locks(config, scan.snapshot());
-            return scan;
+            return Scan {
+                scan_error: Some("request_state_unavailable"),
+                ..Scan::default()
+            };
         }
     };
     // Bound entries as well as candidates: unrelated files cannot monopolize a round.
@@ -259,6 +324,7 @@ pub(crate) async fn run(config: &Config, mut scan: Scan, stop: &mut watch::Recei
             let result = batch(&config_copy, &mut scan, &requests, &stopping);
             if let Err(error) = result {
                 scan.directory = None;
+                scan.pending.clear();
                 scan.scan_error = Some(if error.downcast_ref::<rusqlite::Error>().is_some() {
                     "request_state_unavailable"
                 } else {

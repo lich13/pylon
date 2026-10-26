@@ -369,11 +369,11 @@ def _ordinary_identity() -> tuple[int, int]:
     pytest.skip("no ordinary UID/GID is available for the peer-credential fixture")
 
 
-def _run_context_open_as(uid: int, gid: int, home: Path) -> dict:
+def _run_context_open_as(uid: int, gid: int, home: Path, method="context.open") -> dict:
     request = json.dumps(
         {
             "api_version": 2,
-            "method": "context.open",
+            "method": method,
             "params": {"module": "alpha", "subject": "job:job_alpha"},
             "context": "",
         },
@@ -398,8 +398,9 @@ def _run_context_open_as(uid: int, gid: int, home: Path) -> dict:
     return json.loads(result.stdout)
 
 
+@pytest.mark.parametrize("method", ["context.open", "context.retire_service"])
 def test_production_context_open_rejects_an_ordinary_unix_peer(
-    ordinary_peer_workdir, telegram
+    ordinary_peer_workdir, telegram, method
 ):
     home = ordinary_peer_workdir / "home"
     _seed_security_home(home, telegram)
@@ -426,7 +427,7 @@ def test_production_context_open_rejects_an_ordinary_unix_peer(
         with sqlite3.connect(home / "gateway/state.sqlite3", timeout=3) as database:
             before = database.execute("SELECT COUNT(*) FROM contexts").fetchone()[0]
 
-        response = _run_context_open_as(uid, gid, home)
+        response = _run_context_open_as(uid, gid, home, method)
         assert_rpc_rejected(response)
 
         with sqlite3.connect(home / "gateway/state.sqlite3", timeout=3) as database:

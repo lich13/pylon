@@ -34,16 +34,6 @@ pub struct Store {
 }
 impl Store {
     pub fn new(path: &Path) -> Result<Self> {
-        let store = Self::migration_target(path)?;
-        {
-            let db = store.connect()?;
-            crate::migration::internal_state(&db)?;
-        }
-        Ok(store)
-    }
-    /// The import transaction owns internal initialization so rejected imports
-    /// leave existing state untouched. Normal runtime callers must use `new`.
-    pub(crate) fn migration_target(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path.parent().context("missing database directory")?)?;
         let store = Self {
             path: path.to_path_buf(),
@@ -53,6 +43,7 @@ impl Store {
         {
             let db = store.connect()?;
             db.execute_batch(include_str!("schema.sql"))?;
+            internal_state(&db)?;
         }
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -125,7 +116,7 @@ impl Store {
     pub fn uncertain_digest_day(&self, target: &str, day: &str) -> Result<()> {
         let mut db = self.connect()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        crate::migration::initialize_uncertain(&tx)?;
+        initialize_uncertain(&tx)?;
         let value: String = tx.query_row(
             "SELECT value FROM kv WHERE key='uncertain:counter:v2'",
             [],
@@ -893,4 +884,63 @@ mod freeze_alert_tests {
             0
         );
     }
+}
+
+/// Idempotent internal diagnostics migration; public tables and IDs stay unchanged.
+fn internal_state(db: &rusqlite::Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+    internal_state_transaction(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn internal_state_transaction(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch("DROP TABLE IF EXISTS web_tokens; DROP TABLE IF EXISTS web_sessions;")?;
+    initialize_uncertain(tx)?;
+    let installed: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM kv WHERE key='uncertain:triggers' AND value='3')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !installed {
+        tx.execute_batch(
+            "DROP TRIGGER IF EXISTS uncertain_count_update_v2;
+                          DROP TRIGGER IF EXISTS uncertain_count_insert_v2;",
+        )?;
+        for (name, action, condition) in [
+            (
+                "uncertain_count_update_v2",
+                "UPDATE OF status",
+                "AND OLD.status<>'uncertain'",
+            ),
+            ("uncertain_count_insert_v2", "INSERT", ""),
+        ] {
+            tx.execute_batch(&format!(
+                "CREATE TRIGGER {name} AFTER {action} ON events
+                 WHEN NEW.status='uncertain' {condition} AND NEW.job_id<>'uncertain-summary'
+                 BEGIN
+                   UPDATE kv SET value=json_set(value,'$.pending',json_extract(value,'$.pending')+1)
+                     WHERE key='uncertain:counter:v2';
+                   {seed}
+                 END;",
+                // A deliberately retired counter must stay inactive while an older
+                // binary owns the database. The next Store::new seeds it explicitly.
+                seed = UNCERTAIN_SEED.replace("WHERE NOT EXISTS", "WHERE NOT EXISTS (SELECT 1 FROM kv WHERE key='uncertain:counter:v2:retired') AND NOT EXISTS"),
+            ))?;
+        }
+        tx.execute("INSERT INTO kv VALUES('uncertain:triggers','3') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [])?;
+    }
+    Ok(())
+}
+
+const UNCERTAIN_SEED: &str = "INSERT INTO kv(key,value)
+ SELECT 'uncertain:counter:v2',json_object('version',2,'pending',
+   (SELECT count(*) FROM events WHERE status='uncertain' AND job_id<>'uncertain-summary'
+    AND id NOT IN (SELECT value FROM json_each(COALESCE(
+      (SELECT value FROM kv WHERE key='uncertain:watermark'),'[]')))), 'last_day','')
+ WHERE NOT EXISTS (SELECT 1 FROM kv WHERE key='uncertain:counter:v2');";
+
+pub(crate) fn initialize_uncertain(db: &rusqlite::Connection) -> Result<()> {
+    db.execute_batch(UNCERTAIN_SEED)?;
+    Ok(())
 }

@@ -7,6 +7,27 @@ fn fixture() -> (tempfile::TempDir, Config) {
     crate::queue::connect(&config).unwrap();
     (temp, config)
 }
+
+#[test]
+fn request_scan_retains_only_candidate_records_and_aborts_on_freeze() {
+    let (_temp, config) = fixture();
+    for n in 0..400 {
+        request(&config, &format!("row-{n}"), "running", 1.0);
+    }
+    let candidates = [
+        crate::digest("row-1"),
+        crate::digest("row-399"),
+        crate::digest("orphan"),
+    ]
+    .into_iter()
+    .collect();
+    let (_, rx) = watch::channel(false);
+    let found = requests(&config, &candidates, &rx).unwrap();
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[&crate::digest("row-1")].1, "running");
+    fs::write(config.home.join("run/freeze"), b"").unwrap();
+    assert!(requests(&config, &candidates, &rx).is_err());
+}
 fn path(config: &Config, id: &str) -> std::path::PathBuf {
     config
         .home
@@ -129,6 +150,7 @@ fn scan_is_bounded_continues_and_excludes_other_files_and_freeze() {
     fs::write(config.home.join("run/job.lock"), b"").unwrap();
     let (_, rx) = watch::channel(false);
     let mut scan = Scan::default();
+    collect(&config, &mut scan, &rx).unwrap();
     batch(&config, &mut scan, &Requests::new(), &rx).unwrap();
     assert_eq!(scan.entries_seen, 1000);
     assert!(!scan.finished);
@@ -141,6 +163,7 @@ fn scan_is_bounded_continues_and_excludes_other_files_and_freeze() {
     assert_eq!(scan.deleted, 0);
     fs::write(config.home.join("run/freeze"), b"").unwrap();
     let mut frozen = Scan::default();
+    collect(&config, &mut frozen, &rx).unwrap();
     batch(&config, &mut frozen, &Requests::new(), &rx).unwrap();
     assert_eq!(frozen.checked, 0);
     assert!(candidate(&format!("request-{}.lock", "a".repeat(64))).is_some());
@@ -206,6 +229,7 @@ fn nonempty_request_lock_is_soft_skipped_without_scan_error() {
     fs::set_permissions(path(&config, "nonempty"), fs::Permissions::from_mode(0o660)).unwrap();
     let (_, rx) = watch::channel(false);
     let mut scan = Scan::default();
+    collect(&config, &mut scan, &rx).unwrap();
     batch(&config, &mut scan, &Requests::new(), &rx).unwrap();
     assert!(scan.finished);
     assert_eq!(scan.checked, 1);

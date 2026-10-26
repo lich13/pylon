@@ -187,8 +187,6 @@ pub(crate) enum Kind {
     Updates,
     Runs,
     Events,
-    WebTokens,
-    WebSessions,
     Contexts,
     History,
     Orphans,
@@ -200,8 +198,6 @@ impl Kind {
             Self::Updates => "updates",
             Self::Runs => "runs",
             Self::Events => "events",
-            Self::WebTokens => "web_tokens",
-            Self::WebSessions => "web_sessions",
             Self::Contexts => "contexts",
             Self::History | Self::Orphans => "kv",
             Self::Requests => "requests",
@@ -441,13 +437,9 @@ pub(crate) fn batch(
                         tx.execute("DELETE FROM requests WHERE id=?", [&id])?,
                     );
                 }
-                Kind::WebTokens | Kind::WebSessions | Kind::Contexts => {
+                Kind::Contexts => {
                     let cutoff = now - f64::from(policy.expired_days) * 86400.0;
-                    let predicate = match kind {
-                        Kind::WebTokens => "(used_at IS NOT NULL OR expires_at<?2)",
-                        Kind::WebSessions => "expires_at<?2",
-                        _ => "expires_at>0 AND expires_at<?2",
-                    };
+                    let predicate = "expires_at>0 AND expires_at<?2";
                     result.add(
                         kind.table(),
                         tx.execute(
@@ -660,8 +652,6 @@ pub(crate) async fn gateway(app: crate::api::App, mut stop: watch::Receiver<bool
                     Kind::Updates,
                     Kind::Runs,
                     Kind::Events,
-                    Kind::WebTokens,
-                    Kind::WebSessions,
                     Kind::Contexts,
                     Kind::History,
                 ];

@@ -242,7 +242,6 @@ def _write_shell_module(
     *,
     version: str,
     command_name: str,
-    web_path: str,
     health_status: str = "ok",
     lifecycle: bool = False,
 ) -> Path:
@@ -254,12 +253,6 @@ def _write_shell_module(
             "entry": ["bash", "service.sh"],
             "workspace": "default",
             "topic": topic,
-        }
-    }
-    manifest["web"] = {
-        web_path: {
-            "service": "worker",
-            "upstream": "http://127.0.0.1:18080/",
         }
     }
     if lifecycle:
@@ -584,7 +577,6 @@ def _live_module_activation_contract(*, lifecycle: bool = False):
                     *,
                     version: str,
                     command_name: str,
-                    web_path: str,
                     health_status: str = "ok",
                     with_lifecycle: bool = False,
                 ) -> tuple[Path, str]:
@@ -595,7 +587,6 @@ def _live_module_activation_contract(*, lifecycle: bool = False):
                         topic,
                         version=version,
                         command_name=command_name,
-                        web_path=web_path,
                         health_status=health_status,
                         lifecycle=with_lifecycle,
                     )
@@ -603,14 +594,11 @@ def _live_module_activation_contract(*, lifecycle: bool = False):
                     checksum = _pack(home, source, archive)
                     return archive, checksum
 
-                target_web_path = f"aweb{suffix}"
-                bystander_web_path = f"rweb{suffix}"
                 target_v1_archive, target_v1_sha = create_install(
                     target_id,
                     topic_target,
                     version="target-v1",
                     command_name=f"a{suffix[:6]}v1",
-                    web_path=target_web_path,
                     with_lifecycle=lifecycle,
                 )
                 target_v1 = _install(home, target_v1_archive, target_v1_sha)
@@ -631,7 +619,6 @@ def _live_module_activation_contract(*, lifecycle: bool = False):
                     topic_bystander,
                     version="bystander-v1",
                     command_name=f"r{suffix[:6]}v1",
-                    web_path=bystander_web_path,
                 )
                 bystander_v1 = _install(home, bystander_v1_archive, bystander_v1_sha)
                 assert bystander_v1["id"] == bystander_id
@@ -666,7 +653,6 @@ def _live_module_activation_contract(*, lifecycle: bool = False):
                     topic_target,
                     version="target-v2",
                     command_name=f"a{suffix[:6]}v2",
-                    web_path=target_web_path,
                     with_lifecycle=lifecycle,
                 )
                 if lifecycle:
@@ -743,7 +729,6 @@ def _live_module_activation_contract(*, lifecycle: bool = False):
                         topic_target,
                         version="target-v3",
                         command_name=f"a{suffix[:6]}v3",
-                        web_path=target_web_path,
                         with_lifecycle=True,
                     )
                     blocked = _gateway_cli(
@@ -770,7 +755,6 @@ def _live_module_activation_contract(*, lifecycle: bool = False):
                     topic_target,
                     version="target-bad",
                     command_name=f"a{suffix[:6]}bad",
-                    web_path=target_web_path,
                     health_status="failed",
                 )
                 rejected_archive = fixture_root / f"{target_id}-target-bad.tar.gz"

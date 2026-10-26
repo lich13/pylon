@@ -66,8 +66,6 @@ pub struct Settings {
     pub retention: crate::retention::Policy,
     #[serde(default)]
     pub admission: Admission,
-    #[serde(default = "default_web_port")]
-    pub web_port: u16,
     #[serde(default = "default_ip_family")]
     pub telegram_ip_family: String,
     pub bots: BTreeMap<String, Bot>,
@@ -76,16 +74,11 @@ pub struct Settings {
     #[serde(default)]
     pub workspaces: BTreeMap<String, Workspace>,
     #[serde(default)]
-    pub public_origin: String,
-    #[serde(default)]
     pub legacy_workspaces: BTreeMap<String, String>,
     #[serde(default)]
     pub groups: BTreeMap<String, ResourceGroup>,
     #[serde(default)]
     pub runtime_users: BTreeMap<String, RuntimeUser>,
-}
-fn default_web_port() -> u16 {
-    8793
 }
 fn default_ip_family() -> String {
     "ipv4".into()
@@ -133,7 +126,6 @@ impl Config {
         let s: Settings = serde_json::from_slice(bytes)?;
         s.retention.validate()?;
         s.admission.validate()?;
-        ensure!(s.web_port > 0, "invalid web port");
         ensure!(
             ["ipv4", "ipv6", "auto"].contains(&s.telegram_ip_family.as_str()),
             "invalid Telegram address family"
@@ -179,18 +171,6 @@ impl Config {
             if !workspace.env.is_empty() {
                 self.contained(&workspace.env)?;
             }
-        }
-        if !s.public_origin.is_empty() {
-            let u = reqwest::Url::parse(&s.public_origin)?;
-            ensure!(
-                u.scheme() == "https"
-                    && u.username().is_empty()
-                    && u.password().is_none()
-                    && u.query().is_none()
-                    && u.fragment().is_none()
-                    && u.path() == "/",
-                "invalid public origin"
-            );
         }
         Ok(s)
     }

@@ -39,17 +39,8 @@ def short_tmp_path():
         yield Path(directory)
 
 
-def _free_loopback_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
 
 
-def _set_web_port(home: Path, port: int) -> None:
-    path = home / "config/bots.json"
-    settings = json.loads(path.read_text(encoding="utf-8"))
-    settings["web_port"] = port
-    path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _write_settings(home: Path, settings: dict) -> None:
@@ -58,61 +49,12 @@ def _write_settings(home: Path, settings: dict) -> None:
     )
 
 
-def _tcp_connects(port: int, host: str = "127.0.0.1") -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=0.35):
-            return True
-    except OSError:
-        return False
 
 
-def _listener_lines(pid: int, port: int) -> list[str]:
-    process = Path(f"/proc/{pid}")
-    if process.is_dir():
-        inodes = set()
-        for descriptor in (process / "fd").iterdir():
-            try:
-                target = os.readlink(descriptor)
-            except FileNotFoundError:
-                continue
-            if target.startswith("socket:["):
-                inodes.add(target[8:-1])
-        listeners = []
-        for name, family in (("tcp", socket.AF_INET), ("tcp6", socket.AF_INET6)):
-            table = process / "net" / name
-            if not table.exists():
-                continue
-            for line in table.read_text().splitlines()[1:]:
-                fields = line.split()
-                address, raw_port = fields[1].split(":")
-                if fields[3] != "0A" or fields[9] not in inodes or int(raw_port, 16) != port:
-                    continue
-                raw = bytes.fromhex(address)
-                raw = b"".join(raw[i:i+4][::-1] for i in range(0, len(raw), 4))
-                listeners.append(f"{socket.inet_ntop(family, raw)}:{port}")
-        return listeners
-    if not shutil.which("lsof"):
-        pytest.skip("listener ownership inspection requires /proc or lsof")
-    result = subprocess.run(
-        [
-            "lsof",
-            "-nP",
-            "-a",
-            "-p",
-            str(pid),
-            f"-iTCP:{port}",
-            "-sTCP:LISTEN",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=3,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-    return result.stdout.splitlines()[1:]
 
 
 class _GatewayProcess:
-    """Launch one isolated gateway without assuming the default web port is free."""
+    """Launch one isolated gateway over its Unix socket."""
 
     def __init__(self, home: Path, telegram: "_LocalTelegram"):
         self.home = home
@@ -284,7 +226,6 @@ def _seed_one_bot(home: Path, telegram: _LocalTelegram) -> dict[str, str]:
         [{"id": "alpha", "topic": "topic_alpha", "job_id": "job_alpha"}],
         {"topic_alpha": "bot_one"},
     )
-    _set_web_port(home, _free_loopback_port())
     return tokens
 
 
@@ -381,7 +322,6 @@ def test_removed_bot_old_context_submission_is_a_controlled_error_after_reload(s
             [{"id": "alpha", "topic": "topic_alpha", "job_id": "job_alpha"}],
             {"topic_alpha": "bot_one"},
         )
-        _set_web_port(home, _free_loopback_port())
         with _GatewayProcess(home, telegram):
             context = open_context(home, "alpha", "job_alpha")["token"]
             settings_path = home / "config/bots.json"
@@ -415,7 +355,6 @@ def test_recovery_notice_ttl_coalesces_per_bot_without_expiring_business_events(
         [{"id": "alpha", "topic": "topic_alpha", "job_id": "job_alpha"}],
         {"topic_alpha": "bot_one"},
     )
-    _set_web_port(home, _free_loopback_port())
     try:
         # Initialize the database schema, then simulate interrupted bot updates.
         with _GatewayProcess(home, telegram):
@@ -500,74 +439,8 @@ def test_recovery_notice_ttl_coalesces_per_bot_without_expiring_business_events(
         telegram.close()
 
 
-def test_missing_web_port_defaults_to_loopback_8793(short_tmp_path):
-    if _tcp_connects(8793):
-        pytest.skip("default loopback web port 8793 is already in use")
-    telegram = _LocalTelegram()
-    try:
-        home = short_tmp_path / "home"
-        seed_home(
-            home,
-            telegram,
-            [("bot_one", "101")],
-            [{"id": "alpha", "topic": "topic_alpha", "job_id": "job_alpha"}],
-            {"topic_alpha": "bot_one"},
-        )
-        settings = json.loads((home / "config/bots.json").read_text(encoding="utf-8"))
-        assert "web_port" not in settings
-
-        with _GatewayProcess(home, telegram) as gateway:
-            assert gateway.proc is not None
-            wait_for(lambda: _tcp_connects(8793), timeout=3.0)
-            listeners = _listener_lines(gateway.proc.pid, 8793)
-            assert listeners, "gateway must own the default web listener"
-            assert all("127.0.0.1:8793" in line for line in listeners), listeners
-    finally:
-        telegram.close()
 
 
-@pytest.mark.parametrize("replacement", [0, "different-valid-port"])
-def test_web_port_reload_rejection_preserves_old_snapshot_and_listener(short_tmp_path, replacement):
-    telegram = _LocalTelegram()
-    try:
-        home = short_tmp_path / "home"
-        seed_home(
-            home,
-            telegram,
-            [("bot_one", "101"), ("bot_two", "202")],
-            [{"id": "alpha", "topic": "topic_alpha", "job_id": "job_alpha"}],
-            {"topic_alpha": "bot_one"},
-        )
-        old_port = _free_loopback_port()
-        new_port = _free_loopback_port()
-        while new_port == old_port:
-            new_port = _free_loopback_port()
-        _set_web_port(home, old_port)
-
-        with _GatewayProcess(home, telegram) as gateway:
-            assert gateway.proc is not None
-            wait_for(lambda: _tcp_connects(old_port), timeout=3.0)
-            old_catalog = rpc_value(home, "health")["catalog"]
-
-            settings_path = home / "config/bots.json"
-            settings = json.loads(settings_path.read_text(encoding="utf-8"))
-            settings["routes"]["topic_alpha"] = "bot_two"
-            settings["web_port"] = new_port if replacement == "different-valid-port" else replacement
-            _write_settings(home, settings)
-
-            rejected = rpc(home, "admin.reload")
-            assert_rpc_rejected(rejected)
-            assert rpc_value(home, "health")["catalog"] == old_catalog
-            context = open_context(home, "alpha", "job_alpha")
-            assert context["bot"] == "bot_one"
-            wait_for(lambda: _tcp_connects(old_port), timeout=3.0)
-            if replacement == "different-valid-port":
-                assert not _tcp_connects(new_port)
-            listeners = _listener_lines(gateway.proc.pid, old_port)
-            assert listeners
-            assert all(f"127.0.0.1:{old_port}" in line for line in listeners), listeners
-    finally:
-        telegram.close()
 
 
 def test_health_remains_available_during_sqlite_busy_then_delivery_succeeds(short_tmp_path):

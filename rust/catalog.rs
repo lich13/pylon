@@ -28,8 +28,6 @@ pub struct Manifest {
     #[serde(default)]
     pub services: BTreeMap<String, Service>,
     #[serde(default)]
-    pub web: BTreeMap<String, Web>,
-    #[serde(default)]
     pub documents: Vec<Value>,
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -41,8 +39,6 @@ pub struct Manifest {
     pub workspace: String,
     #[serde(default)]
     pub check: Vec<Vec<String>>,
-    #[serde(default)]
-    pub preview: Vec<String>,
     #[serde(default)]
     pub lifecycle: Vec<String>,
     #[serde(default)]
@@ -111,13 +107,6 @@ pub struct Service {
     pub topic: String,
     #[serde(default)]
     pub legacy_unit: String,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Web {
-    pub service: String,
-    pub upstream: String,
-    #[serde(default)]
-    pub title: String,
 }
 #[derive(Clone, Debug)]
 pub struct Module {
@@ -235,7 +224,6 @@ impl Catalog {
         let mut commands = BTreeSet::from(["help".to_string(), "start".to_string()]);
         let mut jobs = BTreeSet::new();
         let mut callbacks: Vec<String> = Vec::new();
-        let mut web_paths = BTreeSet::new();
         let mut hashes = Vec::new();
         for (id, root) in roots {
             let bytes = fs::read(root.join("module.json"))?;
@@ -298,26 +286,6 @@ impl Catalog {
                         && valid_entry(&service.entry)
                         && crate::identifier(&service.workspace),
                     "invalid service"
-                );
-            }
-            for (path, web) in &manifest.web {
-                ensure!(
-                    crate::identifier(path)
-                        && web_paths.insert(path.clone())
-                        && manifest.services.contains_key(&web.service),
-                    "invalid web registration"
-                );
-                let url = reqwest::Url::parse(&web.upstream)?;
-                ensure!(
-                    url.scheme() == "http"
-                        && url.host_str() == Some("127.0.0.1")
-                        && url.port().is_some()
-                        && url.path() == "/"
-                        && url.query().is_none()
-                        && url.fragment().is_none()
-                        && url.username().is_empty()
-                        && url.password().is_none(),
-                    "web service must use loopback"
                 );
             }
             let hash = crate::modules::content_hash(&root)?;

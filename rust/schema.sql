@@ -21,12 +21,6 @@ CREATE INDEX IF NOT EXISTS updates_pending ON updates(profile,update_id) WHERE s
 CREATE INDEX IF NOT EXISTS runs_job_started ON runs(job_id,started_at DESC);
 CREATE INDEX IF NOT EXISTS runs_status_started ON runs(status,started_at DESC);
 CREATE TABLE IF NOT EXISTS run_events (run_id TEXT NOT NULL,event_id TEXT NOT NULL,PRIMARY KEY(run_id,event_id));
-CREATE TABLE IF NOT EXISTS web_tokens (
- hash TEXT PRIMARY KEY,owner TEXT NOT NULL,bot TEXT NOT NULL,workspace TEXT NOT NULL,expires_at REAL NOT NULL,used_at REAL
-);
-CREATE TABLE IF NOT EXISTS web_sessions (
- hash TEXT PRIMARY KEY,owner TEXT NOT NULL,bot TEXT NOT NULL,csrf TEXT NOT NULL,expires_at REAL NOT NULL
-);
 CREATE TABLE IF NOT EXISTS contexts (
  hash TEXT PRIMARY KEY,module TEXT NOT NULL,bot TEXT NOT NULL,capabilities TEXT NOT NULL,expires_at REAL NOT NULL,
  origin TEXT NOT NULL,workspace TEXT NOT NULL

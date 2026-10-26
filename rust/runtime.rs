@@ -359,7 +359,18 @@ pub async fn process(
     timeout: Option<u64>,
 ) -> Result<(i32, String, String)> {
     let identity = execution_identity(config, module)?;
-    process_as(config, module, entry, env, input, timeout, identity).await
+    process_as(
+        config,
+        module,
+        entry,
+        env,
+        input,
+        timeout,
+        identity,
+        8 * 1024 * 1024,
+        None,
+    )
+    .await
 }
 fn execution_identity(config: &Config, module: &Module) -> Result<crate::config::RuntimeUser> {
     if unsafe { libc::geteuid() } == 0 {
@@ -380,6 +391,7 @@ fn execution_identity(config: &Config, module: &Module) -> Result<crate::config:
         })
     }
 }
+#[allow(clippy::too_many_arguments)]
 async fn process_as(
     config: &Config,
     module: &Module,
@@ -388,6 +400,8 @@ async fn process_as(
     input: Option<&Value>,
     timeout: Option<u64>,
     identity: crate::config::RuntimeUser,
+    output_limit: usize,
+    startup_guard: Option<File>,
 ) -> Result<(i32, String, String)> {
     let mut cmd = command(config, module, entry)?;
     let home = config.home.canonicalize()?;
@@ -413,45 +427,52 @@ async fn process_as(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().context("could not start business process")?;
-    let pid = child.id().context("missing process id")?;
+    drop(startup_guard);
+    let pid = child
+        .id()
+        .context("missing process id")
+        .context(crate::errors::ReconcileRequired)?;
     // Drain both streams concurrently; bounded capture keeps a noisy module from exhausting the gateway.
-    type Tail = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+    type Tail = std::sync::Arc<std::sync::Mutex<crate::output::Tail>>;
     async fn capture(
         mut stream: impl tokio::io::AsyncRead + Unpin,
         tail: Tail,
     ) -> std::io::Result<String> {
-        let mut bytes = vec![];
         let mut chunk = [0; 8192];
         loop {
             let n = stream.read(&mut chunk).await?;
             if n == 0 {
                 break;
             }
-            {
-                let mut tail = tail
-                    .lock()
-                    .map_err(|_| std::io::Error::other("output buffer unavailable"))?;
-                tail.extend_from_slice(&chunk[..n]);
-                if tail.len() > 65536 {
-                    let excess = tail.len() - 65536;
-                    tail.drain(..excess);
-                }
-            }
-            bytes.extend_from_slice(&chunk[..n]);
-            if bytes.len() > 8 * 1024 * 1024 {
-                bytes.drain(..bytes.len() - 8 * 1024 * 1024);
-            }
+            tail.lock()
+                .map_err(|_| std::io::Error::other("output buffer unavailable"))?
+                .append(&chunk[..n]);
         }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(tail
+            .lock()
+            .map_err(|_| std::io::Error::other("output buffer unavailable"))?
+            .text())
     }
-    let stdout_tail = Tail::default();
-    let stderr_tail = Tail::default();
+    let stdout_tail = std::sync::Arc::new(std::sync::Mutex::new(crate::output::Tail::new(
+        output_limit,
+    )));
+    let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(crate::output::Tail::new(
+        output_limit,
+    )));
     let mut out = tokio::spawn(capture(
-        child.stdout.take().context("missing stdout")?,
+        child
+            .stdout
+            .take()
+            .context("missing stdout")
+            .context(crate::errors::ReconcileRequired)?,
         stdout_tail.clone(),
     ));
     let mut err = tokio::spawn(capture(
-        child.stderr.take().context("missing stderr")?,
+        child
+            .stderr
+            .take()
+            .context("missing stderr")
+            .context(crate::errors::ReconcileRequired)?,
         stderr_tail.clone(),
     ));
     let operation = async {
@@ -503,7 +524,7 @@ async fn process_as(
                     .home
                     .join("supervisor")
                     .join(format!("process-last-{}.json", module.manifest.id)),
-                &json!({"at":crate::now(),"module":module.manifest.id,"stdout":safe_tail(&stdout),"stderr":safe_tail(&stderr)}),
+                &json!({"at":crate::now(),"module":module.manifest.id,"stdout":safe_tail(&stdout.last(65536)),"stderr":safe_tail(&stderr.last(65536))}),
                 0o600,
             )
         };
@@ -511,7 +532,7 @@ async fn process_as(
             crate::errors::log("process-diagnostics", &error)
         }
     }
-    result
+    result.map_err(|error| error.context(crate::errors::ReconcileRequired))
 }
 
 pub async fn invoke_local(config: &Config, request: &Value) -> Result<Value> {
@@ -553,14 +574,14 @@ pub async fn invoke_local(config: &Config, request: &Value) -> Result<Value> {
         Some(150),
     )
     .await?;
-    ensure!(code == 0, "module handler failed (exit {code})");
-    let value: Value = serde_json::from_str(&stdout).context("module returned invalid JSON")?;
+    ensure!(code == 0, crate::errors::ReconcileRequired);
+    let value: Value = serde_json::from_str(&stdout).context(crate::errors::ReconcileRequired)?;
     ensure!(
         value["api_version"] == 2
             && value
                 .as_object()
                 .is_some_and(|v| v.len() == 2 && v.contains_key("value")),
-        "invalid module response"
+        crate::errors::ReconcileRequired
     );
     Ok(value["value"].clone())
 }
@@ -864,6 +885,8 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
         None,
         job.timeout,
         identity.clone(),
+        8 * 1024 * 1024,
+        None,
     )
     .await;
     let (status, stdout, stderr) = match output {
@@ -913,6 +936,8 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
         Some(&input),
         Some(150),
         identity,
+        8 * 1024 * 1024,
+        None,
     )
     .await;
     let mut finish = json!({"id":run,"status":"uncertain","execution_status":status,"completion_status":"failed","notification_status":"unknown","detail":"completion response unavailable or invalid; reconcile without replay"});
@@ -984,13 +1009,24 @@ pub async fn service(config: &Config, id: &str) -> Result<i32> {
     // Persist the service identity in supervisor-only storage so an independently
     // restarted observer can record a gateway outage without requiring that gateway.
     let _ = crate::queue::connect(config)?;
+    // Lock the existing private directory across context rotation and child
+    // startup. Cleanup uses the same lock, so it cannot race a cached token.
+    let directory = config.home.join("supervisor");
+    let guard = crate::blocking(move || {
+        let guard = File::open(directory)?;
+        lock(&guard)?;
+        Ok(guard)
+    })
+    .await?;
     let cached = config
         .home
         .join("supervisor")
         .join(format!("service-{module_id}--{service_id}.json"));
-    let previous = fs::read(&cached)
-        .ok()
-        .and_then(|v| serde_json::from_slice::<Value>(&v).ok());
+    let previous = match fs::read(&cached) {
+        Ok(bytes) => Some(serde_json::from_slice::<Value>(&bytes)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
     let opened = api::rpc(
         config,
         "context.open",
@@ -998,14 +1034,30 @@ pub async fn service(config: &Config, id: &str) -> Result<i32> {
         "",
     )
     .await;
-    let context = match opened {
+    let mut context = match opened {
         Ok(mut value) => {
             value["module_hash"] = json!(module.hash);
-            crate::config::atomic_json(&cached, &value, 0o600)?;
-            if let Some(old) = &previous
-                && let Some(token) = old["token"].as_str()
-            {
-                let _ = api::rpc(config, "context.close", json!({}), token).await;
+            let mut pending = previous
+                .as_ref()
+                .and_then(|v| v["pending_retirements"].as_array())
+                .cloned()
+                .unwrap_or_default();
+            if let Some(token) = previous.as_ref().and_then(|v| v["token"].as_str()) {
+                let hash = json!(crate::digest(token));
+                if !pending.contains(&hash) {
+                    pending.push(hash);
+                }
+            }
+            value["pending_retirements"] = json!(pending);
+            if let Err(error) = crate::config::atomic_json(&cached, &value, 0o600) {
+                let _ = api::rpc(
+                    config,
+                    "context.close",
+                    json!({}),
+                    value["token"].as_str().unwrap_or(""),
+                )
+                .await;
+                return Err(error);
             }
             value
         }
@@ -1014,6 +1066,52 @@ pub async fn service(config: &Config, id: &str) -> Result<i32> {
             _ => return Err(error),
         },
     };
+    let pending = context["pending_retirements"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !pending.is_empty() {
+        let inspected = config.clone();
+        match crate::blocking(move || {
+            referenced_service_contexts(&inspected.home.join("supervisor"), Path::new("/proc"))
+        })
+        .await
+        {
+            Ok(references) => {
+                let retire: Vec<_> = pending
+                    .iter()
+                    .filter(|v| v.as_str().is_some_and(|h| !references.contains(h)))
+                    .take(1000)
+                    .cloned()
+                    .collect();
+                if !retire.is_empty() {
+                    match api::rpc(
+                        config,
+                        "context.retire_service",
+                        json!({"module":module_id,"service":service_id,"hashes":retire}),
+                        "",
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            context["pending_retirements"] = json!(
+                                pending
+                                    .into_iter()
+                                    .filter(|h| !retire.contains(h))
+                                    .collect::<Vec<_>>()
+                            );
+                            if let Err(error) = crate::config::atomic_json(&cached, &context, 0o600)
+                            {
+                                crate::errors::log("service-context-save", &error);
+                            }
+                        }
+                        Err(error) => crate::errors::log("service-context-retire", &error),
+                    }
+                }
+            }
+            Err(error) => crate::errors::log("service-context-references", &error),
+        }
+    }
     let token = context["token"].as_str().context("context missing")?;
     let env = environment(
         config,
@@ -1024,9 +1122,69 @@ pub async fn service(config: &Config, id: &str) -> Result<i32> {
         token,
     )?;
     // This context remains valid for this service across disconnected restarts.
-    // Its next successful context.open replaces and revokes it.
-    let result = process(config, module, &service.entry, &env, None, None).await;
+    // A later safe startup revokes only unreferenced predecessors.
+    let identity = execution_identity(config, module)?;
+    let result = process_as(
+        config,
+        module,
+        &service.entry,
+        &env,
+        None,
+        None,
+        identity,
+        65536,
+        Some(guard),
+    )
+    .await;
     Ok(result?.0)
+}
+
+/// Called while holding the supervisor directory lock. If any process cannot
+/// be inspected, preserve pending credentials instead of guessing ownership.
+fn referenced_service_contexts(
+    supervisor: &Path,
+    processes: &Path,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut references = std::collections::BTreeSet::new();
+    for entry in fs::read_dir(supervisor)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with("service-") && s.ends_with(".json"))
+        {
+            let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+            references.insert(crate::digest(
+                value["token"].as_str().context("invalid service cache")?,
+            ));
+        }
+    }
+    for entry in fs::read_dir(processes)? {
+        let path = entry?.path();
+        if !path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.bytes().all(|c| c.is_ascii_digit()))
+        {
+            continue;
+        }
+        let bytes = match fs::read(path.join("environ")) {
+            Ok(bytes) => bytes,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        for field in bytes.split(|b| *b == 0) {
+            if let Some(token) = field.strip_prefix(b"PYLON_CONTEXT=") {
+                references.insert(crate::digest(token));
+            }
+        }
+    }
+    Ok(references)
 }
 
 pub async fn module_exec(config: &Config, id: &str, alias: &str, args: &[String]) -> Result<i32> {
@@ -1084,4 +1242,38 @@ pub(crate) fn safe_tail(bytes: &[u8]) -> Value {
         .filter(|word| allowed.contains(word))
         .collect();
     json!({"captured_bytes":bytes.len(),"fingerprint":crate::digest(bytes),"error_types":classes,"tail":"[untrusted output redacted]"})
+}
+
+#[cfg(test)]
+mod service_context_tests {
+    use super::*;
+
+    #[test]
+    fn references_include_cached_and_running_tokens_and_fail_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let supervisor = temporary.path().join("supervisor");
+        let processes = temporary.path().join("proc");
+        fs::create_dir(&supervisor).unwrap();
+        fs::create_dir_all(processes.join("101")).unwrap();
+        fs::create_dir_all(processes.join("102")).unwrap();
+        fs::write(
+            supervisor.join("service-fixture--relay.json"),
+            json!({"token":"cached","pending_retirements":[crate::digest("old")]}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            processes.join("101/environ"),
+            b"PATH=/bin\0PYLON_CONTEXT=running\0",
+        )
+        .unwrap();
+        let references = referenced_service_contexts(&supervisor, &processes).unwrap();
+        assert_eq!(
+            references,
+            [crate::digest("cached"), crate::digest("running")]
+                .into_iter()
+                .collect()
+        );
+        fs::create_dir(processes.join("102/environ")).unwrap();
+        assert!(referenced_service_contexts(&supervisor, &processes).is_err());
+    }
 }

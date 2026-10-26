@@ -9,6 +9,7 @@ RELEASE_DIR=""
 PREVIOUS_VERSION=""
 DRAIN_TIMEOUT=300
 HEALTH_TIMEOUT=60
+KEEP_FROZEN=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --home) HOME_DIR=$2; shift 2 ;;
@@ -16,6 +17,7 @@ while [[ $# -gt 0 ]]; do
     --previous-version) PREVIOUS_VERSION=$2; shift 2 ;;
     --drain-timeout) DRAIN_TIMEOUT=$2; shift 2 ;;
     --health-timeout) HEALTH_TIMEOUT=$2; shift 2 ;;
+    --keep-frozen) KEEP_FROZEN=1; shift ;;
     *) echo "unknown argument" >&2; exit 2 ;;
   esac
 done
@@ -193,6 +195,8 @@ switch_binary "$TARGET_DIR/dist/pylon-linux-x86_64" "$REVISION"
 limited 60 systemctl start "${SERVICES[@]}" >"$WORK_DIR/command.log" 2>&1
 healthy "$VERSION"
 HEALTH=target_healthy
-limited 10 "$CURRENT" --home "$HOME_DIR" thaw >"$WORK_DIR/command.log" 2>&1
-[[ ! -e "$HOME_DIR/run/freeze" ]]
+if [[ $KEEP_FROZEN -eq 0 ]]; then
+  limited 10 "$CURRENT" --home "$HOME_DIR" thaw >"$WORK_DIR/command.log" 2>&1
+  [[ ! -e "$HOME_DIR/run/freeze" ]]
+fi
 SUCCESS=1

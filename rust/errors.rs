@@ -108,18 +108,6 @@ pub fn cli_message(error: &Error) -> &'static str {
             "task topic is not configured" => "task topic is not configured",
             "module stop preparation failed" => "module stop preparation failed",
             "module health check rejected" => "module health check rejected",
-            "freeze new triggers before state migration" => {
-                "freeze new triggers before state migration"
-            }
-            "unfinished runs require reconciliation before migration" => {
-                "unfinished runs require reconciliation before migration"
-            }
-            "migration already completed; never overwrite live state" => {
-                "migration already completed; never overwrite live state"
-            }
-            "target contains events; state merge required" => {
-                "target contains events; state merge required"
-            }
             _ => continue,
         };
         return safe;

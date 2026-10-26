@@ -601,38 +601,3 @@ def test_invalid_socket_parent_exits_with_error_without_panicking(round3_root):
         assert "result::unwrap" not in output, output
     finally:
         telegram.close()
-
-
-def test_frozen_web_route_returns_503_and_keeps_gateway_alive(round3_root):
-    telegram = _LocalTelegram()
-    home = round3_root / "home"
-    _seed_home(
-        home,
-        telegram,
-        [("bot_one", "101")],
-        [{"id": "alpha", "topic": "topic_alpha", "job_id": "job_alpha", "web": True}],
-        {"topic_alpha": "bot_one"},
-    )
-    freeze = home / "run/freeze"
-    freeze.parent.mkdir(parents=True, exist_ok=True)
-    freeze.touch()
-    settings = json.loads((home / "config/bots.json").read_text(encoding="utf-8"))
-    gateway = _GatewayProcess(home, telegram)
-
-    try:
-        gateway.start()
-        connection = http.client.HTTPConnection("127.0.0.1", settings["web_port"], timeout=3.0)
-        try:
-            connection.request("GET", "/pylon/market/frozen-fixture")
-            response = connection.getresponse()
-            body = response.read()
-        finally:
-            connection.close()
-
-        assert response.status == 503
-        assert body
-        assert gateway.proc is not None and gateway.proc.poll() is None
-        assert rpc_value(home, "health")["api_version"] == 2
-    finally:
-        gateway.stop()
-        telegram.close()
