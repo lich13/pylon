@@ -45,6 +45,7 @@ pub fn check(config: &Config, target: &str) -> Report {
             | "0.5.13"
             | "0.5.14"
             | "0.5.15"
+            | "0.5.16"
     ) {
         report.reason = Some("unsupported_target");
         return report;
@@ -87,7 +88,10 @@ fn inspect(
         let (key, raw) = row?;
         // These releases understand retained records. Still validate their shape.
         if crate::event_history::expires(&key, &raw)? > crate::now()
-            && !matches!(target, "0.5.11" | "0.5.12" | "0.5.13" | "0.5.14" | "0.5.15")
+            && !matches!(
+                target,
+                "0.5.11" | "0.5.12" | "0.5.13" | "0.5.14" | "0.5.15" | "0.5.16"
+            )
         {
             return Ok(Some("retained_events_require_newer_gateway"));
         }
