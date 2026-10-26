@@ -192,21 +192,23 @@ jobs:
       - name: Install the CI runtime offline
         run: |
           python3 - <<'PYCODE'
-          import json,os,sys,subprocess
+          import json,os,sys,subprocess,uuid
           from pathlib import Path
           sys.path.insert(0,str(Path(os.environ['PYLON_MODULES_DIR'])/'deployment'))
           from runtime import digest,extract,install
           stage=Path(os.environ['RUNNER_TEMP']); artifact=stage/'built-runtime'
           metadata=json.loads((artifact/'runtime.json').read_text())
           assert digest(artifact/'pylon-runtime.tar.gz') == metadata['sha256']
-          root=stage/'runtime'
+          # Root tests drop privileges; the runner's private temp parent is not traversable.
+          root=Path('/tmp')/('pylon-runtime-'+uuid.uuid4().hex)
           extract(artifact/'pylon-runtime.tar.gz',root)
           install(root,lambda args: subprocess.check_output([str(x) for x in args],text=True))
           with open(os.environ['GITHUB_ENV'],'a') as output:
               output.write('RUNTIME_PYTHON='+str(root/'venv/bin/python')+'\n')
               output.write('PLAYWRIGHT_BROWSERS_PATH='+str(root/'browsers')+'\n')
+          with open(os.environ['GITHUB_PATH'],'a') as output:
+              output.write(str(root/'venv/bin')+'\n')
           PYCODE
-          echo "$RUNNER_TEMP/runtime/venv/bin" >> "$GITHUB_PATH"
       - name: Test dependencies and browser libraries
         run: |
           "$RUNTIME_PYTHON" -m pip install --require-hashes -r tests/rust_contract/requirements.txt
