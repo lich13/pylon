@@ -150,10 +150,20 @@ async fn response(response: reqwest::Response) -> Result<Value> {
         reason: "Bark response invalid".into(),
         delay: 0.0,
     })?;
+    if (200..300).contains(&status)
+        && (!value.is_object()
+            || value["code"].is_null()
+            || !(value["code"].is_i64() || value["code"].is_string()))
+    {
+        return Err(Failure {
+            status: "uncertain",
+            reason: "Bark response invalid".into(),
+            delay: 0.0,
+        }
+        .into());
+    }
     if !(200..300).contains(&status)
-        || (!value["code"].is_null()
-            && !matches!(value["code"].as_i64(), Some(0 | 200))
-            && value["code"] != "200")
+        || (!matches!(value["code"].as_i64(), Some(0 | 200)) && value["code"] != "200")
     {
         return Err(Failure {
             status: if status >= 500 { "uncertain" } else { "failed" },
@@ -367,6 +377,12 @@ mod tests {
     async fn preserves_delivery_response_classification_without_network() {
         for (status, body, expected) in [
             (200, r#"{"code":200}"#, "delivered"),
+            (200, r#"{"code":0}"#, "delivered"),
+            (200, r#"{"code":"200"}"#, "delivered"),
+            (200, r#"{}"#, "uncertain"),
+            (200, r#"null"#, "uncertain"),
+            (200, r#"[]"#, "uncertain"),
+            (200, r#"{"code":true}"#, "uncertain"),
             (429, "", "pending"),
             (500, r#"{}"#, "uncertain"),
             (400, r#"{}"#, "failed"),

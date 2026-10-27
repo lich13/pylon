@@ -365,7 +365,7 @@ def test_buffer_count_includes_json_temporary_and_corrupt_files(round4_root):
 
 @pytest.mark.parametrize(
     "target",
-    ["0.5.2", "0.5.17", "v0.5.6", "0.5.6.0"],
+    ["0.5.2", "0.5.18", "v0.5.6", "0.5.6.0"],
     ids=["older", "newer", "prefix", "extra-component"],
 )
 def test_unknown_target_returns_fixed_json_without_creating_home(round4_root, target):

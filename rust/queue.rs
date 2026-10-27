@@ -272,11 +272,23 @@ fn summary_inner(config: &Config, force: bool, metrics: Option<Value>) -> Result
     // The outer rowid membership keeps the previous scan order for timestamp ties.
     let mut q=db.prepare("SELECT id,job_id,module,state,created_at,updated_at,execution_status,completion_status,owner FROM requests WHERE rowid IN (SELECT rowid FROM requests INDEXED BY requests_open_summary WHERE state!='completed' UNION ALL SELECT rowid FROM requests INDEXED BY requests_completed_updated WHERE state='completed' AND updated_at>?) ORDER BY +created_at DESC,rowid ASC LIMIT 200")?;
     let rows=q.query_map([now()-86400.0], |r| Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"module":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"created_at":r.get::<_,f64>(4)?,"updated_at":r.get::<_,f64>(5)?,"execution_status":r.get::<_,Option<String>>(6)?,"completion_status":r.get::<_,Option<String>>(7)?,"owner":r.get::<_,Option<u32>>(8)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
-    let (queued, oldest): (u64, Option<f64>) = db.query_row(
-        "SELECT count(*),min(created_at) FROM requests WHERE state='queued'",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let mut groups = db.prepare("SELECT job_id,module,count(*),min(created_at) FROM requests WHERE state='queued' GROUP BY job_id,module ORDER BY job_id,module")?;
+    let queued_jobs = groups
+        .query_map([], |r| {
+            Ok(json!({
+                "job_id":r.get::<_,String>(0)?, "module":r.get::<_,String>(1)?,
+                "count":r.get::<_,u64>(2)?, "oldest_queued_at":r.get::<_,f64>(3)?
+            }))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let queued: u64 = queued_jobs
+        .iter()
+        .map(|row| row["count"].as_u64().unwrap())
+        .sum();
+    let oldest = queued_jobs
+        .iter()
+        .filter_map(|row| row["oldest_queued_at"].as_f64())
+        .reduce(f64::min);
     let totals = json!({"queued_count":queued,"oldest_queued_at":oldest});
     let refresh_storage = metrics.is_some() || previous["metrics"]["storage"].is_null();
     let mut metrics = metrics.unwrap_or_else(|| previous["metrics"].clone());
@@ -298,13 +310,14 @@ fn summary_inner(config: &Config, force: bool, metrics: Option<Value>) -> Result
         && previous["requests"] == json!(rows)
         && previous["metrics"] == metrics
         && previous["totals"] == totals
+        && previous["queued_jobs"] == json!(queued_jobs)
     {
         return Ok(());
     }
     // This contains no payload, context token, credential, path or user data.
     atomic_json(
         &config.home.join("run/task-summary.json"),
-        &json!({"updated_at":now(),"requests":rows,"metrics":metrics,"totals":totals}),
+        &json!({"updated_at":now(),"requests":rows,"metrics":metrics,"totals":totals,"queued_jobs":queued_jobs}),
         0o644,
     )
 }

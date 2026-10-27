@@ -538,3 +538,48 @@ fn latest_run_query_keeps_all_max_started_ties_and_nearby_job_names() {
     assert_eq!(baseline, expected);
     assert_eq!(optimized, expected);
 }
+
+#[test]
+fn full_queue_groups_survive_the_recent_detail_window_and_refresh_independently() {
+    let temporary = tempfile::tempdir().unwrap();
+    let config = Config::new(temporary.path().to_owned());
+    let db = queue::connect(&config).unwrap();
+    let now = pylon::now();
+    for n in 0..205 {
+        db.execute("INSERT INTO requests(id,job_id,module,topic,model,state,created_at,updated_at) VALUES(?,'recent','fixture','fixture',0,'completed',?,?)", params![format!("recent-{n}"),now,now]).unwrap();
+    }
+    for (id, job, module, created) in [
+        ("a", "older", "content", 100.0),
+        ("b", "older2", "content", 200.0),
+        ("c", "other", "gmail", 300.0),
+    ] {
+        db.execute("INSERT INTO requests(id,job_id,module,topic,model,state,created_at,updated_at) VALUES(?,?,?,'fixture',0,'queued',?,?)",params![id,job,module,created,created]).unwrap();
+    }
+    queue::summary_flush(&config).unwrap();
+    let first = queue::public(&config);
+    assert_eq!(first["requests"].as_array().unwrap().len(), 200);
+    assert!(
+        first["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["state"] == "completed")
+    );
+    assert_eq!(first["totals"]["queued_count"], 3);
+    assert_eq!(
+        first["queued_jobs"],
+        json!([
+            {"job_id":"older","module":"content","count":1,"oldest_queued_at":100.0},
+        {"job_id":"older2","module":"content","count":1,"oldest_queued_at":200.0},
+            {"job_id":"other","module":"gmail","count":1,"oldest_queued_at":300.0}
+        ])
+    );
+    // Same detail window and same total, but group membership changed.
+    db.execute("UPDATE requests SET module='gmail' WHERE id='b'", [])
+        .unwrap();
+    queue::summary_flush(&config).unwrap();
+    let second = queue::public(&config);
+    assert_eq!(second["requests"], first["requests"]);
+    assert_eq!(second["totals"], first["totals"]);
+    assert_ne!(second["queued_jobs"], first["queued_jobs"]);
+}
