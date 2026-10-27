@@ -39,7 +39,7 @@ def test_handler_side_effect_then_closed_stdin_cannot_be_automatically_retried(r
     manifest.update(hooks=["fixture"], capabilities=["hook:fixture"])
     manifest_path.write_text(json.dumps(manifest))
     (case.home / "modules/alpha/handler.sh").write_text(
-        '#!/bin/bash\nexec 0<&-\nprintf "effect\\n" >> "$PYLON_HOME/data/effects"\n'
+        '#!/bin/bash\nprintf "effect\\n" >> "$PYLON_HOME/data/effects"\nexec 0<&-\n'
         'sleep 0.1\nprintf \'{"api_version":2,"value":null}\\n\'\n'
     )
     case.start_executor()
