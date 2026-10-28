@@ -3,19 +3,39 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tarfile
 
 
 def select_runtime(candidates):
-    for version in ('3.14.10', '3.12.16'):
-        matches = [path.parent for path in candidates.glob('*/runtime.json')
-                   if json.loads(path.read_text())['python'] == version]
-        if len(matches) > 1:
+    available = {}
+    for path in candidates.glob('*/runtime.json'):
+        version = json.loads(path.read_text())['python']
+        if version in available:
             raise ValueError('ambiguous runtime candidate')
-        if matches:
-            return matches[0]
+        available[version] = path.parent
+    for version in ('3.14.10', '3.12.16'):
+        if version in available:
+            return available[version]
     raise ValueError('no compatible runtime')
+
+
+def download_runtime(candidate, destination):
+    verified = json.loads((candidate / 'runtime.json').read_text())
+    subprocess.run([
+        'gh', 'run', 'download', os.environ['GITHUB_RUN_ID'],
+        '--repo', os.environ['GITHUB_REPOSITORY'],
+        '--name', f"built-runtime-{os.environ['JOB']}-{verified['python']}",
+        '--dir', str(destination),
+    ], check=True)
+    downloaded = json.loads((destination / 'runtime.json').read_text())
+    if downloaded != verified:
+        raise ValueError('runtime compatibility metadata mismatch')
+    with (destination / 'pylon-runtime.tar.gz').open('rb') as archive:
+        if hashlib.file_digest(archive, 'sha256').hexdigest() != verified['sha256']:
+            raise ValueError('runtime checksum mismatch')
+    return destination
 
 
 def main():
@@ -43,9 +63,9 @@ def main():
             target.chmod(0o755 if member.mode & 0o111 else 0o644)
     sys.path.insert(0, str(source / "sdk/src"))
     from pylon_sdk.ci import package
-    # Only successful compatibility jobs upload candidates. Prefer the GIL 3.14 build.
+    # Successful compatibility jobs upload metadata; download only the chosen archive.
     candidates = Path(os.environ['RUNTIMES_DIR'])
-    selected = select_runtime(candidates)
+    selected = download_runtime(select_runtime(candidates), temporary / 'built-runtime')
     metadata = package(source, temporary / "external-dist", os.environ["CORE_SHA"], checksum, selected)
     print('Selected Python ' + metadata['runtime']['python'])
 

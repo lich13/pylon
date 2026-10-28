@@ -184,7 +184,11 @@ sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.7
 
 所有旧目标还必须没有有效的事件占位记录；存在时返回 `retained_events_require_newer_gateway`。占位状态损坏或有效期不明同样拒绝，命中计数为零不能绕过。空缓冲但 counter 损坏、权限异常或无法读取时仍拒绝通过。先冻结新触发并等在途任务、命令和投递结束，再检查；停止核心服务后、替换旧二进制前再检查一次。此命令是部署前置门槛，不能阻止 root 绕过检查替换文件。缓冲无法清空或已有有效占位时保留新版和冻结状态，优先前向修复；不删除记录或恢复旧数据库快照。
 
-版本以运行进程的二进制哈希、版本目录 `REVISION` 和诊断版本交叉核对；切换后同步根目录 `REVISION`。仅分支提交触发网关 CI，版本 tag 不重复构建。发布成品须来自对应提交的成功 CI，并核对 `REVISION` 和 `SHA256SUMS`；校验和中的路径带 `dist/` 前缀，下载至临时根下的 `dist/` 后，从临时根运行 `sha256sum -c dist/SHA256SUMS`。CI artifact 保留 14 天，tag 本身不长期保存二进制。
+版本以运行进程的二进制哈希、版本目录 `REVISION` 和诊断版本交叉核对；切换后同步根目录 `REVISION`。仅分支提交触发网关 CI，版本 tag 不重复构建。发布成品须来自对应提交的成功 CI，并核对 `REVISION` 和 `SHA256SUMS`；校验和中的路径带 `dist/` 前缀，下载至临时根下的 `dist/` 后，从临时根运行 `sha256sum -c dist/SHA256SUMS`。网关 CI artifact 保留 14 天，供同一提交的模块检查复用；正式 Release 资产长期保留，tag 本身不保存二进制。
+
+模块兼容检查只上传通过检查的 `runtime.json`，打包优先选择 Python 3.14.10，否则使用通过检查的 3.12.16；只下载选中的完整 runtime，并核对元数据及哈希。输入、runtime 构建、兼容检查和打包全部结束后，cleanup 分页列出本次运行的产物，只回收本任务的 `module-input`、`built-runtime` 和 `compatible-runtime`。这些中间产物的保留期为 1 天，作为取消或清理失败时的兜底；清理失败单独报告，不自动重跑构建。
+
+未发布的 `pylon-external` 成品保留 30 天。发布入口确认 Release 已正式发布、提交及七个资产完整后，删除该次发布使用的 `pylon-external` CI 副本；失败或不完整时保留副本，发布后的清理失败单独报告且不改变发布成功状态。构建期间及未发布成品积累时仍可能超过免费存储额度。
 
 
 

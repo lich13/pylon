@@ -125,7 +125,7 @@ jobs:
         with:
           name: built-runtime-${{ inputs.job }}-${{ matrix.python }}
           path: ${{ runner.temp }}/runtime-build/dist
-          retention-days: 2
+          retention-days: 1
           if-no-files-found: error
   checks:
     needs: [input, build-runtime]
@@ -249,8 +249,8 @@ jobs:
         if: steps.compatibility.outcome == 'success' && matrix.node == '22.23.4'
         with:
           name: compatible-runtime-${{ inputs.job }}-${{ matrix.python }}
-          path: ${{ runner.temp }}/built-runtime
-          retention-days: 2
+          path: ${{ runner.temp }}/built-runtime/runtime.json
+          retention-days: 1
           if-no-files-found: error
       - name: Record compatibility result
         if: always()
@@ -271,6 +271,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -289,6 +290,8 @@ jobs:
           path: ${{ runner.temp }}/runtimes
       - name: Package verified SDK and modules
         env:
+          GH_TOKEN: ${{ github.token }}
+          JOB: ${{ inputs.job }}
           SOURCE_SHA: ${{ inputs.sha256 }}
           CORE_SHA: ${{ inputs.core_sha }}
           RUNTIMES_DIR: ${{ runner.temp }}/runtimes
@@ -301,15 +304,29 @@ jobs:
           if-no-files-found: error
   cleanup:
     if: always()
-    needs: [input, checks, package]
+    needs: [input, build-runtime, checks, package]
     runs-on: ubuntu-24.04
     permissions:
       actions: write
     steps:
-      - name: Remove workflow source artifact
+      - name: Remove workflow intermediate artifacts
         env:
           GH_TOKEN: ${{ github.token }}
+          JOB: ${{ inputs.job }}
         run: |
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.artifacts[] | select(.name | startswith("module-input-")) | .id' | while read -r id; do
-            gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
-          done
+          python3 - <<'PY'
+          import json,os,re,subprocess
+          job=os.environ['JOB']
+          if not re.fullmatch('[a-f0-9]{24}',job):
+              raise ValueError('invalid module job identifier')
+          repo=os.environ['GITHUB_REPOSITORY']
+          run=os.environ['GITHUB_RUN_ID']
+          # Collect every page before deletion, so pagination cannot skip shifted items.
+          pages=json.loads(subprocess.check_output(['gh','api','--paginate','--slurp',f'repos/{repo}/actions/runs/{run}/artifacts?per_page=100'],text=True))
+          artifacts=[item for page in pages for item in page['artifacts']
+                     if item['name']=='module-input-'+job
+                     or item['name'].startswith(('built-runtime-'+job+'-','compatible-runtime-'+job+'-'))]
+          for item in artifacts:
+              subprocess.run(['gh','api','--method','DELETE',f"repos/{repo}/actions/artifacts/{item['id']}"],check=True)
+          print(f'Removed {len(artifacts)} intermediate artifacts')
+          PY
