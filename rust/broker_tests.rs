@@ -79,3 +79,37 @@ async fn excessive_output_is_uncertain_and_stops_the_helper() {
     assert!(!crate::errors::retryable(&error));
     assert_stopped(&temp.path().join("pids")).await;
 }
+
+#[test]
+fn job_bound_grants_may_omit_modules() {
+    let check = |grant: Value, module: &str, origin: &str| {
+        authorize(&grant, &json!({"module": module, "origin": origin})).map_err(|e| e.to_string())
+    };
+    let module_denied = Err("capability not granted to module".to_string());
+    let origin_denied = Err("capability not granted to this execution origin".to_string());
+    let job_only = json!({"origins": ["job:reconcile"]});
+    for module in ["operations", "content"] {
+        assert_eq!(check(job_only.clone(), module, "job:reconcile"), Ok(()));
+        assert_eq!(check(job_only.clone(), module, "job:other"), origin_denied);
+        assert_eq!(check(job_only.clone(), module, "command"), origin_denied);
+    }
+    for grant in [
+        json!({"origins": ["job:reconcile", "command"]}),
+        json!({"origins": ["service:reconcile"]}),
+        json!({"origins": ["job:"]}),
+        json!({"origins": []}),
+        json!({}),
+        json!({"modules": null, "origins": ["job:reconcile"]}),
+        json!({"modules": [], "origins": ["job:reconcile"]}),
+        json!({"modules": ["operations"], "origins": ["job:reconcile"]}),
+    ] {
+        assert_eq!(check(grant, "content", "job:reconcile"), module_denied);
+    }
+    let scoped = json!({"modules": ["operations"], "origins": ["job:reconcile", "command"]});
+    assert_eq!(check(scoped.clone(), "operations", "command"), Ok(()));
+    assert_eq!(
+        check(scoped.clone(), "operations", "callback"),
+        origin_denied
+    );
+    assert_eq!(check(scoped, "content", "command"), module_denied);
+}

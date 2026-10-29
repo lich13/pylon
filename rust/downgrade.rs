@@ -47,6 +47,7 @@ pub fn check(config: &Config, target: &str) -> Report {
             | "0.5.15"
             | "0.5.16"
             | "0.5.17"
+            | "0.5.19"
     ) {
         report.reason = Some("unsupported_target");
         return report;
@@ -91,7 +92,14 @@ fn inspect(
         if crate::event_history::expires(&key, &raw)? > crate::now()
             && !matches!(
                 target,
-                "0.5.11" | "0.5.12" | "0.5.13" | "0.5.14" | "0.5.15" | "0.5.16" | "0.5.17"
+                "0.5.11"
+                    | "0.5.12"
+                    | "0.5.13"
+                    | "0.5.14"
+                    | "0.5.15"
+                    | "0.5.16"
+                    | "0.5.17"
+                    | "0.5.19"
             )
         {
             return Ok(Some("retained_events_require_newer_gateway"));

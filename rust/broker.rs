@@ -42,6 +42,34 @@ async fn dispatch(config: &Config, store: &Store, request: &Value) -> Result<Val
     run_helper(&mut command, input, timeout).await
 }
 
+// Job ids are unique across modules, so a grant bound only to jobs may omit `modules`.
+fn authorize(grant: &Value, ctx: &Value) -> Result<()> {
+    let job_bound = grant.get("modules").is_none()
+        && grant["origins"].as_array().is_some_and(|origins| {
+            !origins.is_empty()
+                && origins.iter().all(|origin| {
+                    origin
+                        .as_str()
+                        .and_then(|origin| origin.strip_prefix("job:"))
+                        .is_some_and(crate::identifier)
+                })
+        });
+    ensure!(
+        job_bound
+            || grant["modules"]
+                .as_array()
+                .is_some_and(|a| a.contains(&ctx["module"])),
+        "capability not granted to module"
+    );
+    ensure!(
+        grant["origins"]
+            .as_array()
+            .is_some_and(|a| a.contains(&ctx["origin"])),
+        "capability not granted to this execution origin"
+    );
+    Ok(())
+}
+
 fn prepare(
     config: &Config,
     store: &Store,
@@ -63,18 +91,7 @@ fn prepare(
             .is_some_and(|a| a.iter().any(|v| v == name)),
         "capability not declared"
     );
-    ensure!(
-        grant["modules"]
-            .as_array()
-            .is_some_and(|a| a.contains(&ctx["module"])),
-        "capability not granted to module"
-    );
-    ensure!(
-        grant["origins"]
-            .as_array()
-            .is_some_and(|a| a.contains(&ctx["origin"])),
-        "capability not granted to this execution origin"
-    );
+    authorize(grant, &ctx)?;
     let args = grant["argv"]
         .as_array()
         .context("helper entry missing")?

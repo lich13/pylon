@@ -664,6 +664,70 @@ def test_root_broker_uses_trusted_helper_and_module_uid_cannot_write_protected_f
     assert secret.read_bytes() == secret_before
 
 
+def test_root_broker_job_bound_grant_needs_no_module_list(root_broker_workdir, telegram):
+    home = root_broker_workdir / "home"
+    helper = home / "gateway/fixture-job-helper.sh"
+    proof = home / "gateway/fixture-job-helper-ran"
+    seed_home(
+        home,
+        telegram,
+        [("bot_one", "101")],
+        [
+            {"id": "alpha", "topic": "topic_alpha", "job_id": "job_alpha"},
+            {"id": "beta", "topic": "topic_alpha", "job_id": "job_beta"},
+        ],
+        {"topic_alpha": "bot_one"},
+    )
+    helper.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "cat >/dev/null\n"
+        f"printf 'ran\\n' >> {shlex.quote(str(proof))}\n"
+        "printf '{\"ran\":true}\\n'\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    proof.write_bytes(b"")
+    for module in ("alpha", "beta"):
+        manifest_path = home / f"modules/{module}/module.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["capabilities"] = ["fixture.write"]
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    capability_path = home / "config/capabilities.json"
+
+    def install(**grant):
+        grant |= {"argv": ["/bin/sh", str(helper)], "trusted_paths": [str(helper)], "timeout": 5}
+        capability_path.write_text(json.dumps({"fixture.write": grant}), encoding="utf-8")
+        capability_path.chmod(0o600)
+
+    def invoke(context):
+        return rpc(home, "capability.invoke", {"capability": "fixture.write", "params": {}}, context)
+
+    with OfflineGateway(home, telegram):
+        (home / "run").chmod(0o755)
+        with _running_root_broker(home):
+            alpha = open_context(home, "alpha", "job_alpha")["token"]
+            beta = open_context(home, "beta", "job_beta")["token"]
+
+            # The unique job id pins the grant to one job, whichever module owns it.
+            install(origins=["job:job_beta"])
+            assert invoke(beta)["value"] == {"ran": True}
+            assert invoke(alpha)["ok"] is False
+            install(origins=["job:job_alpha"])
+            assert invoke(alpha)["value"] == {"ran": True}
+            assert invoke(beta)["ok"] is False
+
+            # Any non-job origin still requires an explicit module list.
+            install(origins=["job:job_beta", "command"])
+            assert invoke(beta)["ok"] is False
+            install(modules=["alpha"], origins=["job:job_beta"])
+            assert invoke(beta)["ok"] is False
+            install(modules=["beta"], origins=["job:job_beta", "command"])
+            assert invoke(beta)["value"] == {"ran": True}
+
+    assert proof.read_text(encoding="utf-8").splitlines() == ["ran"] * 3
+
+
 @pytest.mark.parametrize(
     "behavior",
     ["invalid_json", "nonzero_exit"],
