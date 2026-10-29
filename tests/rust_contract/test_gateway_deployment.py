@@ -146,6 +146,9 @@ def test_success_requires_new_version_and_thaws(deployment):
     assert (home / "REVISION").read_text().strip() == NEW
     assert (home / "bin/pylon").resolve() != old
     assert old.exists()
+    # The previous binary lives outside releases/, so release pruning is skipped.
+    assert summary["prune"]["releases"]["status"] == "skipped_unresolved"
+    assert summary["prune"]["backups"]["status"] == "ok"
 
 
 def test_coordinated_upgrade_keeps_frozen_until_external_health_passes(deployment):
@@ -164,6 +167,7 @@ def test_failed_cutover_restores_previous_binary_and_keeps_frozen(deployment, fa
     assert result.returncode != 0
     assert summary["phase"] == "failed"
     assert summary["rollback"] == "restored", (result.stderr, summary)
+    assert summary["prune"] == {"status": "not_run"}
     assert summary["active_version"] == "0.5.14"
     assert summary["health"] == "previous_healthy"
     assert summary["freeze"]

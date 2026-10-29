@@ -2,6 +2,12 @@
 
 Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
+## v0.5.23 网关清理
+
+- 发布目录：`scripts/deploy-gateway.sh` 在新版本健康检查通过后调用同目录的 `scripts/gateway-prune.py`，`releases/` 下只保留当前版本与上一版本（`--previous-version` 回滚目标）的网关目录（`v<版本>-<提交>`、`stability-*`、`hardening-*`）。`external-*`、`privileged-*` 等非网关目录、符号链接，以及 `/srv/pylon` 顶层或 `bin/` 链接、systemd 单元仍引用的目录一律保留；无法确认上一版本所在目录时跳过发布目录清理。部署结果 JSON 的 `prune` 字段列出删除项，清理失败不影响已成功的部署。部署时须把该脚本与 `deploy-gateway.sh` 一并复制到发布目录；`--dry-run` 只列出将删除的内容。
+- 备份：同一步骤清理 `backups/gateway-*`，按目录名时间戳（无则按修改时间）保留 14 天，且至少保留最新一份；其他备份子目录不动。
+- 数据库：`requests_days` 默认改为 30 天（`runs_days` 已为 30 天）；行保留清理改为启动 10 分钟后首轮、此后每天一轮，每轮按 500 行事务分批完成整表扫描，结束后强制 WAL checkpoint。仅删除终态记录（runs 含历史 `no_change`），运行中、未完成或不确定的 run／request 保留，不导出。锁回收仍每小时一轮。
+
 ## v0.5.22 下线 /help
 
 Telegram 命令菜单不再追加 `help`，菜单变化后由既有同步自动重新推送。网关只保留 `/start`（打开对话时 Telegram 自动发送）：先执行模块 start 钩子，无返回时显示 `/start <命令>` 详情或当前菜单列表。`/help` 按未知命令处理；停用按钮、未知入口和普通文本提示改为引导用户从命令菜单选择。`help` 与 `start` 仍为保留命令名，模块不可占用。
@@ -272,7 +278,7 @@ sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.8
 网关与 executor 各有一个串行维护任务：启动 10 分钟后首轮，此后每小时运行。`config/bots.json` 的可选 `retention` 配置默认如下，`enabled: false` 同时停止保留清理和请求锁回收；非法或零保留值拒绝加载。冻结或退出后不开始新批次，当前事务提交或回滚；数据库忙则结束本轮。
 
 ```json
-{"retention":{"enabled":true,"updates_per_bot":5000,"runs_days":30,"events_days":7,"requests_days":14,"placeholders_days":90,"expired_days":1}}
+{"retention":{"enabled":true,"updates_per_bot":5000,"runs_days":30,"events_days":7,"requests_days":30,"placeholders_days":90,"expired_days":1}}
 ```
 
 | 对象 | 默认清理条件及保护边界 |
@@ -281,7 +287,7 @@ sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.8
 | runs | 启动和可信完成时间均满 30 天的 ok／failed；保留每 job 最新启动时间的所有并列记录，关联 run_events、run-result 同事务删除 |
 | 孤儿 run-result | 每天按键分批扫描，确认 run 不存在才删除 |
 | events | 创建和更新时间均满 7 天的 delivered／failed／suppressed；保留 uncertain-summary、run_events 引用、部分回执、异常或未知结果 |
-| requests／triggers | 创建和完成更新均满 14 天，结果已补交且没有恢复输入；有不确定或缺少可信最终结果证据的记录保留，triggers 随请求同事务删除 |
+| requests／triggers | 创建和完成更新均满 30 天（v0.5.23 前为 14 天），结果已补交且没有恢复输入；有不确定或缺少可信最终结果证据的记录保留，triggers 随请求同事务删除 |
 | contexts | 有明确到期时间且到期超过 1 天；`expires_at=0` 的长期上下文保留 |
 
 每批扫描至多 500 个主记录，每轮每类至多删除 20,000 个、扫描 50,000 个候选；提交后让出 50 ms。游标跨轮保留，已保护的前缀不会阻塞后面的记录。单批关联记录上限为 5,000，过大的关联组保留并报短码。完成缓冲非空时，events／updates 清理暂缓，保留后台补交仍需核对的正文。进程重启从头扫描，不改变资格或重复执行任务。

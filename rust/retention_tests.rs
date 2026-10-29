@@ -56,6 +56,8 @@ fn receipt() -> Value {
 fn policy_defaults_and_invalid_values() {
     let policy: Policy = serde_json::from_value(json!({})).unwrap();
     assert_eq!(policy.events_days, 7);
+    assert_eq!(policy.runs_days, 30);
+    assert_eq!(policy.requests_days, 30);
     assert_eq!(policy.placeholders_days, 90);
     assert!(policy.enabled);
     for raw in [
@@ -426,6 +428,9 @@ fn runs_keep_latest_ties_uncertain_and_incomplete_and_remove_children_atomically
         ("uncertain", "a", 1.0, Some(2.0), "uncertain"),
         ("incomplete", "a", 1.0, None, "ok"),
         ("sole", "b", 1.0, Some(2.0), "ok"),
+        ("legacy", "c", 1.0, Some(2.0), "no_change"),
+        ("legacy-latest", "c", 3.0, Some(4.0), "no_change"),
+        ("legacy-running", "d", 1.0, None, "no_change"),
     ] {
         db.execute(
             "INSERT INTO runs VALUES(?,?,?,?,?,NULL)",
@@ -447,7 +452,7 @@ fn runs_keep_latest_ties_uncertain_and_incomplete_and_remove_children_atomically
         BATCH,
     )
     .unwrap();
-    assert_eq!(cleaned.deleted["runs"], 1);
+    assert_eq!(cleaned.deleted["runs"], 2, "old ok and legacy no_change");
     assert_eq!(cleaned.deleted["run_events"], 1);
     assert!(store.get("run-result:old").unwrap().is_null());
     clean(&store, Kind::Orphans);
@@ -456,7 +461,13 @@ fn runs_keep_latest_ties_uncertain_and_incomplete_and_remove_children_atomically
     assert_eq!(
         db.query_row("SELECT count(*) FROM runs", [], |r| r.get::<_, u64>(0))
             .unwrap(),
-        6
+        8
+    );
+    assert!(
+        db.query_row("SELECT count(*) FROM runs WHERE id='legacy'", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap()
+            == 0
     );
 }
 
@@ -631,7 +642,7 @@ fn bounded_candidate_cursor_advances_past_protected_prefix_and_busy_rolls_back()
 }
 
 #[tokio::test]
-async fn round_deletion_budget_caps_partial_batches_and_keeps_progress() {
+async fn daily_round_finishes_a_backlog_in_bounded_batches() {
     let (temp, store) = store();
     let config = Config::new(temp.path().to_owned());
     let mut db = store.connect().unwrap();
@@ -657,18 +668,15 @@ async fn round_deletion_budget_caps_partial_batches_and_keeps_progress() {
         &mut receiver,
     )
     .await;
-    assert_eq!(metrics.snapshot()["deleted"]["contexts"], 20_000);
-    assert!(cursors[&Kind::Contexts].row > 20_000);
-    sweep(
-        &config,
-        Some(&store),
-        &Policy::default(),
-        &[Kind::Contexts],
-        &mut cursors,
-        &metrics,
-        &mut receiver,
-    )
-    .await;
+    let report = metrics.snapshot();
+    assert_eq!(report["status"], "completed");
+    assert_eq!(report["deleted"]["contexts"], 20_462);
+    assert!(report["batches"].as_u64().unwrap() >= 41);
+    assert_eq!(
+        cursors[&Kind::Contexts].row,
+        0,
+        "a full pass resets the cursor"
+    );
     assert_eq!(
         db.query_row(
             "SELECT count(*) FROM contexts WHERE expires_at>0",
@@ -1053,4 +1061,27 @@ async fn disabling_retention_does_not_disable_wal_maintenance() {
     worker.await.unwrap();
     assert!(executor_storage(&config)["retention"].is_null());
     assert!(executor_storage(&config)["locks"].is_null());
+}
+
+#[tokio::test(start_paused = true)]
+async fn row_retention_runs_daily_and_forces_a_checkpoint_after_each_round() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = Config::new(temp.path().to_owned());
+    std::fs::create_dir(config.home.join("run")).unwrap();
+    let mut schedule = Maintenance::new(&config);
+    assert!(!schedule.retention_due());
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert!(schedule.retention_due() && schedule.sweep_due());
+    schedule.checkpoint_pending = false;
+    schedule.retained();
+    schedule.swept();
+    assert!(
+        schedule.checkpoint_pending,
+        "deleted pages are checkpointed"
+    );
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert!(schedule.sweep_due(), "lock reaping stays hourly");
+    assert!(!schedule.retention_due(), "row retention is daily");
+    tokio::time::advance(Duration::from_secs(86_400 - 3600)).await;
+    assert!(schedule.retention_due());
 }

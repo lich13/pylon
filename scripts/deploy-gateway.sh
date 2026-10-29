@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Upgrade a CI-built gateway. A failed cutover restores the previous binary,
 # retains live databases and leaves admission frozen. Never retry a cutover here.
+# After a healthy cutover, gateway-prune.py (next to this script) keeps only the
+# new and previous gateway releases and 14 days of gateway-* backups.
 set -euo pipefail
 umask 077
 
@@ -24,6 +26,7 @@ done
 [[ -n "$RELEASE_DIR" && $(id -u) -eq 0 ]] || { echo "root and --release-dir required" >&2; exit 2; }
 [[ "$DRAIN_TIMEOUT" =~ ^[1-9][0-9]*$ && "$HEALTH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || exit 2
 RELEASE_DIR=$(cd "$RELEASE_DIR" && pwd)
+PRUNE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gateway-prune.py"
 BIN="$RELEASE_DIR/pylon-linux-x86_64"
 CURRENT="$HOME_DIR/bin/pylon"
 [[ -x "$BIN" && -x "$CURRENT" && -f "$HOME_DIR/REVISION" ]] || { echo "release or current installation incomplete" >&2; exit 2; }
@@ -54,6 +57,7 @@ SUCCESS=0
 HEALTH=unverified
 STOP_ATTEMPTED=0
 ROLLBACK=not_needed
+PRUNE='{"status":"not_run"}'
 SERVICES=(pylon-gateway.service pylon-executor.service pylon-broker.service)
 
 # Bound every probe by the remaining deadline, including a hung diagnose RPC.
@@ -147,14 +151,19 @@ cleanup() {
     fi
   fi
   [[ -e "$HOME_DIR/run/freeze" ]] && frozen=true
-  python3 - "$SUCCESS" "$VERSION" "$REVISION" "$ROLLBACK" "$frozen" "$code" "$HEALTH" "$OLD_VERSION" "$OLD_REVISION" <<'PY'
+  python3 - "$SUCCESS" "$VERSION" "$REVISION" "$ROLLBACK" "$frozen" "$code" "$HEALTH" "$OLD_VERSION" "$OLD_REVISION" "$PRUNE" <<'PY'
 import json, sys
-success, version, revision, rollback, frozen, code, health, old_version, old_revision = sys.argv[1:]
+success, version, revision, rollback, frozen, code, health, old_version, old_revision, prune = sys.argv[1:]
+try:
+    prune = json.loads(prune)
+except ValueError:
+    prune = {"status": "failed"}
 active_version = version if success == "1" else old_version if rollback == "restored" else None
 active_revision = revision if success == "1" else old_revision if rollback == "restored" else None
 print(json.dumps({"phase": "complete" if success == "1" else "failed", "version": version,
                   "revision": revision, "active_version": active_version, "active_revision": active_revision,
-                  "health": health, "rollback": rollback, "freeze": frozen == "true", "exit": int(code)}))
+                  "health": health, "rollback": rollback, "freeze": frozen == "true", "exit": int(code),
+                  "prune": prune}))
 PY
   rm -f "$WORK_DIR/diagnose.json" "$WORK_DIR/command.log"
   rmdir "$WORK_DIR"
@@ -200,3 +209,13 @@ if [[ $KEEP_FROZEN -eq 0 ]]; then
   [[ ! -e "$HOME_DIR/run/freeze" ]]
 fi
 SUCCESS=1
+
+# Retention for gateway-owned releases and backups. Never fails a healthy deploy.
+if [[ -f "$PRUNE_SCRIPT" ]]; then
+  PRUNE=$(limited 300 python3 "$PRUNE_SCRIPT" --home "$HOME_DIR" \
+    --keep "$TARGET_DIR/dist/pylon-linux-x86_64" --keep "$PREVIOUS_BIN" 2>"$WORK_DIR/command.log") ||
+    PRUNE=${PRUNE:-'{"status":"failed"}'}
+  [[ -n "$PRUNE" ]] || PRUNE='{"status":"failed"}'
+else
+  PRUNE='{"status":"script_missing"}'
+fi

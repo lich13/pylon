@@ -33,7 +33,7 @@ impl Default for Policy {
             updates_per_bot: 5000,
             runs_days: 30,
             events_days: 7,
-            requests_days: 14,
+            requests_days: 30,
             placeholders_days: 90,
             expired_days: 1,
         }
@@ -225,6 +225,11 @@ impl Batch {
 }
 const BATCH: usize = 500;
 const ASSOCIATIONS: usize = 5000;
+// A daily sweep covers a full table pass in 500-row transactions; these only
+// bound a pathological backlog, which the next day's sweep continues.
+const SWEEP_SCANNED: usize = 2_000_000;
+const SWEEP_DELETED: usize = 200_000;
+const SWEEP_INTERVAL: Duration = Duration::from_secs(86_400);
 
 #[derive(Debug)]
 struct CompletionPending;
@@ -354,7 +359,7 @@ pub(crate) fn batch(
                 }
                 Kind::Runs => {
                     let cutoff = now - f64::from(policy.runs_days) * 86400.0;
-                    let id:Option<String> = tx.query_row("SELECT id FROM runs r WHERE rowid=? AND status IN ('ok','failed') AND started_at>=0 AND started_at<?2 AND finished_at>=started_at AND finished_at<?2 AND started_at<(SELECT max(started_at) FROM runs WHERE job_id=r.job_id)",params![row,cutoff],|r|r.get(0)).optional()?;
+                    let id:Option<String> = tx.query_row("SELECT id FROM runs r WHERE rowid=? AND status IN ('ok','failed','no_change') AND started_at>=0 AND started_at<?2 AND finished_at>=started_at AND finished_at<?2 AND started_at<(SELECT max(started_at) FROM runs WHERE job_id=r.job_id)",params![row,cutoff],|r|r.get(0)).optional()?;
                     let Some(id) = id else {
                         continue;
                     };
@@ -499,7 +504,7 @@ async fn sweep(
     for kind in kinds {
         let mut scanned = 0;
         let mut deleted = 0;
-        while scanned < 50_000 && deleted < 20_000 {
+        while scanned < SWEEP_SCANNED && deleted < SWEEP_DELETED {
             if interrupted(config, stop) {
                 metrics.finish("interrupted", None);
                 return;
@@ -525,7 +530,7 @@ async fn sweep(
                     &mut cursor,
                     &policy,
                     crate::now(),
-                    (20_000 - deleted).min(50_000 - scanned),
+                    (SWEEP_DELETED - deleted).min(SWEEP_SCANNED - scanned),
                 )?;
                 Ok((Some(result), cursor))
             })
@@ -574,10 +579,13 @@ async fn sweep(
 }
 
 // One existing maintenance worker per process: cheap observations each minute,
-// retention at its original startup/hourly cadence. Busy checkpoints keep their
-// pending flag; neither dispatch nor a request performs WAL maintenance.
+// lock reaping ten minutes after startup and then hourly, row retention ten
+// minutes after startup and then once a day. Every retention sweep is followed
+// by a forced WAL checkpoint; busy checkpoints keep their pending flag and
+// neither dispatch nor a request performs WAL maintenance.
 struct Maintenance {
     next_sweep: tokio::time::Instant,
+    next_retention: tokio::time::Instant,
     saw_freeze: bool,
     completed_at: f64,
     checkpoint_pending: bool,
@@ -586,6 +594,7 @@ impl Maintenance {
     fn new(config: &Config) -> Self {
         Self {
             next_sweep: tokio::time::Instant::now() + Duration::from_secs(600),
+            next_retention: tokio::time::Instant::now() + Duration::from_secs(600),
             saw_freeze: config.home.join("run/freeze").exists(),
             completed_at: 0.0,
             checkpoint_pending: false,
@@ -602,6 +611,13 @@ impl Maintenance {
     }
     fn sweep_due(&self) -> bool {
         tokio::time::Instant::now() >= self.next_sweep
+    }
+    fn retention_due(&self) -> bool {
+        tokio::time::Instant::now() >= self.next_retention
+    }
+    fn retained(&mut self) {
+        self.next_retention = tokio::time::Instant::now() + SWEEP_INTERVAL;
+        self.checkpoint_pending = true;
     }
     fn swept(&mut self) {
         self.next_sweep = tokio::time::Instant::now() + Duration::from_secs(3600);
@@ -647,7 +663,7 @@ pub(crate) async fn gateway(app: crate::api::App, mut stop: watch::Receiver<bool
             .unwrap_or(0.0);
         maintenance.observe(frozen, completed_at);
         if !frozen {
-            if settings.retention.enabled && maintenance.sweep_due() {
+            if settings.retention.enabled && maintenance.retention_due() {
                 let mut kinds = vec![
                     Kind::Updates,
                     Kind::Runs,
@@ -672,6 +688,7 @@ pub(crate) async fn gateway(app: crate::api::App, mut stop: watch::Receiver<bool
                 if scan_orphans && app.store.runtime.retention.snapshot()["status"] == "completed" {
                     next_orphans = crate::now() + 86400.0;
                 }
+                maintenance.retained();
                 maintenance.swept();
             }
             if !interrupted(&app.config, &stop) {
@@ -713,7 +730,7 @@ pub(crate) async fn executor(config: Config, mut stop: watch::Receiver<bool>) {
                 if !frozen {
                     let due = maintenance.sweep_due();
                     if settings.retention.enabled {
-                        if due {
+                        if maintenance.retention_due() {
                             sweep(
                                 &config,
                                 None,
@@ -730,6 +747,9 @@ pub(crate) async fn executor(config: Config, mut stop: watch::Receiver<bool>) {
                                 .entry(config.home.clone())
                                 .or_default()
                                 .retention = metrics.snapshot();
+                            maintenance.retained();
+                        }
+                        if due {
                             maintenance.swept();
                         }
                         if due || thawed || locks.in_progress() {
