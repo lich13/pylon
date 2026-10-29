@@ -93,16 +93,7 @@ enum Modules {
     Deploy {
         module: String,
         #[arg(long)]
-        artifacts: PathBuf,
-        #[arg(long)]
         host: String,
-        #[arg(long)]
-        directory: Option<PathBuf>,
-    },
-    Ci {
-        module: String,
-        #[arg(long)]
-        gateway: PathBuf,
         #[arg(long)]
         directory: Option<PathBuf>,
     },
@@ -404,10 +395,11 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
                     }
                     Modules::Deploy {
                         module,
-                        artifacts,
                         host,
                         directory,
                     } => {
+                        // Packs locally with this binary; no CI artifacts are involved.
+                        let binary = std::env::current_exe()?;
                         developer_tool(
                             directory,
                             "deploy",
@@ -415,24 +407,8 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
                                 module,
                                 "--host".into(),
                                 host,
-                                "--artifacts".into(),
-                                artifacts.to_string_lossy().into_owned(),
-                            ],
-                        )?;
-                        Value::Null
-                    }
-                    Modules::Ci {
-                        module,
-                        gateway,
-                        directory,
-                    } => {
-                        developer_tool(
-                            directory,
-                            "ci",
-                            &[
-                                module,
-                                "--gateway".into(),
-                                gateway.to_string_lossy().into_owned(),
+                                "--binary".into(),
+                                binary.to_string_lossy().into_owned(),
                             ],
                         )?;
                         Value::Null

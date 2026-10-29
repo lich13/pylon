@@ -2,6 +2,10 @@
 
 Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
+## v0.5.21 模块本机部署
+
+模块不再使用 GitHub CI：删除模块工作流及其打包脚本，`pylon modules ci` 子命令随之移除，任何工作流都不接收模块源码或构建模块运行时。`pylon modules deploy` 改为用当前网关二进制在本机打包后安装，不再需要 CI 成品目录。离线运行时只在 Python 版本或依赖锁变化时用 `scripts/module-runtime.py` 在本机重建，其余情况复用缓存。支持回退至 v0.5.20。
+
 ## v0.5.20 任务授权
 
 仅绑定 `job:<任务 ID>` 来源的 root 授权可省略 `modules`，任务在模块间迁移无需修改授权；含其他来源的授权仍须列出模块。现有授权行为不变，支持回退至 v0.5.19。
@@ -34,9 +38,16 @@ API v2 和业务记录保持兼容，仅新增通知查询索引；SDK 调用与
 
 ## 运行环境
 
-专用运行时优先使用常规 GIL Python 3.14.10；仅当其兼容检查失败而相同依赖的 Python 3.12.16 全部通过时使用后者。系统 Python 保持发行版管理。Node 22.23.4、Playwright 1.64.1、certifi 2026.10.23、pip 26.2.2，保留必要依赖并排除 uvicorn、starlette。
+专用运行时优先使用常规 GIL Python 3.14.10；仅当其本机检查失败而相同依赖的 Python 3.12.16 全部通过时使用后者。系统 Python 保持发行版管理。Node 22.23.4、Playwright 1.64.1、certifi 2026.10.23、pip 26.2.2，保留必要依赖并排除 uvicorn、starlette。
 
-外部模块 CI 从校验后的官方源码构建两种 Python，验证六个模块、SDK、特权辅助程序、网关契约和无账号的浏览器页面。发布同时附带独立的 `pylon-runtime.tar.gz` 与 `RUNTIME_SHA256SUMS`；运行时、模块及网关绑定同一提交。服务器仅离线安装 CI wheel，不编译 Python 或依赖。先准备新环境，冻结并排空后切换；回退记录同时保存原虚拟环境、浏览器、Node、模块和网关，支持恢复至 v0.5.14，失败恢复后保持冻结。
+离线运行时在本机构建：`scripts/module-runtime.py` 在固定校验的 Ubuntu 24.04 基础镜像中（与服务器相同的 glibc，经 `sudo chroot`）调用外置目录的 `deployment/build_runtime.py`，从校验后的官方源码编译 Python，产出 `pylon-runtime.tar.gz` 和 `runtime.json`。缓存键只覆盖 Python 版本、`requirements.lock`、`deployment/bootstrap.lock`、构建脚本及 SDK／特权包的依赖声明；键不变时直接复用，复用前核对哈希、元数据和归档安全性。业务源码不进入构建根，也不上传任何位置。服务器仅离线安装，不编译 Python 或依赖。
+
+```sh
+scripts/module-runtime.py build --source ../pylon-tasks --python 3.14.10   # 键未变时输出 "reused": true
+scripts/module-runtime.py key --source ../pylon-tasks --python 3.14.10
+```
+
+缓存位于 `$PYLON_RUNTIME_CACHE`，默认 `~/.cache/pylon/runtime/<键>/`，含 `pylon-runtime.tar.gz`、`runtime.json`（`source_sha256` 即缓存键，`gateway_revision` 为构建时的网关提交）和 `build.json`。只支持 Linux x86_64，需要免密 sudo 和访问 python.org、Ubuntu 软件源、PyPI、nodesource 及 Playwright 下载源。
 
 ## v0.5.14 运行与升级
 
@@ -93,15 +104,12 @@ Rust 工具链每月由 Dependabot 检查；更新后同时核对最低支持版
 
 ```sh
 target/debug/pylon modules check example --directory ../pylon-tasks
-target/debug/pylon modules deploy example --directory ../pylon-tasks --host production-alias --artifacts ./external-dist
-target/debug/pylon modules ci example --directory ../pylon-tasks --gateway .
+target/debug/pylon modules deploy example --directory ../pylon-tasks --host production-alias
 ```
 
-`modules ci all` 在既有私有矩阵全部通过后生成匹配提交的 SDK、模块与必要 helper 部署成品。单模块 CI 只做针对性检查；部署入口使用已验证的成品目录，不在本机重新打包。协调升级保留匹配的 SDK、模块、helper 和配置用于回退，旧版所需运行依赖在回退窗口内保留。
+模块改动只需本机 `modules check` 后 `modules deploy`：用当前网关二进制 `modules pack` 打包，经 SSH 上传后由服务器 `pylon modules install --activate` 安装，不经过 GitHub CI。依赖锁或 Python 版本变化时先用 `scripts/module-runtime.py` 重建运行时。
 
 服务器上 `pylon modules rollback example --activate` 回到上一模块版本。普通部署只重启该模块的服务；网关进程和其他模块保持运行。在途任务固定启动时的源码版本。停止准备钩子会等待本模块在途工作；数据版本变化还要求冻结新触发。
-
-外置源码需要 CI 时使用私有仓库的临时哈希校验包，运行后删除输入包。既有检查通过后生成 SDK、模块包及校验清单，部署直接使用 CI 字节，不在本机重新打包；不把业务源码提交回网关仓库。
 
 ## 机器人与路由
 
@@ -188,11 +196,7 @@ sudo pylon --home /srv/pylon downgrade-check --target-version 0.5.7
 
 所有旧目标还必须没有有效的事件占位记录；存在时返回 `retained_events_require_newer_gateway`。占位状态损坏或有效期不明同样拒绝，命中计数为零不能绕过。空缓冲但 counter 损坏、权限异常或无法读取时仍拒绝通过。先冻结新触发并等在途任务、命令和投递结束，再检查；停止核心服务后、替换旧二进制前再检查一次。此命令是部署前置门槛，不能阻止 root 绕过检查替换文件。缓冲无法清空或已有有效占位时保留新版和冻结状态，优先前向修复；不删除记录或恢复旧数据库快照。
 
-版本以运行进程的二进制哈希、版本目录 `REVISION` 和诊断版本交叉核对；切换后同步根目录 `REVISION`。仅分支提交触发网关 CI，版本 tag 不重复构建。发布成品须来自对应提交的成功 CI，并核对 `REVISION` 和 `SHA256SUMS`；校验和中的路径带 `dist/` 前缀，下载至临时根下的 `dist/` 后，从临时根运行 `sha256sum -c dist/SHA256SUMS`。网关 CI artifact 保留 14 天，供同一提交的模块检查复用；正式 Release 资产长期保留，tag 本身不保存二进制。
-
-模块兼容检查只上传通过检查的 `runtime.json`，打包优先选择 Python 3.14.10，否则使用通过检查的 3.12.16；只下载选中的完整 runtime，并核对元数据及哈希。输入、runtime 构建、兼容检查和打包全部结束后，cleanup 分页列出本次运行的产物，只回收本任务的 `module-input`、`built-runtime` 和 `compatible-runtime`。这些中间产物的保留期为 1 天，作为取消或清理失败时的兜底；清理失败单独报告，不自动重跑构建。
-
-未发布的 `pylon-external` 成品保留 30 天。发布入口确认 Release 已正式发布、提交及七个资产完整后，删除该次发布使用的 `pylon-external` CI 副本；失败或不完整时保留副本，发布后的清理失败单独报告且不改变发布成功状态。构建期间及未发布成品积累时仍可能超过免费存储额度。
+版本以运行进程的二进制哈希、版本目录 `REVISION` 和诊断版本交叉核对；切换后同步根目录 `REVISION`。仅分支提交触发网关 CI，版本 tag 不重复构建。发布成品须来自对应提交的成功 CI，并核对 `REVISION` 和 `SHA256SUMS`；校验和中的路径带 `dist/` 前缀，下载至临时根下的 `dist/` 后，从临时根运行 `sha256sum -c dist/SHA256SUMS`。网关 CI artifact 保留 14 天；正式 Release 资产长期保留，tag 本身不保存二进制。
 
 
 
