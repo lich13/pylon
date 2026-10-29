@@ -53,12 +53,10 @@ pub fn menu(snapshot: &Snapshot, bot: &str) -> Vec<Value> {
         })
         .collect::<Vec<_>>();
     commands.sort_by_key(|c| (c.order, &c.name));
-    let mut result = commands
+    commands
         .into_iter()
         .map(|c| json!({"command":c.name,"description":c.description}))
-        .collect::<Vec<_>>();
-    result.push(json!({"command":"help","description":"查看功能与使用说明"}));
-    result
+        .collect()
 }
 async fn synchronize(app: &App, id: &str, bot: &Bot, tg: &Telegram) -> Result<()> {
     let wanted = menu(&*app.snapshot.read().await, id);
@@ -222,7 +220,7 @@ async fn route(
             .modules
             .values()
             .find(|m| m.manifest.callbacks.iter().any(|p| data.starts_with(p)))
-            .context("此按钮已停用，请使用 /help 打开当前入口")?;
+            .context("此按钮已停用，请从命令菜单重新打开")?;
         return invoke(
             app,
             contexts,
@@ -271,27 +269,25 @@ async fn route(
         let mut pieces = command.splitn(2, char::is_whitespace);
         let name = pieces.next().unwrap_or("").split('@').next().unwrap_or("");
         let argument = pieces.next().unwrap_or("").trim();
-        if name == "help" || name == "start" {
-            if name == "start" {
-                for module in snapshot
-                    .catalog
-                    .modules
-                    .values()
-                    .filter(|m| m.manifest.hooks.iter().any(|s| s == "start"))
-                {
-                    let value = invoke(
-                        app,
-                        contexts,
-                        module,
-                        id,
-                        "start",
-                        json!({"argument":argument}),
-                        (request_id, reply_id),
-                    )
-                    .await?;
-                    if !value.is_null() {
-                        return Ok(card(value));
-                    }
+        if name == "start" {
+            for module in snapshot
+                .catalog
+                .modules
+                .values()
+                .filter(|m| m.manifest.hooks.iter().any(|s| s == "start"))
+            {
+                let value = invoke(
+                    app,
+                    contexts,
+                    module,
+                    id,
+                    "start",
+                    json!({"argument":argument}),
+                    (request_id, reply_id),
+                )
+                .await?;
+                if !value.is_null() {
+                    return Ok(card(value));
                 }
             }
             if !argument.is_empty()
@@ -302,7 +298,7 @@ async fn route(
                 );
             }
             return Ok(
-                json!({"text":format!("Pylon\n\n{}\n\n详细说明：/help 命令",menu(&snapshot,id).iter().map(|c|format!("/{} — {}",c["command"].as_str().unwrap(),c["description"].as_str().unwrap())).collect::<Vec<_>>().join("\n"))}),
+                json!({"text":format!("Pylon\n\n{}",menu(&snapshot,id).iter().map(|c|format!("/{} — {}",c["command"].as_str().unwrap(),c["description"].as_str().unwrap())).collect::<Vec<_>>().join("\n"))}),
             );
         }
         for hook in snapshot
@@ -323,7 +319,7 @@ async fn route(
             .await?;
         }
         let Some((module, command)) = snapshot.catalog.command(name) else {
-            return Ok(json!({"text":"该入口已停用，请使用 /help 查看当前功能。"}));
+            return Ok(json!({"text":"该入口已停用，请从命令菜单选择当前功能。"}));
         };
         if !command.shared
             && let Some(target) = snapshot.settings.routes.get(&command.topic)
@@ -370,7 +366,7 @@ async fn route(
                 return Ok(card(value));
             }
         }
-        Ok(json!({"text":"请使用 /help 选择功能；补充任务信息时请回复原任务消息。"}))
+        Ok(json!({"text":"请从命令菜单选择功能；补充任务信息时请回复原任务消息。"}))
     }
 }
 pub async fn command_once(app: &App, id: &str, tg: &Telegram) -> Result<bool> {

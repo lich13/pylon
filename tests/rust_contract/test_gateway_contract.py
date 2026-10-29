@@ -763,6 +763,16 @@ def test_owner_updates_and_bot_scoped_menus(workdir, telegram):
                     "text": "/help",
                 },
             },
+            {
+                "update_id": 4,
+                "message": {
+                    "message_id": 14,
+                    "date": now,
+                    "chat": {"id": 101, "type": "private"},
+                    "from": {"id": 101, "is_bot": False},
+                    "text": "/start",
+                },
+            },
         ],
     )
 
@@ -806,7 +816,7 @@ def test_owner_updates_and_bot_scoped_menus(workdir, telegram):
                 offset = database.execute(
                     "SELECT value FROM kv WHERE key='offset:bot_one'"
                 ).fetchone()
-            return rows == [(3, "done")] and offset == ("4",)
+            return rows == [(3, "done"), (4, "done")] and offset == ("5",)
 
         wait_for(authorized_updates_ready, timeout=5.0)
         for bot_id, expected_command, other_command in (
@@ -819,6 +829,22 @@ def test_owner_updates_and_bot_scoped_menus(workdir, telegram):
                     for item in telegram.commands(tokens[bot_id], scope, "zh")
                 }
                 assert expected_command in names and other_command not in names
+                assert "help" not in names
+
+        def sent_texts():
+            with telegram._lock:
+                return [
+                    body.get("text", "").rstrip("\n")
+                    for _, method, body in telegram._calls
+                    if method == "sendMessage"
+                ]
+
+        expected_replies = {
+            "该入口已停用，请从命令菜单选择当前功能。",
+            "Pylon\n/alpha_cmd — alpha fixture command",
+        }
+        wait_for(lambda: expected_replies <= set(sent_texts()), timeout=5.0)
+        assert not any("/help" in text for text in sent_texts())
         assert telegram.sent_text("UNAUTHORIZED-SENDER") is False
         assert telegram.sent_text("GROUP-MESSAGE") is False
 
@@ -1183,3 +1209,9 @@ def test_model_job_lock_prevents_overlapping_runs(workdir, telegram):
                 except subprocess.TimeoutExpired:
                     first.kill()
                     first.wait(timeout=3)
+
+
+def test_gateway_sources_no_longer_point_users_at_help():
+    root = Path(__file__).resolve().parents[2]
+    for path in (root / "rust").rglob("*.rs"):
+        assert "/help" not in path.read_text(encoding="utf-8"), path

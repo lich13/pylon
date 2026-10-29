@@ -122,7 +122,7 @@ fn one_buffered_file_blocks_downgrade() {
     assert_eq!(report.target_version, "0.5.6");
     assert_eq!(report.completions_pending, Some(1));
     assert_eq!(report.reason, Some("pending_completions"));
-    for target in ["0.5.15", "0.5.16", "0.5.17", "0.5.19", "0.5.20"] {
+    for target in ["0.5.15", "0.5.16", "0.5.17", "0.5.19", "0.5.20", "0.5.21"] {
         assert_eq!(
             downgrade::check(&config, target).reason,
             Some("pending_completions")
@@ -178,7 +178,7 @@ fn active_retained_history_blocks_every_supported_target_without_writing_state()
         }
 
         assert_eq!(state_snapshot(&database_path), before);
-        for target in ["0.5.15", "0.5.16", "0.5.17", "0.5.19", "0.5.20"] {
+        for target in ["0.5.15", "0.5.16", "0.5.17", "0.5.19", "0.5.20", "0.5.21"] {
             assert!(downgrade::check(&config, target).ok);
         }
         assert_eq!(state_snapshot(&database_path), before);
@@ -204,7 +204,7 @@ fn malformed_retained_history_is_unavailable_and_read_only() {
         assert_eq!(report.completions_pending, Some(0));
         assert_eq!(report.reason, Some("state_unavailable"));
         assert_eq!(state_snapshot(&database_path), before);
-        for target in ["0.5.15", "0.5.16", "0.5.17", "0.5.19", "0.5.20"] {
+        for target in ["0.5.15", "0.5.16", "0.5.17", "0.5.19", "0.5.20", "0.5.21"] {
             assert_eq!(
                 downgrade::check(&config, target).reason,
                 Some("state_unavailable")
