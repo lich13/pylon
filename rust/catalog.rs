@@ -60,6 +60,8 @@ pub struct Command {
     pub topic: String,
     #[serde(default)]
     pub menu: bool,
+    /// Accepted for manifest compatibility only. Since v0.5.24 every bot
+    /// shows and executes every command, so this flag has no effect.
     #[serde(default)]
     pub shared: bool,
     #[serde(default)]

@@ -707,7 +707,7 @@ def test_sending_event_recovers_as_uncertain_and_is_never_replayed(workdir, tele
         gateway.stop()
 
 
-def test_owner_updates_and_bot_scoped_menus(workdir, telegram):
+def test_owner_updates_and_unified_menus(workdir, telegram):
     home = workdir / "home"
     tokens = seed_home(
         home,
@@ -773,6 +773,16 @@ def test_owner_updates_and_bot_scoped_menus(workdir, telegram):
                     "text": "/start",
                 },
             },
+            {
+                "update_id": 5,
+                "message": {
+                    "message_id": 15,
+                    "date": now,
+                    "chat": {"id": 101, "type": "private"},
+                    "from": {"id": 101, "is_bot": False},
+                    "text": "/beta_cmd",
+                },
+            },
         ],
     )
 
@@ -792,11 +802,11 @@ def test_owner_updates_and_bot_scoped_menus(workdir, telegram):
 
         def missing_menus():
             missing = []
-            for bot_id, command_name in (("bot_one", "alpha_cmd"), ("bot_two", "beta_cmd")):
+            for bot_id in ("bot_one", "bot_two"):
                 for scope in scopes_by_bot[bot_id]:
                     for language in ("", "zh", "en"):
                         commands = telegram.commands(tokens[bot_id], scope, language)
-                        if command_name not in {item.get("command") for item in commands}:
+                        if not {"alpha_cmd", "beta_cmd"} <= {item.get("command") for item in commands}:
                             missing.append((bot_id, scope, language))
             return missing
 
@@ -816,20 +826,19 @@ def test_owner_updates_and_bot_scoped_menus(workdir, telegram):
                 offset = database.execute(
                     "SELECT value FROM kv WHERE key='offset:bot_one'"
                 ).fetchone()
-            return rows == [(3, "done"), (4, "done")] and offset == ("5",)
+            # /beta_cmd belongs to bot_two's topic but is dispatched to the
+            # beta module from bot_one instead of being redirected. This
+            # harness runs no executor, so that dispatch ends uncertain.
+            return rows == [(3, "done"), (4, "done"), (5, "uncertain")] and offset == ("6",)
 
         wait_for(authorized_updates_ready, timeout=5.0)
-        for bot_id, expected_command, other_command in (
-            ("bot_one", "alpha_cmd", "beta_cmd"),
-            ("bot_two", "beta_cmd", "alpha_cmd"),
-        ):
+        for bot_id in ("bot_one", "bot_two"):
             for scope in scopes_by_bot[bot_id]:
-                names = {
+                names = [
                     item["command"]
                     for item in telegram.commands(tokens[bot_id], scope, "zh")
-                }
-                assert expected_command in names and other_command not in names
-                assert "help" not in names
+                ]
+                assert names == ["alpha_cmd", "beta_cmd"]
 
         def sent_texts():
             with telegram._lock:
@@ -841,10 +850,11 @@ def test_owner_updates_and_bot_scoped_menus(workdir, telegram):
 
         expected_replies = {
             "该入口已停用，请从命令菜单选择当前功能。",
-            "Pylon\n/alpha_cmd — alpha fixture command",
+            "Pylon\n/alpha_cmd — alpha fixture command\n/beta_cmd — beta fixture command",
         }
         wait_for(lambda: expected_replies <= set(sent_texts()), timeout=5.0)
         assert not any("/help" in text for text in sent_texts())
+        assert not any("已迁至" in text for text in sent_texts())
         assert telegram.sent_text("UNAUTHORIZED-SENDER") is False
         assert telegram.sent_text("GROUP-MESSAGE") is False
 
@@ -1215,3 +1225,9 @@ def test_gateway_sources_no_longer_point_users_at_help():
     root = Path(__file__).resolve().parents[2]
     for path in (root / "rust").rglob("*.rs"):
         assert "/help" not in path.read_text(encoding="utf-8"), path
+
+
+def test_gateway_sources_no_longer_redirect_commands_between_bots():
+    root = Path(__file__).resolve().parents[2]
+    for path in (root / "rust").rglob("*.rs"):
+        assert "已迁至" not in path.read_text(encoding="utf-8"), path

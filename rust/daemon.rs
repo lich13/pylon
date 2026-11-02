@@ -37,20 +37,15 @@ impl<T> Drop for Child<T> {
     }
 }
 
-pub fn menu(snapshot: &Snapshot, bot: &str) -> Vec<Value> {
+/// Every enabled bot shows the same menu: all module commands marked
+/// `menu`. Routes only decide where scheduled and notification output goes.
+pub fn menu(snapshot: &Snapshot) -> Vec<Value> {
     let mut commands = snapshot
         .catalog
         .modules
         .values()
         .flat_map(|m| m.manifest.commands.iter())
-        .filter(|c| {
-            c.menu
-                && snapshot
-                    .settings
-                    .routes
-                    .get(&c.topic)
-                    .is_some_and(|id| id == bot)
-        })
+        .filter(|c| c.menu)
         .collect::<Vec<_>>();
     commands.sort_by_key(|c| (c.order, &c.name));
     commands
@@ -59,7 +54,7 @@ pub fn menu(snapshot: &Snapshot, bot: &str) -> Vec<Value> {
         .collect()
 }
 async fn synchronize(app: &App, id: &str, bot: &Bot, tg: &Telegram) -> Result<()> {
-    let wanted = menu(&*app.snapshot.read().await, id);
+    let wanted = menu(&*app.snapshot.read().await);
     let hash = crate::digest(serde_json::to_vec(&wanted)?);
     let key = format!("menu:{id}");
     if app.store.blocking(move |store| store.get(&key)).await? == hash {
@@ -298,7 +293,7 @@ async fn route(
                 );
             }
             return Ok(
-                json!({"text":format!("Pylon\n\n{}",menu(&snapshot,id).iter().map(|c|format!("/{} — {}",c["command"].as_str().unwrap(),c["description"].as_str().unwrap())).collect::<Vec<_>>().join("\n"))}),
+                json!({"text":format!("Pylon\n\n{}",menu(&snapshot).iter().map(|c|format!("/{} — {}",c["command"].as_str().unwrap(),c["description"].as_str().unwrap())).collect::<Vec<_>>().join("\n"))}),
             );
         }
         for hook in snapshot
@@ -321,19 +316,6 @@ async fn route(
         let Some((module, command)) = snapshot.catalog.command(name) else {
             return Ok(json!({"text":"该入口已停用，请从命令菜单选择当前功能。"}));
         };
-        if !command.shared
-            && let Some(target) = snapshot.settings.routes.get(&command.topic)
-            && target != id
-        {
-            let bot = snapshot
-                .settings
-                .bots
-                .get(target)
-                .context("route bot missing")?;
-            return Ok(
-                json!({"text":format!("此功能已迁至 @{}，请在那里使用 /{}。",bot.username,command.name)}),
-            );
-        }
         invoke(
             app,
             contexts,
@@ -1065,6 +1047,44 @@ mod tests {
     use tokio::sync::Semaphore;
 
     #[test]
+    fn every_bot_shares_one_menu_regardless_of_routes() {
+        let manifest: crate::catalog::Manifest = serde_json::from_value(json!({
+            "api_version": 2,
+            "id": "fixture",
+            "handler": ["true"],
+            "commands": [
+                {"name":"zeta","description":"z","topic":"elsewhere","menu":true,"order":2},
+                {"name":"alpha","description":"a","topic":"personal","menu":true,"order":1},
+                {"name":"hidden","description":"h","topic":"personal","menu":false},
+                {"name":"legacy","description":"l","topic":"trading","menu":true,"shared":true,"order":3}
+            ]
+        }))
+        .unwrap();
+        let mut catalog = crate::catalog::Catalog::default();
+        catalog.modules.insert(
+            "fixture".into(),
+            crate::catalog::Module {
+                root: std::path::PathBuf::new(),
+                manifest,
+                hash: String::new(),
+            },
+        );
+        let mut settings = crate::config::Settings::default();
+        settings.routes.insert("personal".into(), "one".into());
+        settings.routes.insert("trading".into(), "two".into());
+        let snapshot = Snapshot {
+            settings,
+            catalog,
+            credentials: BTreeMap::new(),
+        };
+        let names = menu(&snapshot)
+            .iter()
+            .map(|c| c["command"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["alpha", "zeta", "legacy"]);
+    }
+
+    #[test]
     fn configuration_fingerprint_covers_indexed_and_discovered_manifests() {
         let temp = tempfile::tempdir().unwrap();
         let config = crate::config::Config::new(temp.path().to_path_buf());
@@ -1108,7 +1128,7 @@ mod tests {
             }))),
             reload_guard: Arc::default(),
         };
-        let wanted = menu(&*app.snapshot.read().await, "fixture");
+        let wanted = menu(&*app.snapshot.read().await);
         store
             .put(
                 "menu:fixture",

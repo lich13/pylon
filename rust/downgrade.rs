@@ -51,6 +51,7 @@ pub fn check(config: &Config, target: &str) -> Report {
             | "0.5.20"
             | "0.5.21"
             | "0.5.22"
+            | "0.5.23"
     ) {
         report.reason = Some("unsupported_target");
         return report;
@@ -106,6 +107,7 @@ fn inspect(
                     | "0.5.20"
                     | "0.5.21"
                     | "0.5.22"
+                    | "0.5.23"
             )
         {
             return Ok(Some("retained_events_require_newer_gateway"));
