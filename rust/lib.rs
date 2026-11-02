@@ -111,7 +111,7 @@ pub async fn rpc_isolated<T: Send + 'static>(
         slots.clone().acquire_owned(),
     )
     .await
-    .map_err(|_| errors::RemoteFailure { retryable: true })??;
+    .map_err(|_| errors::RemoteFailure::unavailable())??;
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;

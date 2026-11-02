@@ -483,7 +483,11 @@ async fn process_as(
         }
         let status = child.wait().await?;
         Ok::<_, anyhow::Error>((
-            status.code().unwrap_or(128),
+            // Shell convention: a signal-terminated child reports 128 + signal.
+            status.code().unwrap_or_else(|| {
+                use std::os::unix::process::ExitStatusExt;
+                128 + status.signal().unwrap_or(0)
+            }),
             (&mut out).await??,
             (&mut err).await??,
         ))
@@ -1136,7 +1140,31 @@ pub async fn service(config: &Config, id: &str) -> Result<i32> {
         Some(guard),
     )
     .await;
+    match &result {
+        Ok((code, stdout, stderr)) if *code != 0 => {
+            eprintln!("{}", service_exit_event(id, *code, stdout, stderr))
+        }
+        Ok(_) => {}
+        Err(error) => crate::errors::log("service", error),
+    }
     Ok(result?.0)
+}
+
+/// Journal line for a failed module service. Module output is untrusted and
+/// may contain message bodies or tokens, so only sizes, a fingerprint and
+/// known exception class names are logged (see `safe_tail`).
+fn service_exit_event(id: &str, code: i32, stdout: &str, stderr: &str) -> Value {
+    let summary = |text: &str| {
+        let mut value = safe_tail(text.as_bytes());
+        value["lines"] = json!(text.lines().count());
+        if let Some(map) = value.as_object_mut() {
+            map.remove("tail");
+        }
+        value
+    };
+    json!({"event":"service-exit","service":id,"at":crate::now(),"exit_code":code,
+        "signal":(code > 128).then(|| code - 128),
+        "stdout":summary(stdout),"stderr":summary(stderr)})
 }
 
 /// Called while holding the supervisor directory lock. If any process cannot
@@ -1247,6 +1275,31 @@ pub(crate) fn safe_tail(bytes: &[u8]) -> Value {
 #[cfg(test)]
 mod service_context_tests {
     use super::*;
+
+    #[test]
+    fn service_exit_event_keeps_classes_and_drops_bodies() {
+        let event = service_exit_event(
+            "fixture--poller",
+            1,
+            "fixture-message-body\n",
+            "Traceback (most recent call last):\nPermissionError: fixture-token-path\n",
+        );
+        assert_eq!(event["event"], "service-exit");
+        assert_eq!(event["exit_code"], 1);
+        assert!(event["signal"].is_null());
+        assert_eq!(event["stderr"]["lines"], 2);
+        assert_eq!(
+            event["stderr"]["error_types"],
+            json!(["PermissionError", "Traceback"])
+        );
+        assert_eq!(event["stdout"]["lines"], 1);
+        assert!(!event.to_string().contains("message-body"));
+        assert!(!event.to_string().contains("token-path"));
+        assert_eq!(
+            service_exit_event("fixture--relay", 143, "", "")["signal"],
+            15
+        );
+    }
 
     #[test]
     fn references_include_cached_and_running_tokens_and_fail_closed() {

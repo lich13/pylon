@@ -26,6 +26,52 @@ fn wait_for_writer(attempt: i32) -> bool {
     true
 }
 
+/// Root may only hand a root-owned, singly linked regular file back to the
+/// non-root owner of its directory (the gateway service account).
+fn should_align(directory: (u32, u32), file: (u32, u64, bool)) -> Option<(u32, u32)> {
+    let (dir_uid, dir_gid) = directory;
+    let (file_uid, links, regular) = file;
+    (dir_uid != 0 && file_uid == 0 && links == 1 && regular).then_some((dir_uid, dir_gid))
+}
+
+/// The gateway service owns its private state database, but root processes
+/// (broker, CLI) open it too. If root created the file or a WAL sidecar, give
+/// it back to the directory owner so the gateway never loses write access.
+/// Mode stays 0600: no other account gains access.
+pub(crate) fn align_owner(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let parent = std::fs::symlink_metadata(path.parent().context("missing database directory")?)?;
+    if !parent.is_dir() || parent.uid() == 0 {
+        return Ok(());
+    }
+    let mut candidates = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        candidates.push(name.into());
+    }
+    for candidate in candidates {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        // Decide on the opened inode, so a swapped name cannot redirect fchown.
+        let meta = file.metadata()?;
+        if let Some((uid, gid)) = should_align(
+            (parent.uid(), parent.gid()),
+            (meta.uid(), meta.nlink(), meta.is_file()),
+        ) {
+            std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Store {
     pub path: PathBuf,
@@ -47,6 +93,9 @@ impl Store {
         }
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        if unsafe { libc::geteuid() } == 0 {
+            align_owner(path)?;
+        }
         Ok(store)
     }
     pub fn connect(&self) -> Result<PooledConnection> {
@@ -943,4 +992,19 @@ const UNCERTAIN_SEED: &str = "INSERT INTO kv(key,value)
 pub(crate) fn initialize_uncertain(db: &rusqlite::Connection) -> Result<()> {
     db.execute_batch(UNCERTAIN_SEED)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::should_align;
+
+    #[test]
+    fn only_root_owned_single_link_files_in_service_directories_are_aligned() {
+        assert_eq!(should_align((993, 986), (0, 1, true)), Some((993, 986)));
+        // Already owned by the service, linked elsewhere, not a file, or in a root directory.
+        assert_eq!(should_align((993, 986), (993, 1, true)), None);
+        assert_eq!(should_align((993, 986), (0, 2, true)), None);
+        assert_eq!(should_align((993, 986), (0, 1, false)), None);
+        assert_eq!(should_align((0, 0), (0, 1, true)), None);
+    }
 }

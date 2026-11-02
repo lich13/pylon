@@ -664,6 +664,32 @@ fn health_candidate(
     remove_tree(&root)?;
     outcome
 }
+/// Modules only read drain markers (SDK `lifecycle.draining()` and operations
+/// diagnostics), so every module identity needs search/list access, while only
+/// root writes. If a restrictive umask created the directory privately, a
+/// module would silently miss the marker and keep accepting work mid-deploy.
+fn drain_mode(current: u32) -> Option<u32> {
+    // Add-only: never removes a bit an operator granted deliberately.
+    let wanted = (current & 0o7777) | 0o2750;
+    (current & 0o7777 != wanted).then_some(wanted)
+}
+fn ensure_drain_directory(directory: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = std::fs::symlink_metadata(directory)?;
+    anyhow::ensure!(meta.is_dir(), "drain path is not a directory");
+    if unsafe { libc::geteuid() } != 0 || meta.uid() != 0 {
+        return Ok(());
+    }
+    // Same group as run/ (the service group every module identity belongs to).
+    let group = std::fs::metadata(directory.parent().context("drain parent missing")?)?.gid();
+    if meta.gid() != group {
+        std::os::unix::fs::lchown(directory, None, Some(group))?;
+    }
+    if let Some(mode) = drain_mode(meta.mode()) {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
 struct DrainGuard(std::path::PathBuf);
 impl Drop for DrainGuard {
     fn drop(&mut self) {
@@ -676,7 +702,9 @@ fn prepare_stop(
     id: &str,
 ) -> Result<DrainGuard> {
     let path = config.home.join("run/drain").join(id);
-    std::fs::create_dir_all(path.parent().context("destination parent missing")?)?;
+    let directory = path.parent().context("destination parent missing")?;
+    std::fs::create_dir_all(directory)?;
+    ensure_drain_directory(directory)?;
     // A previous interrupted deployment intentionally leaves admission frozen for inspection.
     let marker = std::fs::OpenOptions::new()
         .write(true)
@@ -1046,4 +1074,18 @@ fn collect_versions(config: &crate::config::Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::drain_mode;
+
+    #[test]
+    fn drain_directory_gains_list_access_without_losing_bits() {
+        assert_eq!(drain_mode(0o40700), Some(0o2750));
+        assert_eq!(drain_mode(0o40750), Some(0o2750));
+        assert_eq!(drain_mode(0o42755), None);
+        assert_eq!(drain_mode(0o42770), None);
+        assert_eq!(drain_mode(0o40755), Some(0o2755));
+    }
 }

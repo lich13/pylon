@@ -60,7 +60,7 @@ fn only_completed_old_or_proven_old_orphan_unlocked_files_are_removed() {
     let orphan = path(&config, "orphan");
     drop(runtime::open_task_lock(&orphan).unwrap());
     assert!(!remove(&config, &orphan, None, now).unwrap());
-    assert!(remove(&config, &orphan, None, now + 86401.0).unwrap());
+    assert!(remove(&config, &orphan, None, now + STALE_AFTER + 1.0).unwrap());
     request(&config, "held", "completed", 1.0);
     let held = path(&config, "held");
     let file = runtime::acquire_task_lock(&held).unwrap().unwrap();
@@ -88,7 +88,7 @@ fn only_completed_old_or_proven_old_orphan_unlocked_files_are_removed() {
 #[test]
 fn rejects_links_permissions_nonempty_and_rechecks_request_state() {
     let (_temp, config) = fixture();
-    let now = crate::now() + 86401.0;
+    let now = crate::now() + STALE_AFTER + 1.0;
     let real = path(&config, "real");
     drop(runtime::open_task_lock(&real).unwrap());
     let link = path(&config, "symlink");
@@ -122,7 +122,7 @@ fn descriptor_opened_before_unlink_cannot_own_replacement_path() {
     let (_temp, config) = fixture();
     let path = path(&config, "race");
     let stale = runtime::open_task_lock(&path).unwrap();
-    assert!(remove(&config, &path, None, crate::now() + 86401.0).unwrap());
+    assert!(remove(&config, &path, None, crate::now() + STALE_AFTER + 1.0).unwrap());
     let current = runtime::acquire_task_lock(&path).unwrap().unwrap();
     assert!(runtime::try_lock(&stale).unwrap());
     assert!(!runtime::task_lock_current(&path, &stale).unwrap());
@@ -183,7 +183,7 @@ fn scan_is_bounded_continues_and_excludes_other_files_and_freeze() {
 #[test]
 fn old_job_process_and_quota_locks_are_never_reclaimed() {
     let (_temp, config) = fixture();
-    let now = crate::now() + 86401.0;
+    let now = crate::now() + STALE_AFTER + 1.0;
     let run = config.home.join("run");
     for name in [
         "software-update-review.lock",
@@ -209,7 +209,7 @@ fn old_job_process_and_quota_locks_are_never_reclaimed() {
 fn completed_with_fresh_updated_at_reclaims_when_lock_file_is_old() {
     let (_temp, config) = fixture();
     let now = crate::now();
-    let future = now + 86401.0;
+    let future = now + STALE_AFTER + 1.0;
     // Simulate reconcile bumping updated_at to "now" while the lock inode is aged.
     request(&config, "reconciled", "completed", future);
     let file = path(&config, "reconciled");
@@ -237,4 +237,63 @@ fn nonempty_request_lock_is_soft_skipped_without_scan_error() {
     assert_eq!(scan.skipped, 1);
     assert!(scan.scan_error.is_none(), "{:?}", scan.scan_error);
     assert!(path(&config, "nonempty").exists());
+}
+
+#[test]
+fn unheld_dispatch_lock_for_finished_request_is_reaped_after_one_hour_not_one_day() {
+    let (_temp, config) = fixture();
+    let now = crate::now();
+    let dispatch = |id: &str| {
+        config
+            .home
+            .join("run")
+            .join(format!("dispatch-{}.lock", crate::digest(id)))
+    };
+    // Finished an hour ago: reclaimable well before the old 24 hour window.
+    request(&config, "finished", "completed", now - STALE_AFTER - 1.0);
+    drop(runtime::open_task_lock(&dispatch("finished")).unwrap());
+    let known = (
+        "finished".into(),
+        "completed".into(),
+        now - STALE_AFTER - 1.0,
+    );
+    // A held lock is never removed, whatever its age.
+    let held = runtime::acquire_task_lock(&dispatch("finished"))
+        .unwrap()
+        .unwrap();
+    assert!(!remove(&config, &dispatch("finished"), Some(&known), now).unwrap());
+    drop(held);
+    assert!(remove(&config, &dispatch("finished"), Some(&known), now).unwrap());
+    assert!(!dispatch("finished").exists());
+    // A request that is still queued or running keeps its dispatch lock.
+    request(&config, "active", "running", 1.0);
+    drop(runtime::open_task_lock(&dispatch("active")).unwrap());
+    let active = ("active".into(), "running".into(), 1.0);
+    assert!(
+        !remove(
+            &config,
+            &dispatch("active"),
+            Some(&active),
+            now + 30.0 * 86400.0
+        )
+        .unwrap()
+    );
+    // A just-finished request with a fresh lock waits for the lock to age.
+    request(&config, "fresh", "completed", now);
+    drop(runtime::open_task_lock(&dispatch("fresh")).unwrap());
+    let fresh = ("fresh".into(), "completed".into(), now);
+    assert!(!remove(&config, &dispatch("fresh"), Some(&fresh), now + 60.0).unwrap());
+    assert!(
+        remove(
+            &config,
+            &dispatch("fresh"),
+            Some(&fresh),
+            now + STALE_AFTER + 1.0
+        )
+        .unwrap()
+    );
+    // Orphans (no request row) also need an aged lock first.
+    drop(runtime::open_task_lock(&dispatch("orphan")).unwrap());
+    assert!(!remove(&config, &dispatch("orphan"), None, now + 60.0).unwrap());
+    assert!(remove(&config, &dispatch("orphan"), None, now + STALE_AFTER + 1.0).unwrap());
 }

@@ -172,10 +172,14 @@ async fn run_helper(
             },
             async { child.wait().await.context(ReconcileRequired) },
         )?;
-        ensure!(
-            status.success(),
-            "privileged helper rejected or failed; inspect retained state"
-        );
+        if !status.success() {
+            use std::os::unix::process::ExitStatusExt;
+            return Err(crate::errors::HelperFailed {
+                code: status.code(),
+                signal: status.signal(),
+            }
+            .into());
+        }
         serde_json::from_slice(&bytes).context(ReconcileRequired)
     };
     let result = tokio::time::timeout(timeout, operation)

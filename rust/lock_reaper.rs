@@ -13,6 +13,11 @@ use std::{
 use tokio::sync::watch;
 
 type Requests = BTreeMap<String, (String, String, f64)>;
+/// Unheld request/dispatch locks older than this are reclaimable once their
+/// request is completed (or proven absent). Every opener re-verifies inode
+/// identity after flock, so a short window only bounds directory churn: about
+/// two hours of locks at the hourly sweep instead of a full day.
+pub(crate) const STALE_AFTER: f64 = 3600.0;
 #[derive(Default)]
 pub(crate) struct Scan {
     directory: Option<ReadDir>,
@@ -35,7 +40,7 @@ impl Scan {
         self.directory.is_some()
     }
     fn snapshot(&self) -> Value {
-        json!({"checked":self.checked,"deleted":self.deleted,"skipped":self.skipped,"directory_entries":self.directory_entries,"directory_sampled_at":self.directory_sampled_at,"directory_scan_started_at":self.directory_started_at,"scan_error":self.scan_error,"sampled_at":crate::now(),"scan_in_progress":self.directory.is_some()})
+        json!({"checked":self.checked,"deleted":self.deleted,"skipped":self.skipped,"directory_entries":self.directory_entries,"directory_sampled_at":self.directory_sampled_at,"directory_scan_started_at":self.directory_started_at,"scan_error":self.scan_error,"stale_after_seconds":STALE_AFTER,"sampled_at":crate::now(),"scan_in_progress":self.directory.is_some()})
     }
 }
 
@@ -98,7 +103,7 @@ fn safe(metadata: &fs::Metadata) -> bool {
         && metadata.mode() & 0o010 == 0
 }
 fn old(metadata: &fs::Metadata, now: f64) -> bool {
-    (metadata.mtime() as f64) < now - 86400.0 && (metadata.ctime() as f64) < now - 86400.0
+    (metadata.mtime() as f64) < now - STALE_AFTER && (metadata.ctime() as f64) < now - STALE_AFTER
 }
 
 pub(crate) fn remove(
@@ -138,7 +143,9 @@ pub(crate) fn remove(
     if !safe(&metadata) {
         return Ok(false);
     }
-    let known_updated_old = known.map(|(_, _, at)| *at < now - 86400.0).unwrap_or(false);
+    let known_updated_old = known
+        .map(|(_, _, at)| *at < now - STALE_AFTER)
+        .unwrap_or(false);
     // Orphans and completed-with-fresh-updated_at need an aged lock before flock.
     // Completed-with-old-updated_at may reclaim without waiting on mtime/ctime.
     if (known.is_none() || !known_updated_old) && !old(&metadata, now) {
@@ -162,7 +169,7 @@ pub(crate) fn remove(
             .optional()?;
         match state {
             Some((state, at)) if state == "completed" && at.is_finite() && at >= 0.0 => {
-                if at < now - 86400.0 {
+                if at < now - STALE_AFTER {
                     require_aged_lock = false;
                 } else if old(&metadata, now) {
                     require_aged_lock = true;
