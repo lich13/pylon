@@ -2,6 +2,12 @@
 
 Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
+## v0.5.27 已移除机器人的待发投递改投
+
+- `pylon deliveries retarget <id>... --to <bot>` 或 `pylon deliveries retarget --from-bot <已移除的机器人> --to <bot>`（仅 root）：把配置中已不存在的机器人名下的待发（`pending`）文本／文件投递改由另一个已配置且启用的机器人发送。目标机器人的接收会话必须与原机器人历史送达回执中的会话完全一致（原会话未知或不一致时拒绝，输出不含会话 ID），已有回执（部分已发送）的记录、仍在配置中的来源机器人、非待发记录一律拒绝。所选记录在同一事务内全部改投或全部不变，不重置尝试次数，不会重复发送已送达的内容；`uncertain`、`sending` 等其他状态不会改投。正文中的 `reply_to_message_id` 指向原机器人会话的消息，改投时移除并在结果中标记 `reply_reference_removed`，按钮（`reply_markup`）保留。
+- 结果写入 `delivery-resolution:<id>`，保留原有字段并新增 `retargeted_from`、`retargeted_to`、`retargeted_at`、`retargeted_by`（及可选的 `reply_reference_removed`）；模块经 `delivery.get` 看到 `profile` 为新机器人、状态照常从待发变为已送达。输出只含元数据，不含正文与回执。
+- 仅新增状态字段，不改表结构；支持回退至 v0.5.26。
+
 ## v0.5.26 Telegram 连接状态、轮询退避与待核对处理
 
 - 错误分类：Telegram 请求失败带固定取值的 `class`（`timeout`、`dns`、`tls`、`connect`、`http_status`、`unauthorized`、`conflict`、`rate_limited`、`invalid_response`）以及 `http_status`、`telegram_error_code`。传输错误先去掉请求 URL（含 token）再分类，不记录原始错误文本或 Telegram 描述。

@@ -2,6 +2,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeSet,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{
@@ -70,6 +71,30 @@ pub(crate) fn align_owner(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Distinct chats in receipts of deliveries the bot completed.
+fn source_chats(db: &Connection, bot: &str) -> Result<BTreeSet<String>> {
+    let mut query = db.prepare(
+        "SELECT receipt FROM events WHERE profile=? AND status='delivered' AND receipt IS NOT NULL",
+    )?;
+    let mut chats = BTreeSet::new();
+    for receipt in query.query_map([bot], |r| r.get::<_, String>(0))? {
+        let Ok(receipt) = serde_json::from_str::<Value>(&receipt?) else {
+            continue;
+        };
+        let parts = match receipt {
+            Value::Array(parts) => parts,
+            other => vec![other],
+        };
+        for part in parts {
+            let chat = crate::telegram::numeric_id(&part["chat_id"]);
+            if !chat.is_empty() {
+                chats.insert(chat);
+            }
+        }
+    }
+    Ok(chats)
 }
 
 pub(crate) const RESOLUTION_PREFIX: &str = "delivery-resolution:";
@@ -497,6 +522,124 @@ impl Store {
                 .delivery_ready(&bot, crate::optimization::Lane::delivery(kind == "bark"));
         }
         Ok(result)
+    }
+    /// Moves pending deliveries whose bot was removed from configuration to
+    /// another configured bot, in one transaction (all or nothing). Only
+    /// untouched text/document items without receipts move, and only when
+    /// every chat the removed bot delivered to equals `target_owner`, so the
+    /// destination chat never changes and nothing already sent is re-sent.
+    /// Operator output carries metadata only.
+    pub fn retarget_deliveries(
+        &self,
+        ids: &[String],
+        target: &str,
+        target_owner: &str,
+        configured: &[String],
+        actor: &str,
+    ) -> Result<Vec<Value>> {
+        ensure!(!ids.is_empty(), "no deliveries selected");
+        ensure!(
+            configured.iter().any(|b| b == target) && !target_owner.is_empty(),
+            "target bot is not configured"
+        );
+        let mut db = self.connect()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = crate::now();
+        let mut checked_sources = BTreeSet::new();
+        let mut results = Vec::new();
+        for id in ids {
+            let row: Option<(String, String, String, Option<String>, String)> = tx
+                .query_row(
+                    "SELECT status,profile,kind,receipt,payload FROM events WHERE id=?",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()?;
+            let (status, source, kind, receipt, payload) = row.context("unknown event")?;
+            ensure!(
+                status == "pending",
+                "only pending deliveries can be retargeted"
+            );
+            ensure!(source != target, "delivery already uses the target bot");
+            ensure!(
+                !configured.contains(&source),
+                "source bot is still configured"
+            );
+            ensure!(
+                kind == "text" || kind == "document",
+                "only text or document deliveries can be retargeted"
+            );
+            let partial = receipt
+                .as_deref()
+                .and_then(|r| serde_json::from_str::<Value>(r).ok())
+                .is_some_and(|r| !r.is_null() && r.as_array().is_none_or(|a| !a.is_empty()));
+            ensure!(!partial, "delivery already has a receipt");
+            if !checked_sources.contains(&source) {
+                let chats = source_chats(&tx, &source)?;
+                ensure!(
+                    !chats.is_empty(),
+                    "original chat of the removed bot is unknown"
+                );
+                ensure!(
+                    chats.len() == 1 && chats.contains(target_owner),
+                    "target bot delivers to a different chat"
+                );
+                checked_sources.insert(source.clone());
+            }
+            // Message ids belong to the old bot's conversation; a reply
+            // reference would fail or point elsewhere through another bot.
+            let mut payload: Value =
+                serde_json::from_str(&payload).context("invalid delivery payload")?;
+            let reply_removed = payload
+                .as_object_mut()
+                .and_then(|p| p.remove("reply_to_message_id"))
+                .is_some();
+            let changed = tx.execute(
+                "UPDATE events SET profile=?,payload=?,next_attempt=?,updated_at=? WHERE id=? AND status='pending' AND profile=?",
+                params![target, payload.to_string(), now, now, id, source],
+            )?;
+            ensure!(changed == 1, "delivery changed concurrently");
+            let key = format!("{RESOLUTION_PREFIX}{id}");
+            let old: Option<String> = tx
+                .query_row("SELECT value FROM kv WHERE key=?", [&key], |r| r.get(0))
+                .optional()?;
+            let mut resolution = old
+                .and_then(|v| serde_json::from_str::<Value>(&v).ok())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            resolution["retargeted_from"] = json!(source);
+            resolution["retargeted_to"] = json!(target);
+            resolution["retargeted_at"] = json!(now);
+            resolution["retargeted_by"] = json!(actor);
+            if reply_removed {
+                resolution["reply_reference_removed"] = json!(true);
+            }
+            tx.execute(
+                "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, resolution.to_string()],
+            )?;
+            let mut result = self.event_on(&tx, id)?.context("unknown event")?;
+            if let Some(object) = result.as_object_mut() {
+                let receipt = object.remove("receipt").unwrap_or(Value::Null);
+                object.insert("has_receipt".into(), json!(!receipt.is_null()));
+            }
+            results.push(result);
+        }
+        tx.commit()?;
+        self.runtime
+            .delivery_ready(target, crate::optimization::Lane::delivery(false));
+        Ok(results)
+    }
+    /// Pending delivery ids still bound to `bot`.
+    pub fn pending_for_bot(&self, bot: &str) -> Result<Vec<String>> {
+        let db = self.connect()?;
+        let mut query = db.prepare(
+            "SELECT id FROM events WHERE status='pending' AND profile=? ORDER BY created_at,id",
+        )?;
+        let ids = query
+            .query_map([bot], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
     }
     pub fn cancel(&self, module: &str, id: &str) -> Result<Value> {
         self.cancel_or_insert(module, id, None)
@@ -1133,6 +1276,178 @@ mod resolution_tests {
                 0.0,
             )
             .unwrap();
+    }
+
+    fn queued(store: &Store, id: &str, bot: &str) {
+        store
+            .submit(
+                "fixture",
+                &json!({"id":id,"kind":"text","payload":{"text":"private body"}}),
+                bot,
+            )
+            .unwrap();
+    }
+
+    fn delivered(store: &Store, id: &str, bot: &str, chat: i64) {
+        queued(store, id, bot);
+        assert_eq!(store.claim(bot).unwrap().unwrap()["id"], id);
+        store
+            .finish(
+                id,
+                "delivered",
+                Some(&json!([{"message_id":9,"chat_id":chat}])),
+                "",
+                0.0,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn retarget_moves_orphaned_pending_deliveries_to_same_chat_bot() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::new(&temporary.path().join("state.sqlite3")).unwrap();
+        let configured = vec!["new".to_string(), "other".to_string()];
+        delivered(&store, "old-history", "old", 4242);
+        queued(&store, "orphan-a", "old");
+        store
+            .submit(
+                "fixture",
+                &json!({"id":"orphan-b","kind":"text","payload":{"text":"private body","reply_to_message_id":9}}),
+                "old",
+            )
+            .unwrap();
+        queued(&store, "live", "other");
+        queued(&store, "unknown-history", "ghost");
+        assert_eq!(
+            store.pending_for_bot("old").unwrap(),
+            vec!["orphan-a".to_string(), "orphan-b".to_string()]
+        );
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // A different destination chat refuses everything; nothing moves.
+        let error = store
+            .retarget_deliveries(
+                &ids(&["orphan-a", "orphan-b"]),
+                "new",
+                "999",
+                &configured,
+                "uid:0",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("different chat"));
+        assert!(!error.to_string().contains("4242"));
+        assert_eq!(store.event("orphan-a").unwrap()["profile"], "old");
+        // Bots still configured, unknown history, unknown targets and empty
+        // selections are refused; a refusal anywhere rolls back the batch.
+        assert!(
+            store
+                .retarget_deliveries(&ids(&["live"]), "new", "4242", &configured, "uid:0")
+                .is_err()
+        );
+        assert!(
+            store
+                .retarget_deliveries(
+                    &ids(&["unknown-history"]),
+                    "new",
+                    "4242",
+                    &configured,
+                    "uid:0"
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .retarget_deliveries(&ids(&["orphan-a"]), "gone", "4242", &configured, "uid:0")
+                .is_err()
+        );
+        assert!(
+            store
+                .retarget_deliveries(&[], "new", "4242", &configured, "uid:0")
+                .is_err()
+        );
+        assert!(
+            store
+                .retarget_deliveries(
+                    &ids(&["orphan-a", "old-history"]),
+                    "new",
+                    "4242",
+                    &configured,
+                    "uid:0"
+                )
+                .is_err()
+        );
+        assert_eq!(store.event("orphan-a").unwrap()["profile"], "old");
+
+        let moved = store
+            .retarget_deliveries(
+                &ids(&["orphan-a", "orphan-b"]),
+                "new",
+                "4242",
+                &configured,
+                "uid:0",
+            )
+            .unwrap();
+        assert_eq!(moved.len(), 2);
+        let text = serde_json::to_string(&moved).unwrap();
+        assert!(!text.contains("4242") && !text.contains("private body"));
+        assert_eq!(moved[0]["profile"], "new");
+        assert_eq!(moved[0]["status"], "pending");
+        assert_eq!(moved[0]["resolution"]["retargeted_from"], "old");
+        assert_eq!(moved[0]["resolution"]["retargeted_by"], "uid:0");
+        // Modules see the move through delivery.get; it applies once.
+        assert_eq!(
+            store.event("orphan-b").unwrap()["resolution"]["retargeted_to"],
+            "new"
+        );
+        assert!(
+            store
+                .retarget_deliveries(&ids(&["orphan-a"]), "new", "4242", &configured, "uid:0")
+                .is_err()
+        );
+        assert!(store.pending_for_bot("old").unwrap().is_empty());
+        assert!(store.claim("old").unwrap().is_none());
+        assert!(
+            moved[0]["resolution"]
+                .get("reply_reference_removed")
+                .is_none()
+        );
+        assert_eq!(moved[1]["resolution"]["reply_reference_removed"], true);
+        assert_eq!(store.claim("new").unwrap().unwrap()["id"], "orphan-a");
+        let claimed = store.claim("new").unwrap().unwrap();
+        assert_eq!(claimed["id"], "orphan-b");
+        assert!(claimed["payload"].get("reply_to_message_id").is_none());
+        assert_eq!(claimed["payload"]["text"], "private body");
+        assert!(store.claim("new").unwrap().is_none());
+    }
+
+    #[test]
+    fn retarget_keeps_earlier_resolution_and_refuses_partial_receipts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::new(&temporary.path().join("state.sqlite3")).unwrap();
+        let configured = vec!["new".to_string()];
+        delivered(&store, "history", "fixture", 4242);
+        uncertain(&store, "resent");
+        store.resolve_delivery("resent", "resend", "uid:0").unwrap();
+        // The resent item carries the receipt of its first attempt.
+        assert!(
+            store
+                .retarget_deliveries(&["resent".to_string()], "new", "4242", &configured, "uid:0")
+                .unwrap_err()
+                .to_string()
+                .contains("receipt")
+        );
+        queued(&store, "fresh", "fixture");
+        store
+            .put(
+                "delivery-resolution:fresh",
+                &json!({"resolution":"resend","resend_count":1}),
+            )
+            .unwrap();
+        let moved = store
+            .retarget_deliveries(&["fresh".to_string()], "new", "4242", &configured, "uid:0")
+            .unwrap();
+        assert_eq!(moved[0]["resolution"]["resend_count"], 1);
+        assert_eq!(moved[0]["resolution"]["retargeted_from"], "fixture");
     }
 
     #[test]

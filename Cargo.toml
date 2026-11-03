@@ -1,6 +1,6 @@
 [package]
 name = "pylon"
-version = "0.5.26"
+version = "0.5.27"
 edition = "2024"
 rust-version = "1.99.0"
 

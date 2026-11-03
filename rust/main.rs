@@ -107,6 +107,18 @@ enum Deliveries {
         #[arg(long)]
         accept_duplicate_risk: bool,
     },
+    /// Move pending deliveries of a removed bot to a configured bot that
+    /// delivers to the same chat. All selected items move or none do.
+    Retarget {
+        /// Delivery ids (alternatively use --from-bot).
+        ids: Vec<String>,
+        /// Select every pending delivery of this removed bot.
+        #[arg(long)]
+        from_bot: Option<String>,
+        /// Configured, enabled bot that will deliver them.
+        #[arg(long)]
+        to: String,
+    },
 }
 #[derive(Subcommand)]
 enum Modules {
@@ -444,6 +456,27 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
                         "resend can duplicate a message; pass --accept-duplicate-risk"
                     );
                     store.resolve_delivery(&id, "resend", &actor)?
+                }
+                Deliveries::Retarget { ids, from_bot, to } => {
+                    let s = config.settings()?;
+                    let target = s.bots.get(&to).context("unknown bot")?;
+                    ensure!(target.enabled, "target bot is disabled");
+                    let mut ids = ids;
+                    if let Some(source) = from_bot {
+                        ensure!(
+                            !s.bots.contains_key(&source),
+                            "source bot is still configured"
+                        );
+                        for id in store.pending_for_bot(&source)? {
+                            if !ids.contains(&id) {
+                                ids.push(id);
+                            }
+                        }
+                    }
+                    let configured = s.bots.keys().cloned().collect::<Vec<_>>();
+                    let rows =
+                        store.retarget_deliveries(&ids, &to, &target.owner, &configured, &actor)?;
+                    json!({"ok":true,"to":to,"count":rows.len(),"deliveries":rows})
                 }
             }
         }

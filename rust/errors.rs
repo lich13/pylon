@@ -274,6 +274,24 @@ pub fn cli_message(error: &Error) -> &'static str {
             "resend can duplicate a message; pass --accept-duplicate-risk" => {
                 "resend can duplicate a message; pass --accept-duplicate-risk"
             }
+            "no deliveries selected" => "no deliveries selected",
+            "unknown bot" => "unknown bot",
+            "target bot is not configured" => "target bot is not configured",
+            "target bot is disabled" => "target bot is disabled",
+            "only pending deliveries can be retargeted" => {
+                "only pending deliveries can be retargeted"
+            }
+            "delivery already uses the target bot" => "delivery already uses the target bot",
+            "source bot is still configured" => "source bot is still configured",
+            "only text or document deliveries can be retargeted" => {
+                "only text or document deliveries can be retargeted"
+            }
+            "delivery already has a receipt" => "delivery already has a receipt",
+            "original chat of the removed bot is unknown" => {
+                "original chat of the removed bot is unknown"
+            }
+            "target bot delivers to a different chat" => "target bot delivers to a different chat",
+            "invalid delivery payload" => "invalid delivery payload",
             _ => continue,
         };
         return safe;
