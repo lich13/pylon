@@ -43,9 +43,21 @@ async fn dispatch(config: &Config, store: &Store, request: &Value) -> Result<Val
 }
 
 // Job ids are unique across modules, so a grant bound only to jobs may omit `modules`.
+//
+// Module-scoped grants (v0.5.29): a grant that lists the module in `modules`
+// and either omits `origins` or lists `"module:*"`, or any grant whose
+// `origins` lists `"module:<id>"`, accepts every execution origin of that
+// module (new jobs, services, commands, callbacks, documents) without a grant
+// edit. The capability must still be declared in module.json and the helper
+// argv/trusted_paths and capabilities.json must still be root-owned. An
+// explicit empty `origins` list denies everything.
 fn authorize(grant: &Value, ctx: &Value) -> Result<()> {
+    let module = ctx["module"].as_str().unwrap_or("");
+    let origins = grant.get("origins").and_then(Value::as_array);
+    let listed = |value: &str| origins.is_some_and(|a| a.iter().any(|o| o == value));
+    let module_origin = !module.is_empty() && listed(&format!("module:{module}"));
     let job_bound = grant.get("modules").is_none()
-        && grant["origins"].as_array().is_some_and(|origins| {
+        && origins.is_some_and(|origins| {
             !origins.is_empty()
                 && origins.iter().all(|origin| {
                     origin
@@ -54,17 +66,17 @@ fn authorize(grant: &Value, ctx: &Value) -> Result<()> {
                         .is_some_and(crate::identifier)
                 })
         });
+    let module_listed = grant["modules"]
+        .as_array()
+        .is_some_and(|a| a.contains(&ctx["module"]));
     ensure!(
-        job_bound
-            || grant["modules"]
-                .as_array()
-                .is_some_and(|a| a.contains(&ctx["module"])),
+        job_bound || module_listed || module_origin,
         "capability not granted to module"
     );
+    let module_scoped =
+        module_origin || (module_listed && (grant.get("origins").is_none() || listed("module:*")));
     ensure!(
-        grant["origins"]
-            .as_array()
-            .is_some_and(|a| a.contains(&ctx["origin"])),
+        module_scoped || origins.is_some_and(|a| a.contains(&ctx["origin"])),
         "capability not granted to this execution origin"
     );
     Ok(())

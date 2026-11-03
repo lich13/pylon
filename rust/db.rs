@@ -1248,7 +1248,7 @@ fn connect(path: &Path, pool: &Arc<Mutex<Vec<Connection>>>) -> Result<PooledConn
     } else {
         let db = Connection::open(path)?;
         db.busy_handler(Some(wait_for_writer))?;
-        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
         db
     };
     Ok(PooledConnection {

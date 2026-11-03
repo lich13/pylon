@@ -124,7 +124,7 @@ fn one_buffered_file_blocks_downgrade() {
     assert_eq!(report.reason, Some("pending_completions"));
     for target in [
         "0.5.15", "0.5.16", "0.5.17", "0.5.19", "0.5.20", "0.5.21", "0.5.22", "0.5.23", "0.5.24",
-        "0.5.25", "0.5.26", "0.5.27",
+        "0.5.25", "0.5.26", "0.5.27", "0.5.28",
     ] {
         assert_eq!(
             downgrade::check(&config, target).reason,
@@ -183,7 +183,7 @@ fn active_retained_history_blocks_every_supported_target_without_writing_state()
         assert_eq!(state_snapshot(&database_path), before);
         for target in [
             "0.5.15", "0.5.16", "0.5.17", "0.5.19", "0.5.20", "0.5.21", "0.5.22", "0.5.23",
-            "0.5.24", "0.5.25", "0.5.26", "0.5.27", "0.5.27",
+            "0.5.24", "0.5.25", "0.5.26", "0.5.27", "0.5.28",
         ] {
             assert!(downgrade::check(&config, target).ok);
         }
@@ -212,7 +212,7 @@ fn malformed_retained_history_is_unavailable_and_read_only() {
         assert_eq!(state_snapshot(&database_path), before);
         for target in [
             "0.5.15", "0.5.16", "0.5.17", "0.5.19", "0.5.20", "0.5.21", "0.5.22", "0.5.23",
-            "0.5.24", "0.5.25", "0.5.26", "0.5.27", "0.5.27",
+            "0.5.24", "0.5.25", "0.5.26", "0.5.27", "0.5.28",
         ] {
             assert_eq!(
                 downgrade::check(&config, target).reason,

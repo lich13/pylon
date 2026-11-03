@@ -175,6 +175,9 @@ fn index(base: &Path) -> Result<serde_json::Value> {
 }
 fn validate_index(base: &Path, value: &serde_json::Value) -> Result<()> {
     let catalog = crate::catalog::Catalog::load_index(base.to_path_buf(), Some(value.clone()))?;
+    // A change may only reject modules the current registry already rejects.
+    let current = crate::catalog::Catalog::load_index(base.to_path_buf(), Some(index(base)?)).ok();
+    catalog.ensure_accepted(current.as_ref())?;
     for module in catalog.modules.values() {
         let entries = std::iter::once(&module.manifest.handler)
             .chain(module.manifest.jobs.values().map(|j| &j.entry))
@@ -294,26 +297,14 @@ pub fn install(
             serde_json::json!(staging.file_name().unwrap().to_string_lossy());
         validate_index(&base, &registry)?;
         if health {
-            crate::catalog::Catalog::load_index(base.clone(), Some(registry.clone()))?
-                .validate_settings(&config.settings()?)?;
+            ensure_workspaces(config, &manifest)?;
+            accept(config, &base, &registry, &manifest.id)?;
             if let Some(path) = previous.as_str() {
                 let old: crate::catalog::Manifest =
                     serde_json::from_slice(&std::fs::read(base.join(path).join("module.json"))?)?;
-                if old.data_version != manifest.data_version {
-                    ensure!(
-                        config.home.join("run/freeze").is_file(),
-                        "data version changes require frozen triggers and drained tasks"
-                    );
-                    for job in old.jobs.keys() {
-                        let status = std::process::Command::new("/usr/bin/systemctl")
-                            .args(["is-active", "--quiet", &format!("pylon-task@{job}.service")])
-                            .status()?;
-                        ensure!(
-                            !status.success(),
-                            "data version change waits for active jobs"
-                        );
-                    }
-                }
+                // Since v0.5.29 a data version change needs no global freeze:
+                // the module's own drain marker plus this active-job check suffice.
+                data_version_ready(&old, &manifest, unit_active, "change")?;
             }
             ensure_runtime(config, &manifest.id)?;
             health_candidate(
@@ -363,8 +354,7 @@ pub fn rollback(
     registry["previous"][id] = current.clone();
     validate_index(&base, &registry)?;
     if health {
-        crate::catalog::Catalog::load_index(base.clone(), Some(registry.clone()))?
-            .validate_settings(&config.settings()?)?;
+        accept(config, &base, &registry, id)?;
         let original: crate::catalog::Manifest = serde_json::from_slice(&std::fs::read(
             base.join(current.as_str().context("current module version missing")?)
                 .join("module.json"),
@@ -377,21 +367,7 @@ pub fn rollback(
             )
             .join("module.json"),
         )?)?;
-        if original.data_version != candidate.data_version {
-            ensure!(
-                config.home.join("run/freeze").is_file(),
-                "data version rollback requires frozen triggers and drained tasks"
-            );
-            for job in original.jobs.keys() {
-                ensure!(
-                    !std::process::Command::new("/usr/bin/systemctl")
-                        .args(["is-active", "--quiet", &format!("pylon-task@{job}.service")])
-                        .status()?
-                        .success(),
-                    "data version rollback waits for active jobs"
-                );
-            }
-        }
+        data_version_ready(&original, &candidate, unit_active, "rollback")?;
 
         health_candidate(
             config,
@@ -469,6 +445,7 @@ pub fn calendar(cron: &str) -> Result<String> {
 }
 pub fn check(path: &Path) -> Result<serde_json::Value> {
     let catalog = crate::catalog::Catalog::load_from(path.to_path_buf())?;
+    catalog.ensure_accepted(None)?;
     Ok(
         serde_json::json!({"api_version":2,"modules":catalog.modules.keys().collect::<Vec<_>>(),"hash":catalog.hash}),
     )
@@ -696,21 +673,36 @@ impl Drop for DrainGuard {
         let _ = std::fs::remove_file(&self.0);
     }
 }
+const STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
 fn prepare_stop(
     config: &crate::config::Config,
     catalog: &crate::catalog::Catalog,
     id: &str,
 ) -> Result<DrainGuard> {
+    prepare_stop_within(config, catalog, id, STOP_LIMIT)
+}
+fn prepare_stop_within(
+    config: &crate::config::Config,
+    catalog: &crate::catalog::Catalog,
+    id: &str,
+    limit: std::time::Duration,
+) -> Result<DrainGuard> {
     let path = config.home.join("run/drain").join(id);
     let directory = path.parent().context("destination parent missing")?;
     std::fs::create_dir_all(directory)?;
     ensure_drain_directory(directory)?;
-    // A previous interrupted deployment intentionally leaves admission frozen for inspection.
+    // Module changes are serialized, so an existing marker is a leftover of
+    // an interrupted deployment: take it over instead of failing forever.
+    if std::fs::symlink_metadata(&path).is_ok() {
+        crate::warn("stale-drain-marker", serde_json::json!({"module":id}));
+    }
     let marker = std::fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .open(&path)?;
     marker.sync_all()?;
+    let deadline = std::time::Instant::now() + limit;
     let guard = DrainGuard(path);
     let Some(module) = catalog.modules.get(id) else {
         return Ok(guard);
@@ -777,7 +769,11 @@ fn prepare_stop(
         if !active {
             return Ok(guard);
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "module stop preparation timed out after 10 minutes; tasks still active"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1).min(limit));
     }
 }
 fn activate(
@@ -905,24 +901,18 @@ pub fn change(
                 return Err(error);
             }
         };
-        let applied =
-            (|| -> Result<()> {
-                if old.modules.get(id).is_some_and(|m| {
-                    m.manifest.data_version != next.modules[id].manifest.data_version
-                }) {
-                    for job in old.modules[id].manifest.jobs.keys() {
-                        let status = std::process::Command::new("/usr/bin/systemctl")
-                            .args(["is-active", "--quiet", &format!("pylon-task@{job}.service")])
-                            .status()?;
-                        ensure!(
-                            !status.success(),
-                            "data version change waits for active jobs"
-                        );
-                    }
-                }
-                crate::config::atomic_json(&base.join("registry.json"), &candidate, 0o644)?;
-                activate(config, &old, &next, id)
-            })();
+        let applied = (|| -> Result<()> {
+            if let Some(before) = old.modules.get(id) {
+                data_version_ready(
+                    &before.manifest,
+                    &next.modules.get(id).context("module missing")?.manifest,
+                    unit_active,
+                    "change",
+                )?;
+            }
+            crate::config::atomic_json(&base.join("registry.json"), &candidate, 0o644)?;
+            activate(config, &old, &next, id)
+        })();
         if let Err(error) = applied {
             crate::config::atomic_json(&base.join("registry.json"), &original, 0o644)?;
             let restored = if old.modules.contains_key(id) {
@@ -962,6 +952,97 @@ pub fn change(
     Ok(result)
 }
 
+fn unit_active(unit: &str) -> Result<bool> {
+    Ok(std::process::Command::new("/usr/bin/systemctl")
+        .args(["is-active", "--quiet", unit])
+        .status()?
+        .success())
+}
+/// A data version change waits only for the module's own active jobs; the
+/// per-module drain marker already stops new runs of this module.
+fn data_version_ready(
+    before: &crate::catalog::Manifest,
+    after: &crate::catalog::Manifest,
+    active: impl Fn(&str) -> Result<bool>,
+    action: &str,
+) -> Result<()> {
+    if before.data_version == after.data_version {
+        return Ok(());
+    }
+    for job in before.jobs.keys() {
+        if active(&format!("pylon-task@{job}.service"))? {
+            anyhow::bail!(if action == "rollback" {
+                "data version rollback waits for active jobs"
+            } else {
+                "data version change waits for active jobs"
+            });
+        }
+    }
+    Ok(())
+}
+/// Install and rollback reject only the candidate: other modules the current
+/// configuration already rejects stay rejected without blocking the change.
+fn accept(
+    config: &crate::config::Config,
+    base: &Path,
+    registry: &serde_json::Value,
+    id: &str,
+) -> Result<()> {
+    let settings = config.settings()?;
+    let mut next = crate::catalog::Catalog::load_index(base.to_path_buf(), Some(registry.clone()))?;
+    next.apply_settings(&settings);
+    if let Some(reason) = next.rejected.get(id) {
+        anyhow::bail!("{reason}");
+    }
+    let mut current = crate::catalog::Catalog::load_index(base.to_path_buf(), Some(index(base)?))?;
+    current.apply_settings(&settings);
+    next.ensure_accepted(Some(&current))
+}
+/// Register workspaces a module names but bots.json lacks, like runtime
+/// users: root `profiles/<id>`, env `profiles/<id>/.env` (optional file).
+fn ensure_workspaces(
+    config: &crate::config::Config,
+    manifest: &crate::catalog::Manifest,
+) -> Result<()> {
+    let mut settings = config.settings()?;
+    let missing = std::iter::once(&manifest.workspace)
+        .chain(manifest.jobs.values().map(|j| &j.workspace))
+        .chain(manifest.services.values().map(|s| &s.workspace))
+        .filter(|w| crate::identifier(w) && !settings.workspaces.contains_key(*w))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        unsafe { libc::geteuid() } == 0,
+        "workspace registration requires root"
+    );
+    let profiles = config.home.join("profiles");
+    for id in &missing {
+        let root = format!("profiles/{id}");
+        let path = config.contained(&root)?;
+        if !path.exists() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            std::fs::create_dir_all(&path)?;
+            let group = std::fs::metadata(&profiles)
+                .or_else(|_| std::fs::metadata(&config.home))?
+                .gid();
+            std::os::unix::fs::lchown(&path, Some(0), Some(group))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o2770))?;
+        }
+        settings.workspaces.insert(
+            id.clone(),
+            crate::config::Workspace {
+                root,
+                env: format!("profiles/{id}/.env"),
+            },
+        );
+        crate::warn("workspace-registered", serde_json::json!({"workspace":id}));
+    }
+    crate::config::atomic_json(&config.home.join("config/bots.json"), &settings, 0o644)?;
+    Ok(())
+}
 fn ensure_runtime(config: &crate::config::Config, id: &str) -> Result<()> {
     let mut settings = config.settings()?;
     if settings.runtime_users.contains_key(id) {
@@ -1078,7 +1159,86 @@ fn collect_versions(config: &crate::config::Config) -> Result<()> {
 
 #[cfg(test)]
 mod drain_tests {
-    use super::drain_mode;
+    use super::{data_version_ready, drain_mode, prepare_stop_within};
+    use std::time::Duration;
+
+    fn module(home: &std::path::Path, data_version: u32) -> crate::catalog::Catalog {
+        let root = home.join("modules/alpha");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("job.sh"), "true\n").unwrap();
+        std::fs::write(
+            root.join("module.json"),
+            serde_json::json!({
+                "api_version":2,"data_version":data_version,"id":"alpha",
+                "handler":["bash","job.sh"],"workspace":"default",
+                "jobs":{"sync":{"name":"sync","entry":["bash","job.sh"],"workspace":"default",
+                    "topic":"personal","schedule":"0 * * * *"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        crate::catalog::Catalog::load_from(home.join("modules")).unwrap()
+    }
+
+    #[test]
+    fn stale_drain_marker_is_taken_over_and_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::new(temp.path().to_path_buf());
+        let catalog = module(temp.path(), 1);
+        let marker = temp.path().join("run/drain/alpha");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "left by an interrupted deployment").unwrap();
+        let guard = prepare_stop_within(&config, &catalog, "alpha", Duration::from_secs(5))
+            .expect("stale marker must not block a new deployment");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"");
+        drop(guard);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn stop_preparation_times_out_with_a_clear_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::new(temp.path().to_path_buf());
+        let catalog = module(temp.path(), 1);
+        std::fs::create_dir_all(temp.path().join("run")).unwrap();
+        let lock = crate::runtime::open_task_lock(&temp.path().join("run/sync.lock")).unwrap();
+        assert!(crate::runtime::try_lock(&lock).unwrap());
+        let error = match prepare_stop_within(&config, &catalog, "alpha", Duration::from_millis(50))
+        {
+            Ok(_) => panic!("held task lock must time out"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "module stop preparation timed out after 10 minutes; tasks still active"
+        );
+        assert!(!temp.path().join("run/drain/alpha").exists());
+    }
+
+    #[test]
+    fn data_version_change_needs_no_freeze_only_idle_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let before = module(temp.path(), 1).modules["alpha"].manifest.clone();
+        let after = module(temp.path(), 2).modules["alpha"].manifest.clone();
+        assert!(!temp.path().join("run/freeze").exists());
+        data_version_ready(&before, &after, |_| Ok(false), "change").unwrap();
+        data_version_ready(&before, &before, |_| Ok(true), "change").unwrap();
+        let busy = data_version_ready(
+            &before,
+            &after,
+            |unit| Ok(unit == "pylon-task@sync.service"),
+            "change",
+        );
+        assert_eq!(
+            busy.unwrap_err().to_string(),
+            "data version change waits for active jobs"
+        );
+        let busy = data_version_ready(&after, &before, |_| Ok(true), "rollback");
+        assert_eq!(
+            busy.unwrap_err().to_string(),
+            "data version rollback waits for active jobs"
+        );
+    }
 
     #[test]
     fn drain_directory_gains_list_access_without_losing_bits() {

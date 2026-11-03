@@ -1079,7 +1079,8 @@ def test_fourth_bot_and_module_reload_without_replacing_gateway_or_binary(workdi
         assert rejected.returncode != 0
         assert "duplicate or invalid command" in rejected.stderr
         assert (home / "modules/registry.json").read_bytes() == invalid_registry
-        assert _wait_stderr_line(gateway.proc, "configuration rejected", timeout=8.0)
+        # v0.5.29: the live registry rejects only the intruder module.
+        assert _wait_stderr_line(gateway.proc, '"module-rejected"', timeout=8.0)
 
         assert rpc_value(home, "health")["catalog"] == catalog_hash
         assert rpc_value(

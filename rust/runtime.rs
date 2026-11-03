@@ -766,6 +766,10 @@ pub async fn resume(config: &Config, run: &str) -> Result<i32> {
         .join(&module.manifest.id)
         .exists()
     {
+        crate::warn(
+            "job-skipped-drain",
+            json!({"module":module.manifest.id,"job":id,"run":run}),
+        );
         return Ok(0);
     }
     let lock = open_task_lock(&config.home.join("run").join(format!(

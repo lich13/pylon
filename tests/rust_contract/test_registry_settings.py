@@ -81,10 +81,16 @@ def test_hot_reload_rejects_unconfigured_job_reference_and_keeps_old_catalog(
         check = run_cli(home, "check")
         assert check.returncode != 0
         assert error_fragment in check.stderr
-        rejected_line = _wait_stderr_line(
-            gateway.proc, "configuration rejected", timeout=8.0
-        )
+        # v0.5.29: only the offending module is rejected; the rest keeps serving.
+        rejected_line = _wait_stderr_line(gateway.proc, '"module-rejected"', timeout=8.0)
         assert rejected_line is not None
+        warning = json.loads(rejected_line)
+        assert warning["event"] == "warning"
+        assert warning["module"] == "candidate"
+        assert warning["reason"] == error_fragment
+        diagnostics = rpc_value(home, "diagnostics")
+        assert diagnostics["modules_rejected"] == {"candidate": error_fragment}
+        assert diagnostics["configuration_rejected"] is None
         assert rpc_value(home, "health")["catalog"] == catalog_hash
 
         still_active = rpc_value(
@@ -134,3 +140,44 @@ def test_fixture_job_runs_when_workspace_env_is_omitted(workdir, telegram):
     assert result.returncode == 0, result.stderr or result.stdout
     assert json.loads(result.stdout.strip()) == {"task": "job_alpha", "status": "ok"}
     assert (home / "data/model-runs").read_text(encoding="utf-8") == "started\n"
+
+
+def test_unrouted_topic_falls_back_to_default_bot_with_warning(workdir, telegram):
+    home = workdir / "home"
+    seed_home(
+        home,
+        telegram,
+        [("bot_one", "101"), ("default", "101")],
+        [{"id": "alpha", "topic": "topic_alpha", "job_id": "job_alpha"}],
+        {"topic_alpha": "bot_one"},
+    )
+
+    with running_gateway(home, telegram) as gateway:
+        write_module(
+            home / "modules/candidate",
+            "candidate",
+            "topic_unrouted",
+            job_id="job_candidate",
+        )
+        write_registry(home / "modules", ["alpha", "candidate"])
+        line = _wait_stderr_line(gateway.proc, '"route-fallback"', timeout=8.0)
+        assert line is not None
+        warning = json.loads(line)
+        assert warning["bot"] == "default"
+        assert warning["topics"] == ["topic_unrouted"]
+        diagnostics = rpc_value(home, "diagnostics")
+        assert diagnostics["route_fallback"] == {
+            "bot": "default",
+            "topics": ["topic_unrouted"],
+        }
+        assert diagnostics["modules_rejected"] == {}
+        context = rpc_value(
+            home,
+            "context.open",
+            {"module": "candidate", "subject": "job:job_candidate"},
+        )
+        assert context["bot"] == "default"
+        routed = rpc_value(
+            home, "context.open", {"module": "alpha", "subject": "job:job_alpha"}
+        )
+        assert routed["bot"] == "bot_one"

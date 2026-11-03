@@ -13,8 +13,10 @@ import pytest
 from test_gateway_contract import (
     FakeTelegram,
     Gateway,
+    assert_rpc_rejected,
     event_row,
     open_context,
+    rpc,
     rpc_value,
     run_cli,
     seed_home,
@@ -49,7 +51,7 @@ def performance_telegram():
 
 def _diagnostics(home: Path) -> dict:
     value = rpc_value(home, "diagnostics")
-    assert value["version"] == "0.5.28"
+    assert value["version"] == "0.5.29"
     optimization = value["metrics"].get("optimization")
     assert isinstance(optimization, dict)
     assert OPTIMIZATION_KEYS <= optimization.keys()
@@ -185,26 +187,31 @@ def test_invalid_reload_and_credential_changes_keep_snapshot_and_recover(
             {"module": "alpha", "subject": "job:job_alpha"},
         )
 
+        # v0.5.29: an invalid manifest rejects only that module, never the
+        # whole configuration; the rest of the catalog keeps serving.
         manifest_path.write_text("{\"api_version\":2,\"id\":\"alpha\"", encoding="utf-8")
         rejected = wait_for(
             lambda: (
                 value
-                if (value := _diagnostics(home))["configuration_rejected"]
+                if "alpha" in (value := _diagnostics(home))["modules_rejected"]
                 else None
             ),
             timeout=14.0,
         )
-        assert rejected["configuration_rejected"]
+        assert rejected["modules_rejected"]["alpha"] == "invalid module manifest"
+        assert rejected["configuration_rejected"] is None
+        assert_rpc_rejected(
+            rpc(home, "context.open", {"module": "alpha", "subject": "job:job_alpha"})
+        )
+
+        manifest_path.write_bytes(manifest_bytes)
+        wait_for(lambda: not _diagnostics(home)["modules_rejected"], timeout=14.0)
         assert rpc_value(home, "health")["catalog"] == original_catalog
         assert rpc_value(
             home,
             "context.open",
             {"module": "alpha", "subject": "job:job_alpha"},
         )["module_hash"] == original_context["module_hash"]
-
-        manifest_path.write_bytes(manifest_bytes)
-        wait_for(lambda: _diagnostics(home)["configuration_rejected"] is None, timeout=14.0)
-        assert rpc_value(home, "health")["catalog"] == original_catalog
 
         # A changed credential with unsafe permissions must be rejected while
         # the previously validated snapshot continues serving context requests.

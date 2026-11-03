@@ -487,6 +487,7 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
             let s = config.settings()?;
             config.validate_credentials(&s)?;
             let c = pylon::catalog::Catalog::load(&config)?;
+            c.ensure_accepted(None)?;
             json!({"ok":true,"version":env!("CARGO_PKG_VERSION"),"bots":s.bots.keys().collect::<Vec<_>>(),"modules":c.modules.keys().collect::<Vec<_>>()})
         }
         Command::Rpc { method, params } => {

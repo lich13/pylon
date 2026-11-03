@@ -113,3 +113,58 @@ fn job_bound_grants_may_omit_modules() {
     );
     assert_eq!(check(scoped, "content", "command"), module_denied);
 }
+
+fn grant_allows(grant: Value, module: &str, origin: &str) -> std::result::Result<(), String> {
+    authorize(&grant, &json!({"module":module,"origin":origin})).map_err(|e| e.to_string())
+}
+
+#[test]
+fn exact_job_grants_keep_working() {
+    let grant = json!({"origins":["job:alpha-sync"]});
+    assert!(grant_allows(grant.clone(), "alpha", "job:alpha-sync").is_ok());
+    assert_eq!(
+        grant_allows(grant, "alpha", "job:alpha-new").unwrap_err(),
+        "capability not granted to this execution origin"
+    );
+    let grant = json!({"modules":["ops"],"origins":["command","job:ops-sync"]});
+    assert!(grant_allows(grant.clone(), "ops", "command").is_ok());
+    assert!(grant_allows(grant.clone(), "ops", "job:ops-sync").is_ok());
+    assert!(grant_allows(grant.clone(), "ops", "job:ops-new").is_err());
+    assert_eq!(
+        grant_allows(grant, "other", "command").unwrap_err(),
+        "capability not granted to module"
+    );
+}
+
+#[test]
+fn module_scoped_grant_accepts_a_new_job_without_grant_edit() {
+    for grant in [
+        json!({"modules":["ops"]}),
+        json!({"modules":["ops"],"origins":["module:*"]}),
+        json!({"origins":["module:ops"]}),
+        json!({"modules":["gmail"],"origins":["command","module:ops"]}),
+    ] {
+        for origin in [
+            "job:ops-added-later",
+            "service:worker",
+            "command",
+            "callback",
+            "document",
+        ] {
+            assert!(
+                grant_allows(grant.clone(), "ops", origin).is_ok(),
+                "{grant} {origin}"
+            );
+        }
+        assert_eq!(
+            grant_allows(grant.clone(), "other", "job:ops-added-later").unwrap_err(),
+            "capability not granted to module",
+            "{grant}"
+        );
+    }
+    // `module:*` only widens origins for modules the grant lists.
+    assert!(grant_allows(json!({"origins":["module:*"]}), "ops", "command").is_err());
+    // An explicit empty origin list still denies everything.
+    assert!(grant_allows(json!({"modules":["ops"],"origins":[]}), "ops", "command").is_err());
+    assert!(grant_allows(json!({}), "ops", "command").is_err());
+}

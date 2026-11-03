@@ -35,6 +35,7 @@ pub struct App {
 impl App {
     pub fn new(config: Config) -> Result<Self> {
         let (snapshot, inputs) = crate::reload::load(&config)?;
+        crate::catalog::Catalog::warn_changes(None, &snapshot.catalog);
         let store = Store::new(&config.db())?;
         store
             .runtime
@@ -79,7 +80,11 @@ impl App {
         let Some((snapshot, inputs)) = candidate else {
             return Ok(false);
         };
-        *self.snapshot.write().await = Arc::new(snapshot);
+        {
+            let mut current = self.snapshot.write().await;
+            crate::catalog::Catalog::warn_changes(Some(&current.catalog), &snapshot.catalog);
+            *current = Arc::new(snapshot);
+        }
         *guard = Some(Arc::new(inputs));
         if force {
             self.reloaded.notify_one();
@@ -147,7 +152,7 @@ async fn rebind(app: &App, ctx: &mut Value) {
     let route = match snapshot.settings.route_overrides.get(topic.as_str()) {
         // Only consult connection state when an override needs it.
         Some(_) => snapshot.settings.effective_route(&app.store, topic),
-        None => snapshot.settings.routes.get(topic.as_str()).cloned(),
+        None => snapshot.settings.route_base(topic),
     };
     if let Some(route) = route
         && route != stored
@@ -674,6 +679,6 @@ fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
         .flatten();
     let freeze_alert = app.store.get("freeze-alert:last")?;
     Ok(
-        json!({"api_version":2,"metrics":{"storage":storage,"retention":retention,"optimization":app.store.runtime.metrics.snapshot(),"sqlite_busy":crate::db::busy_count(),"telegram_proxy_invalid":proxy_invalid,"telegram_response_invalid":response_invalid,"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"completions_pending":completions_pending,"sampled_at":crate::now(),"maintenance":freeze_present,"freeze":{"present":freeze_present,"age_seconds":freeze_age_seconds,"alert_after_seconds":snapshot.settings.admission.freeze_alert_after_seconds,"last_alert":freeze_alert},"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"settings_digest":crate::config::settings_digest(&snapshot.settings),"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
+        json!({"api_version":2,"metrics":{"storage":storage,"retention":retention,"optimization":app.store.runtime.metrics.snapshot(),"sqlite_busy":crate::db::busy_count(),"telegram_proxy_invalid":proxy_invalid,"telegram_response_invalid":response_invalid,"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"completions_pending":completions_pending,"sampled_at":crate::now(),"maintenance":freeze_present,"freeze":{"present":freeze_present,"age_seconds":freeze_age_seconds,"alert_after_seconds":snapshot.settings.admission.freeze_alert_after_seconds,"last_alert":freeze_alert},"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"modules_rejected":snapshot.catalog.rejected,"route_fallback":{"bot":snapshot.catalog.fallback_bot,"topics":snapshot.catalog.fallback_topics},"configuration_rejected":app.store.get("configuration-rejected")?,"settings_digest":crate::config::settings_digest(&snapshot.settings),"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
     )
 }

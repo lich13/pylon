@@ -81,6 +81,25 @@ pub const MESSAGES: &[&str] = &[
     "unknown route bot",
     "notification topic is not configured",
     "service topic is not configured",
+    "task topic is not configured",
+    "task workspace is not configured",
+    "module workspace is not configured",
+    "service workspace is not configured",
+    "invalid module manifest",
+    "module files unreadable",
+    "invalid module",
+    "invalid module protocol or identity",
+    "invalid module entrypoint",
+    "invalid command description",
+    "duplicate callback",
+    "duplicate or invalid job",
+    "invalid lock",
+    "invalid job workspace or timeout",
+    "invalid service",
+    "missing module dependency",
+    "cyclic module dependency",
+    "module stop preparation timed out after 10 minutes; tasks still active",
+    "workspace registration requires root",
 ];
 
 pub fn is_root() -> bool {
@@ -195,9 +214,11 @@ pub async fn run(
     let new_settings = config.settings_from_bytes(&new_bytes)?;
     check_credentials(config, &new_settings, &change.secrets)?;
     if config.home.join("modules").is_dir()
-        && crate::catalog::Catalog::load_with_settings(config, &settings).is_ok()
+        && let Ok(current) = crate::catalog::Catalog::load_with_settings(config, &settings)
     {
-        crate::catalog::Catalog::load_with_settings(config, &new_settings)?;
+        // A change may not reject a module the current configuration accepts.
+        let next = crate::catalog::Catalog::load_with_settings(config, &new_settings)?;
+        next.ensure_accepted(Some(&current))?;
     }
     let deliveries = plan_deliveries(&ctx, &change.db)?;
     if !change.db.is_empty()
@@ -1134,7 +1155,11 @@ pub fn bots_menu_resync(ctx: &Ctx, ids: &[String], all: bool) -> Result<Change> 
 }
 
 pub fn routes_set(ctx: &Ctx, topic: &str, bot: &str) -> Result<Change> {
-    ensure!(crate::identifier(topic), "invalid topic");
+    // `*` names the fallback bot for topics without their own route.
+    ensure!(
+        topic == crate::config::FALLBACK_TOPIC || crate::identifier(topic),
+        "invalid topic"
+    );
     ensure!(ctx.bot(bot)?.enabled, "target bot is disabled");
     let mut raw = ctx.raw.clone();
     object(&mut raw, "routes").insert(topic.into(), json!(bot));
@@ -1246,9 +1271,13 @@ pub fn routes_list(config: &Config) -> Result<Value> {
     let rows = topics
         .into_iter()
         .map(|topic| {
-            let effective = match &store {
-                Some(store) => settings.effective_route(store, topic),
-                None => settings.effective_route_with(topic, now, |_| Value::Null),
+            let effective = if topic.as_str() == crate::config::FALLBACK_TOPIC {
+                settings.fallback_bot().map(str::to_owned)
+            } else {
+                match &store {
+                    Some(store) => settings.effective_route(store, topic),
+                    None => settings.effective_route_with(topic, now, |_| Value::Null),
+                }
             };
             let o = settings.route_overrides.get(topic).map(|o| {
                 json!({"bot":o.bot,"until":o.until,"revert_when_healthy":o.revert_when_healthy,
@@ -1259,7 +1288,7 @@ pub fn routes_list(config: &Config) -> Result<Value> {
             json!({"topic":topic,"base":settings.routes.get(topic),"override":o,"effective":effective})
         })
         .collect::<Vec<_>>();
-    Ok(json!({"routes":rows}))
+    Ok(json!({"routes":rows,"fallback":settings.fallback_bot()}))
 }
 
 /// Bots with state; owners and credentials are never shown.

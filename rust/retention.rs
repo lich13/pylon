@@ -16,7 +16,7 @@ use std::{
 use tokio::sync::watch;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Policy {
     pub enabled: bool,
     pub updates_per_bot: u32,
@@ -25,6 +25,9 @@ pub struct Policy {
     pub requests_days: u32,
     pub placeholders_days: u32,
     pub expired_days: u32,
+    /// Ignored keys, kept on rewrite and reported once with a warning.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, serde_json::Value>,
 }
 impl Default for Policy {
     fn default() -> Self {
@@ -36,6 +39,7 @@ impl Default for Policy {
             requests_days: 30,
             placeholders_days: 90,
             expired_days: 1,
+            unknown: Default::default(),
         }
     }
 }

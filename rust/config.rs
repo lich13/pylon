@@ -27,7 +27,7 @@ fn yes() -> bool {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Admission {
     /// Alert when run/freeze has existed at least this long (seconds).
     pub freeze_alert_after_seconds: u64,
@@ -37,6 +37,9 @@ pub struct Admission {
     pub recovery_concurrency: u32,
     /// Truncate SQLite WAL when it reaches this many bytes (default 32 MiB).
     pub wal_checkpoint_bytes: u64,
+    /// Keys a newer or older release understands; kept and ignored with a warning.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_json::Value>,
 }
 impl Default for Admission {
     fn default() -> Self {
@@ -45,6 +48,7 @@ impl Default for Admission {
             freeze_alert_repeat_seconds: 1800,
             recovery_concurrency: 4,
             wal_checkpoint_bytes: 32 * 1024 * 1024,
+            unknown: BTreeMap::new(),
         }
     }
 }
@@ -150,7 +154,7 @@ impl Settings {
         now: f64,
         connection: impl Fn(&str) -> Value,
     ) -> Option<String> {
-        let base = self.routes.get(topic);
+        let base = self.route_base(topic);
         if let Some(o) = self.route_overrides.get(topic)
             && o.until.is_none_or(|until| now < until)
             && self.bots.get(&o.bot).is_some_and(|b| b.enabled)
@@ -166,7 +170,33 @@ impl Settings {
                 return Some(o.bot.clone());
             }
         }
-        base.cloned()
+        base
+    }
+    /// Bot for topics without an explicit `routes` entry: `routes["*"]` when
+    /// configured, otherwise bot `default` when it exists and is enabled.
+    pub fn fallback_bot(&self) -> Option<&str> {
+        if let Some(bot) = self.routes.get(FALLBACK_TOPIC) {
+            return Some(bot.as_str());
+        }
+        self.bots
+            .get(DEFAULT_BOT)
+            .is_some_and(|b| b.enabled)
+            .then_some(DEFAULT_BOT)
+    }
+    /// The configured route of a topic, falling back to [`Self::fallback_bot`].
+    pub fn route_base(&self, topic: &str) -> Option<String> {
+        if topic.is_empty() || topic == FALLBACK_TOPIC {
+            return None;
+        }
+        self.routes
+            .get(topic)
+            .map(String::as_str)
+            .or_else(|| self.fallback_bot())
+            .map(str::to_owned)
+    }
+    /// Whether `topic` is served only through the fallback route.
+    pub fn routes_by_fallback(&self, topic: &str) -> bool {
+        !topic.is_empty() && !self.routes.contains_key(topic) && self.fallback_bot().is_some()
     }
     pub fn effective_route(&self, store: &crate::db::Store, topic: &str) -> Option<String> {
         self.effective_route_with(topic, crate::now(), |bot| {
@@ -180,6 +210,10 @@ impl Settings {
         o.until.is_some_and(|until| now >= until)
     }
 }
+/// `routes` key naming the bot for every topic without its own entry.
+pub const FALLBACK_TOPIC: &str = "*";
+/// Implicit fallback bot when `routes["*"]` is absent.
+pub const DEFAULT_BOT: &str = "default";
 fn default_ip_family() -> String {
     "ipv4".into()
 }
@@ -226,6 +260,8 @@ impl Config {
         let s: Settings = serde_json::from_slice(bytes)?;
         s.retention.validate()?;
         s.admission.validate()?;
+        warn_unknown("admission", s.admission.unknown.keys());
+        warn_unknown("retention", s.retention.unknown.keys());
         ensure!(
             ["ipv4", "ipv6", "auto"].contains(&s.telegram_ip_family.as_str()),
             "invalid Telegram address family"
@@ -251,6 +287,7 @@ impl Config {
                 crate::identifier(topic) && enabled(&o.bot),
                 "route override bot must exist and be enabled"
             );
+            // Overrides apply only to explicitly routed topics, never to `*`.
             let base = s
                 .routes
                 .get(topic)
@@ -504,6 +541,24 @@ pub fn read_env(path: &Path) -> Result<BTreeMap<String, String>> {
         }
     }
     Ok(values)
+}
+/// Warn once per process for each ignored policy key.
+fn warn_unknown<'a>(section: &'static str, keys: impl Iterator<Item = &'a String>) {
+    static SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    for key in keys {
+        if seen.insert(format!("{section}.{key}")) {
+            let key = if crate::identifier(key) {
+                key.as_str()
+            } else {
+                "<invalid>"
+            };
+            crate::warn(
+                "unknown-config-key",
+                serde_json::json!({"section":section,"key":key}),
+            );
+        }
+    }
 }
 pub fn atomic_json(path: &Path, value: &impl Serialize, mode: u32) -> Result<()> {
     let parent = path.parent().context("missing parent")?;

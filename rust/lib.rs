@@ -41,6 +41,15 @@ pub(crate) fn child_identity(command: &mut std::process::Command, uid: u32, gid:
     }
 }
 
+/// One structured warning line on stderr (journal). Callers pass only
+/// program-owned identifiers, never payloads, tokens or chat ids.
+pub fn warn(kind: &'static str, fields: serde_json::Value) {
+    let mut line = serde_json::json!({"event":"warning","kind":kind,"at":now()});
+    if let (Some(line), serde_json::Value::Object(fields)) = (line.as_object_mut(), fields) {
+        line.extend(fields);
+    }
+    eprintln!("{line}");
+}
 pub fn now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

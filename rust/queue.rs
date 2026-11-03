@@ -155,7 +155,7 @@ pub fn connect(config: &Config) -> Result<crate::db::PooledConnection> {
     if initialized.get(&path) == Some(&identity) {
         return Ok(db);
     }
-    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
         CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY,job_id TEXT NOT NULL,module TEXT NOT NULL,topic TEXT NOT NULL,model INTEGER NOT NULL,state TEXT NOT NULL,created_at REAL NOT NULL,updated_at REAL NOT NULL,execution_status TEXT,completion_status TEXT,detail TEXT NOT NULL DEFAULT '',report TEXT,token TEXT,owner INTEGER,completion_input TEXT);
         CREATE UNIQUE INDEX IF NOT EXISTS waiting_task ON requests(job_id) WHERE state='queued';
         CREATE TABLE IF NOT EXISTS triggers(id TEXT PRIMARY KEY,request_id TEXT NOT NULL);
@@ -329,7 +329,8 @@ pub fn public(config: &Config) -> Value {
 }
 pub fn report(config: &Config, id: &str, token: &str, value: &Value) -> Result<()> {
     connect(config)?.execute("UPDATE requests SET state='reporting',report=?,token=?,execution_status=?,completion_status=?,detail=?,updated_at=? WHERE id=?",params![value.to_string(),token,value["execution_status"].as_str(),value["completion_status"].as_str(),value["detail"].as_str().unwrap_or(""),now(),id])?;
-    summary(config)
+    // The caller publishes one final summary_flush per run.
+    Ok(())
 }
 pub async fn flush(config: &Config, id: &str) -> Result<()> {
     let (report, token): (String, String) = connect(config)?.query_row(
@@ -344,7 +345,6 @@ pub async fn flush(config: &Config, id: &str) -> Result<()> {
         "UPDATE requests SET state='completed',updated_at=?,token=NULL,report=NULL,completion_input=CASE WHEN completion_status='ok' THEN NULL ELSE completion_input END WHERE id=?",
         params![now(), id],
     )?;
-    summary(config)?;
     let _ = crate::api::rpc(config, "context.close", json!({}), &token).await;
     Ok(())
 }
