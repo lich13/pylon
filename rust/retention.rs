@@ -1,6 +1,6 @@
 //! Bounded, cooperative maintenance; no retention work runs on a request path.
 use crate::{config::Config, db::Store};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -235,15 +235,6 @@ const SWEEP_SCANNED: usize = 2_000_000;
 const SWEEP_DELETED: usize = 200_000;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(86_400);
 
-#[derive(Debug)]
-struct CompletionPending;
-impl std::fmt::Display for CompletionPending {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("completion_pending")
-    }
-}
-impl std::error::Error for CompletionPending {}
-
 pub(crate) fn batch(
     db: &mut Connection,
     kind: Kind,
@@ -255,15 +246,6 @@ pub(crate) fn batch(
     let limit = limit.min(BATCH);
     ensure!(limit > 0, "invalid retention batch limit");
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    // A terminal row may still have a committed completion whose unlink failed.
-    // Check after taking the writer lock: new work cannot become an eligible
-    // terminal row between this check and deletion.
-    if matches!(kind, Kind::Events | Kind::Updates)
-        && crate::completion::pending_count(Path::new(tx.path().context("state path missing")?))?
-            > 0
-    {
-        return Err(CompletionPending.into());
-    }
     let mut result = Batch::default();
     let mut next = cursor.clone();
     if matches!(kind, Kind::History | Kind::Orphans) {
@@ -292,11 +274,15 @@ pub(crate) fn batch(
                 }
                 crate::event_history::expires(&key, &raw)? <= now
             } else {
-                !tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?)",
-                    [key.trim_start_matches("run-result:")],
-                    |r| r.get::<_, bool>(0),
-                )?
+                // Fold a legacy result key into its run row; orphans just go.
+                result.add(
+                    "run_results_folded",
+                    tx.execute(
+                        "UPDATE runs SET result=coalesce(result,?) WHERE id=?",
+                        params![raw, key.trim_start_matches("run-result:")],
+                    )?,
+                );
+                true
             };
             if delete {
                 result.add(
@@ -479,9 +465,6 @@ pub(crate) fn batch(
 }
 
 fn error_code(error: &anyhow::Error) -> &'static str {
-    if error.is::<CompletionPending>() {
-        return "completion_pending";
-    }
     if error.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
         matches!(
             e.sqlite_error_code(),
@@ -570,14 +553,7 @@ async fn sweep(
                     return;
                 }
                 Err(error) => {
-                    metrics.finish(
-                        if error.is::<CompletionPending>() {
-                            "deferred"
-                        } else {
-                            "failed"
-                        },
-                        Some(error_code(&error)),
-                    );
+                    metrics.finish("failed", Some(error_code(&error)));
                     return;
                 }
             }
@@ -727,7 +703,6 @@ pub(crate) async fn gateway(app: crate::api::App, mut stop: watch::Receiver<bool
 pub(crate) async fn executor(config: Config, mut stop: watch::Receiver<bool>) {
     let mut cursors = BTreeMap::new();
     let metrics = Metrics::default();
-    let mut locks = crate::lock_reaper::Scan::default();
     let mut maintenance = Maintenance::new(&config);
     while !*stop.borrow() {
         let frozen = config.home.join("run/freeze").exists();
@@ -741,31 +716,33 @@ pub(crate) async fn executor(config: Config, mut stop: watch::Receiver<bool>) {
                 let thawed = maintenance.observe(frozen, recovery.completed_at);
                 if !frozen {
                     let due = maintenance.sweep_due();
-                    if settings.retention.enabled {
-                        if maintenance.retention_due() {
-                            sweep(
-                                &config,
-                                None,
-                                &settings.retention,
-                                &[Kind::Requests],
-                                &mut cursors,
-                                &metrics,
-                                &mut stop,
-                            )
-                            .await;
-                            executor_metrics()
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .entry(config.home.clone())
-                                .or_default()
-                                .retention = metrics.snapshot();
-                            maintenance.retained();
+                    if settings.retention.enabled && maintenance.retention_due() {
+                        sweep(
+                            &config,
+                            None,
+                            &settings.retention,
+                            &[Kind::Requests],
+                            &mut cursors,
+                            &metrics,
+                            &mut stop,
+                        )
+                        .await;
+                        executor_metrics()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .entry(config.home.clone())
+                            .or_default()
+                            .retention = metrics.snapshot();
+                        maintenance.retained();
+                    }
+                    if due || thawed {
+                        let read = config.clone();
+                        match crate::blocking(move || crate::request_lock::sweep(&read)).await {
+                            Ok(locks) => publish_locks(&config, locks),
+                            Err(error) => crate::errors::log("request-lock-sweep", &error),
                         }
                         if due {
                             maintenance.swept();
-                        }
-                        if due || thawed || locks.in_progress() {
-                            locks = crate::lock_reaper::run(&config, locks, &mut stop).await;
                         }
                     }
                     if !interrupted(&config, &stop) {

@@ -241,6 +241,34 @@ fn public_event(mut event: Value) -> Value {
     event
 }
 
+/// Gateway state format in `PRAGMA user_version`; it only moves forward.
+/// 0: unversioned (v0.5.29 and older). 1: runs.result holds run results and
+/// completions are written directly (v0.5.30). Older gateways ignore both.
+pub const STATE_VERSION: i64 = 1;
+
+fn migrate(db: &Connection) -> Result<()> {
+    db.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        anyhow::ensure!(
+            version <= STATE_VERSION,
+            "gateway state version {version} requires a newer gateway"
+        );
+        if !db
+            .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name='result'")?
+            .exists([])?
+        {
+            db.execute_batch("ALTER TABLE runs ADD COLUMN result TEXT")?;
+        }
+        if version < STATE_VERSION {
+            db.execute_batch(&format!("PRAGMA user_version={STATE_VERSION}"))?;
+        }
+        Ok(())
+    })();
+    db.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+    result
+}
+
 pub(crate) const RESOLUTION_PREFIX: &str = "delivery-resolution:";
 pub const DELIVERY_STATUSES: &[&str] = &[
     "pending",
@@ -267,6 +295,7 @@ impl Store {
         {
             let db = store.connect()?;
             db.execute_batch(include_str!("schema.sql"))?;
+            migrate(&db)?;
             internal_state(&db)?;
         }
         use std::os::unix::fs::PermissionsExt;

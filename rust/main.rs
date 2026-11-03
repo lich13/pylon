@@ -26,7 +26,7 @@ enum Command {
     Resume {
         id: String,
         #[arg(long, hide = true)]
-        dispatch_fd: Option<i32>,
+        dispatched: bool,
     },
     Diagnose,
     /// Inspect all in-flight work without modifying state; exits 0 only when drained and frozen.
@@ -420,9 +420,8 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
             }
             Value::Null
         }
-        Command::Resume { id, dispatch_fd } => {
-            let _dispatch = pylon::runtime::inherited_dispatch_lock(&config, &id, dispatch_fd)?;
-            let code = pylon::runtime::resume(&config, &id).await?;
+        Command::Resume { id, dispatched } => {
+            let code = pylon::runtime::resume(&config, &id, dispatched).await?;
             if code != 0 {
                 std::process::exit(code)
             }

@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS updates (
  chat_id TEXT, message_id INTEGER, PRIMARY KEY(profile,update_id)
 );
 CREATE TABLE IF NOT EXISTS runs (
- id TEXT PRIMARY KEY,job_id TEXT NOT NULL,started_at REAL NOT NULL,finished_at REAL,status TEXT NOT NULL,detail TEXT
+ id TEXT PRIMARY KEY,job_id TEXT NOT NULL,started_at REAL NOT NULL,finished_at REAL,status TEXT NOT NULL,detail TEXT,result TEXT
 );
 CREATE INDEX IF NOT EXISTS updates_pending ON updates(profile,update_id) WHERE status='pending';
 CREATE INDEX IF NOT EXISTS runs_job_started ON runs(job_id,started_at DESC);

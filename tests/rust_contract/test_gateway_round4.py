@@ -283,7 +283,7 @@ def _assert_read_only_check(
 
 
 @pytest.mark.parametrize("completion_files", [None, []], ids=["missing-buffer", "empty-buffer"])
-@pytest.mark.parametrize("target", ["0.5.4", "0.5.5", "0.5.6", "0.5.7", "0.5.8", "0.5.14", "0.5.15", "0.5.16"])
+@pytest.mark.parametrize("target", ["0.5.11", "0.5.14", "0.5.16", "0.5.17", "0.5.25", "0.5.28", "0.5.29"])
 def test_missing_and_empty_buffer_are_safe_for_current_targets(
     round4_root, completion_files, target
 ):
@@ -337,7 +337,7 @@ def test_every_regular_buffer_file_blocks_downgrade_without_being_parsed(
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.6",
+        "0.5.29",
         exit_code=1,
         ok=False,
         pending=1,
@@ -355,7 +355,7 @@ def test_buffer_count_includes_json_temporary_and_corrupt_files(round4_root):
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.4",
+        "0.5.29",
         exit_code=1,
         ok=False,
         pending=3,
@@ -365,8 +365,8 @@ def test_buffer_count_includes_json_temporary_and_corrupt_files(round4_root):
 
 @pytest.mark.parametrize(
     "target",
-    ["0.5.2", "0.5.29", "v0.5.6", "0.5.6.0"],
-    ids=["older", "newer", "prefix", "extra-component"],
+    ["0.5.2", "0.5.6", "0.5.10", "0.5.18", "0.5.30", "v0.5.29", "0.5.29.0"],
+    ids=["older", "retired", "pre-lock-reclaim", "withdrawn", "newer", "prefix", "extra-component"],
 )
 def test_unknown_target_returns_fixed_json_without_creating_home(round4_root, target):
     home = round4_root / "home"
@@ -383,98 +383,23 @@ def test_unknown_target_returns_fixed_json_without_creating_home(round4_root, ta
     assert not home.exists()
 
 
-def test_legacy_target_accepts_a_valid_old_watermark_without_conversion(round4_root):
-    event_id = "fixture-old-uncertain-01"
-    kv = {WATERMARK_KEY: _json([event_id])}
-    home = _seed_home(
-        round4_root,
-        kv=kv,
-        uncertain_event_ids=(event_id,),
-        completion_files=[],
-    )
+def test_newer_state_version_requires_a_newer_gateway(round4_root):
+    home = _seed_home(round4_root, kv={COUNTER_KEY: _counter()}, completion_files=[])
+    database_path = home / "gateway/state.sqlite3"
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.execute("PRAGMA user_version=2")
+        connection.commit()
+    finally:
+        connection.close()
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.3",
-        exit_code=0,
-        ok=True,
-        pending=0,
-        reason=None,
-    )
-    saved = dict(_kv_snapshot(home / "gateway/state.sqlite3"))
-    assert COUNTER_KEY not in saved, "legacy check must not prepare a new v2 counter"
-    assert saved == kv, "legacy watermark or retired counter was converted"
-
-
-def test_v3_trigger_marker_requires_a_valid_retired_counter(round4_root):
-    kv = {
-        WATERMARK_KEY: _json([]),
-        TRIGGERS_KEY: _json(3),
-        RETIRED_COUNTER_KEY: _counter(),
-    }
-    home = _seed_home(round4_root, kv=kv, completion_files=[])
-    _assert_read_only_check(
-        round4_root,
-        home,
-        "0.5.3",
-        exit_code=0,
-        ok=True,
-        pending=0,
-        reason=None,
-    )
-    saved = dict(_kv_snapshot(home / "gateway/state.sqlite3"))
-    assert COUNTER_KEY not in saved
-    assert saved == kv
-
-
-def test_v3_trigger_marker_without_retired_counter_requires_preparation(round4_root):
-    kv = {WATERMARK_KEY: _json([]), TRIGGERS_KEY: _json(3)}
-    home = _seed_home(round4_root, kv=kv, completion_files=[])
-    _assert_read_only_check(
-        round4_root,
-        home,
-        "0.5.3",
+        "0.5.29",
         exit_code=1,
         ok=False,
         pending=0,
-        reason="legacy_counter_preparation_required",
-    )
-    assert dict(_kv_snapshot(home / "gateway/state.sqlite3")) == kv
-
-
-def test_corrupt_retired_counter_is_unavailable(round4_root):
-    kv = {
-        WATERMARK_KEY: _json([]),
-        TRIGGERS_KEY: _json(3),
-        RETIRED_COUNTER_KEY: "{fixture-invalid-json",
-    }
-    home = _seed_home(round4_root, kv=kv, completion_files=[])
-    _assert_read_only_check(
-        round4_root,
-        home,
-        "0.5.3",
-        exit_code=1,
-        ok=False,
-        pending=0,
-        reason="state_unavailable",
-    )
-    assert dict(_kv_snapshot(home / "gateway/state.sqlite3")) == kv
-
-
-def test_legacy_target_requires_preparation_when_v2_counter_is_active(round4_root):
-    home = _seed_home(
-        round4_root,
-        kv={COUNTER_KEY: _counter(), WATERMARK_KEY: _json([])},
-        completion_files=[],
-    )
-    _assert_read_only_check(
-        round4_root,
-        home,
-        "0.5.3",
-        exit_code=1,
-        ok=False,
-        pending=0,
-        reason="legacy_counter_preparation_required",
+        reason="state_requires_newer_gateway",
     )
 
 
@@ -483,41 +408,22 @@ def test_legacy_target_requires_preparation_when_v2_counter_is_active(round4_roo
     [
         "{fixture-invalid-json",
         _json({"version": 1, "pending": 0, "last_day": ""}),
-        _json({"version": 2, "pending": -1, "last_day": ""}),
-        _json({"version": 2, "pending": 0, "last_day": 7}),
+        _json({"version": 2, "pending": 3, "last_day": ""}),
     ],
-    ids=["invalid-json", "wrong-version", "negative-count", "wrong-day-type"],
+    ids=["invalid-json", "wrong-version", "pending-count"],
 )
-def test_corrupt_v2_counter_is_unavailable_and_never_repaired(round4_root, raw):
+def test_retired_uncertain_counter_no_longer_gates_supported_targets(round4_root, raw):
     home = _seed_home(round4_root, kv={COUNTER_KEY: raw}, completion_files=[])
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.6",
-        exit_code=1,
-        ok=False,
+        "0.5.29",
+        exit_code=0,
+        ok=True,
         pending=0,
-        reason="state_unavailable",
+        reason=None,
     )
     assert dict(_kv_snapshot(home / "gateway/state.sqlite3"))[COUNTER_KEY] == raw
-
-
-def test_missing_or_invalid_legacy_watermark_is_unavailable_and_not_seeded(round4_root):
-    for raw in (None, "{}"):
-        case_root = round4_root / ("missing" if raw is None else "invalid")
-        case_root.mkdir()
-        kv = {} if raw is None else {WATERMARK_KEY: raw}
-        home = _seed_home(case_root, kv=kv, completion_files=[])
-        _assert_read_only_check(
-            case_root,
-            home,
-            "0.5.3",
-            exit_code=1,
-            ok=False,
-            pending=0,
-            reason="state_unavailable",
-        )
-        assert dict(_kv_snapshot(home / "gateway/state.sqlite3")) == kv
 
 
 def test_missing_database_and_corrupt_database_are_read_only_unavailable(round4_root):
@@ -527,7 +433,7 @@ def test_missing_database_and_corrupt_database_are_read_only_unavailable(round4_
     _assert_read_only_check(
         missing_root,
         missing_home,
-        "0.5.6",
+        "0.5.29",
         exit_code=1,
         ok=False,
         pending=None,
@@ -546,7 +452,7 @@ def test_missing_database_and_corrupt_database_are_read_only_unavailable(round4_
     _assert_read_only_check(
         corrupt_root,
         corrupt_home,
-        "0.5.6",
+        "0.5.29",
         exit_code=1,
         ok=False,
         pending=0,
@@ -594,7 +500,7 @@ def test_completion_buffer_rejects_links_hardlinks_nested_and_special_entries(
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.6",
+        "0.5.29",
         exit_code=1,
         ok=False,
         pending=None,
@@ -627,7 +533,7 @@ def test_private_state_rejects_unsafe_permissions(round4_root, unsafe_part):
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.6",
+        "0.5.29",
         exit_code=1,
         ok=False,
         pending=None,
@@ -651,7 +557,7 @@ def test_completion_directory_owner_must_match_private_database_owner(round4_roo
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.6",
+        "0.5.29",
         exit_code=1,
         ok=False,
         pending=None,
@@ -679,7 +585,7 @@ def test_completion_file_owner_must_match_private_database_owner(round4_root):
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.6",
+        "0.5.29",
         exit_code=1,
         ok=False,
         pending=None,
@@ -704,7 +610,7 @@ def test_closed_wal_database_is_read_only_and_creates_no_sidecars(round4_root):
     before_hash = _file_hash(database_path)
     report = _invoke_check(
         home,
-        "0.5.6",
+        "0.5.29",
         exit_code=0,
         ok=True,
         pending=0,
@@ -718,24 +624,14 @@ def test_closed_wal_database_is_read_only_and_creates_no_sidecars(round4_root):
     assert not Path(f"{database_path}-shm").exists()
 
 
-def test_active_wal_counter_is_seen_without_checkpointing_or_sidecar_changes(round4_root):
-    watermark = _json(["fixture-old-uncertain-02"])
-    home = _seed_home(
-        round4_root,
-        kv={WATERMARK_KEY: watermark},
-        completion_files=[],
-        journal_mode="WAL",
-    )
+def test_active_wal_state_version_is_seen_without_checkpointing_or_sidecar_changes(round4_root):
+    home = _seed_home(round4_root, completion_files=[], journal_mode="WAL")
     database_path = home / "gateway/state.sqlite3"
     writer = sqlite3.connect(database_path, timeout=5.0, isolation_level=None)
     try:
         assert writer.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-        writer.execute(
-            "INSERT INTO kv(key,value) VALUES(?,?)", (COUNTER_KEY, _counter())
-        )
-        assert writer.execute("SELECT value FROM kv WHERE key=?", (COUNTER_KEY,)).fetchone() == (
-            _counter(),
-        )
+        writer.execute("PRAGMA user_version=2")
+        assert writer.execute("PRAGMA user_version").fetchone() == (2,)
         wal_path = Path(f"{database_path}-wal")
         shm_path = Path(f"{database_path}-shm")
         assert wal_path.is_file() and wal_path.stat().st_size > 0
@@ -745,9 +641,9 @@ def test_active_wal_counter_is_seen_without_checkpointing_or_sidecar_changes(rou
             f"{database_path.as_uri()}?mode=ro&immutable=1", uri=True
         )
         try:
-            assert immutable.execute(
-                "SELECT value FROM kv WHERE key=?", (COUNTER_KEY,)
-            ).fetchone() is None, "fixture counter must exist only in the uncheckpointed WAL"
+            assert immutable.execute("PRAGMA user_version").fetchone() == (
+                0,
+            ), "fixture state version must exist only in the uncheckpointed WAL"
         finally:
             immutable.close()
 
@@ -757,21 +653,16 @@ def test_active_wal_counter_is_seen_without_checkpointing_or_sidecar_changes(rou
         before_wal_hash = _file_hash(wal_path)
         _invoke_check(
             home,
-            "0.5.3",
+            "0.5.29",
             exit_code=1,
             ok=False,
             pending=0,
-            reason="legacy_counter_preparation_required",
+            reason="state_requires_newer_gateway",
         )
         assert _tree_snapshot(round4_root, volatile_entries=volatile) == before_tree
         assert _file_hash(database_path) == before_db_hash
         assert _file_hash(wal_path) == before_wal_hash
-        assert writer.execute(
-            "SELECT value FROM kv WHERE key=?", (COUNTER_KEY,)
-        ).fetchone() == (_counter(),)
-        assert writer.execute("SELECT value FROM kv WHERE key=?", (WATERMARK_KEY,)).fetchone() == (
-            watermark,
-        )
+        assert writer.execute("PRAGMA user_version").fetchone() == (2,)
     finally:
         writer.close()
 
@@ -835,7 +726,7 @@ def test_diagnostics_count_is_top_level_and_permissions_stay_unchanged(
     _assert_read_only_check(
         round4_root,
         home,
-        "0.5.6",
+        "0.5.29",
         exit_code=0,
         ok=True,
         pending=0,

@@ -13,7 +13,6 @@ use tokio::sync::watch;
 pub(crate) struct Metrics {
     pub reload_full: AtomicU64,
     pub reload_skipped: AtomicU64,
-    pub completion_scans: AtomicU64,
     pub delivery_empty_claims: AtomicU64,
     pub command_empty_claims: AtomicU64,
     pub command_wakeups: AtomicU64,
@@ -23,7 +22,6 @@ impl Metrics {
         json!({
             "reload_full": self.reload_full.load(Ordering::Relaxed),
             "reload_skipped": self.reload_skipped.load(Ordering::Relaxed),
-            "completion_scans": self.completion_scans.load(Ordering::Relaxed),
             "delivery_empty_claims": self.delivery_empty_claims.load(Ordering::Relaxed),
             "command_empty_claims": self.command_empty_claims.load(Ordering::Relaxed),
             "command_wakeups": self.command_wakeups.load(Ordering::Relaxed),
@@ -49,7 +47,6 @@ impl Wake {
 #[derive(Default)]
 pub(crate) struct Runtime {
     pub metrics: Metrics,
-    pub completion: Wake,
     deliveries: Mutex<BTreeMap<(String, Lane), Weak<Wake>>>,
     pub retention: crate::retention::Metrics,
 }
@@ -109,13 +106,6 @@ pub(crate) const DELIVERY_IDLE: [Duration; 3] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
 ];
-pub(crate) const COMPLETION_IDLE: [Duration; 4] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(5),
-    Duration::from_secs(10),
-];
-
 #[cfg(test)]
 #[path = "optimization_tests.rs"]
 mod tests;

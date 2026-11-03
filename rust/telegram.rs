@@ -501,21 +501,8 @@ pub(crate) async fn deliver_with_stop(
     event: &Value,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<f64> {
-    let _hold = crate::completion::Hold::delivery(store, event, stop)
-        .await
-        .context(crate::errors::ReconcileRequired)?;
-    crate::completion::stage(
-        store,
-        crate::completion::Completion::delivery(
-            event,
-            "uncertain",
-            event.get("receipt").filter(|v| !v.is_null()).cloned(),
-            "delivery interrupted before acknowledgement",
-            0.0,
-        )?,
-    )
-    .await
-    .context(crate::errors::ReconcileRequired)?;
+    // The row is already claimed `sending`; an interruption before the final
+    // write leaves it for uncertain reconciliation, never a resend.
     let payload = &event["payload"];
     let result: Result<Value> = async {
         let check_expiry = || -> Result<()> {

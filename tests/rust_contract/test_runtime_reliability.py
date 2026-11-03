@@ -277,10 +277,13 @@ def test_completion_failure_overrides_successful_business_exit(runtime_case):
     assert request["payload"]["status"] == "ok"
 
     recorded_runs = case.runs()
-    result_key = f"run-result:{recorded_runs[0]['id']}"
     with sqlite3.connect(case.home / "gateway/state.sqlite3", timeout=3) as database:
         recorded_result = database.execute(
-            "SELECT value FROM kv WHERE key=?", (result_key,)
+            "SELECT result FROM runs WHERE id=?", (recorded_runs[0]["id"],)
+        ).fetchone()[0]
+        assert recorded_result
+        assert not database.execute(
+            "SELECT count(*) FROM kv WHERE key LIKE 'run-result:%'"
         ).fetchone()[0]
     context = rpc_value(
         case.home, "context.open", {"module": "alpha", "subject": f"job:{JOB}"}
@@ -301,7 +304,7 @@ def test_completion_failure_overrides_successful_business_exit(runtime_case):
         assert case.runs() == recorded_runs
         with sqlite3.connect(case.home / "gateway/state.sqlite3", timeout=3) as database:
             assert database.execute(
-                "SELECT value FROM kv WHERE key=?", (result_key,)
+                "SELECT result FROM runs WHERE id=?", (recorded_runs[0]["id"],)
             ).fetchone()[0] == recorded_result
     finally:
         rpc_value(case.home, "context.close", context=context)

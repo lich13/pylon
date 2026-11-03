@@ -433,7 +433,7 @@ fn runs_keep_latest_ties_uncertain_and_incomplete_and_remove_children_atomically
         ("legacy-running", "d", 1.0, None, "no_change"),
     ] {
         db.execute(
-            "INSERT INTO runs VALUES(?,?,?,?,?,NULL)",
+            "INSERT INTO runs(id,job_id,started_at,finished_at,status,detail) VALUES(?,?,?,?,?,NULL)",
             params![id, job, started, finished, status],
         )
         .unwrap();
@@ -457,7 +457,14 @@ fn runs_keep_latest_ties_uncertain_and_incomplete_and_remove_children_atomically
     assert!(store.get("run-result:old").unwrap().is_null());
     clean(&store, Kind::Orphans);
     assert!(store.get("run-result:absent").unwrap().is_null());
-    assert_eq!(store.get("run-result:tie1").unwrap(), json!({}));
+    // Legacy kv results fold into the run row once, then the kv is removed.
+    assert!(store.get("run-result:tie1").unwrap().is_null());
+    assert_eq!(
+        db.query_row("SELECT result FROM runs WHERE id='tie1'", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "{}"
+    );
     assert_eq!(
         db.query_row("SELECT count(*) FROM runs", [], |r| r.get::<_, u64>(0))
             .unwrap(),
@@ -727,85 +734,6 @@ async fn freeze_and_stop_prevent_new_batches() {
     )
     .await;
     assert_eq!(metrics.snapshot()["batches"], 0);
-}
-
-#[tokio::test]
-async fn committed_completions_protect_terminal_rows_until_reconciled() {
-    let (_temp, store) = store();
-    let payload = json!({"text":"fixture"});
-    event(
-        &store,
-        "committed",
-        "delivered",
-        "text",
-        payload.clone(),
-        receipt(),
-    );
-    let raw = json!({"id":"committed","profile":"bot","payload":payload,"attempts":0});
-    crate::completion::stage(
-        &store,
-        crate::completion::Completion::delivery(&raw, "delivered", Some(receipt()), "", 0.0)
-            .unwrap(),
-    )
-    .await
-    .unwrap();
-    let mut db = store.connect().unwrap();
-    let mut cursor = Cursor::default();
-    let error = batch(
-        &mut db,
-        Kind::Events,
-        &mut cursor,
-        &Policy::default(),
-        crate::now(),
-        BATCH,
-    )
-    .err()
-    .unwrap();
-    assert_eq!(error_code(&error), "completion_pending");
-    assert_eq!(cursor.row, 0);
-    assert!(store.has_event("committed").unwrap());
-    crate::completion::reconcile(&store).unwrap();
-    assert_eq!(crate::completion::pending_count(&store.path).unwrap(), 0);
-    assert_eq!(clean(&store, Kind::Events).deleted["events"], 1);
-
-    db.execute("INSERT INTO updates(profile,update_id,payload,status) VALUES('bot',1,'{}','done'),('bot',2,'{}','done')", []).unwrap();
-    crate::completion::stage(
-        &store,
-        crate::completion::Completion::command("bot", 1, "{}", "fixture", Value::Null, "done", &[]),
-    )
-    .await
-    .unwrap();
-    let policy = Policy {
-        updates_per_bot: 1,
-        ..Policy::default()
-    };
-    assert!(
-        batch(
-            &mut db,
-            Kind::Updates,
-            &mut Cursor::default(),
-            &policy,
-            crate::now(),
-            BATCH,
-        )
-        .err()
-        .unwrap()
-        .is::<CompletionPending>()
-    );
-    crate::completion::reconcile(&store).unwrap();
-    assert_eq!(
-        batch(
-            &mut db,
-            Kind::Updates,
-            &mut Cursor::default(),
-            &policy,
-            crate::now(),
-            BATCH,
-        )
-        .unwrap()
-        .deleted["updates"],
-        1
-    );
 }
 
 #[tokio::test(start_paused = true)]

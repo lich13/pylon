@@ -166,6 +166,7 @@ pub fn connect(config: &Config) -> Result<crate::db::PooledConnection> {
         CREATE INDEX IF NOT EXISTS triggers_request ON triggers(request_id);
         CREATE INDEX IF NOT EXISTS requests_open_summary ON requests(created_at) WHERE state!='completed';
         CREATE INDEX IF NOT EXISTS requests_completed_updated ON requests(updated_at) WHERE state='completed';")?;
+    db.execute_batch(crate::request_lock::SCHEMA)?;
     initialized.insert(path, identity);
     Ok(db)
 }
@@ -376,43 +377,16 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
     let mut starting = 0_u32;
     if recovering {
         for (id, _, state) in &rows {
-            if state == "queued"
-                && ["request", "dispatch"]
-                    .iter()
-                    .try_fold(false, |held, prefix| {
-                        Ok::<_, anyhow::Error>(
-                            held || crate::runtime::existing_task_lock_held(
-                                &config
-                                    .home
-                                    .join("run")
-                                    .join(format!("{prefix}-{}.lock", crate::digest(id))),
-                            )?,
-                        )
-                    })?
-            {
+            if state == "queued" && crate::request_lock::held(&*connect(config)?, id)? {
                 starting = starting.saturating_add(1);
             }
         }
     }
     let mut launched = 0_u32;
     for (id, job, _) in rows {
-        let Some(dispatch_lock) = crate::runtime::acquire_task_lock(
-            &config
-                .home
-                .join("run")
-                .join(format!("dispatch-{}.lock", crate::digest(&id))),
-        )?
-        else {
-            continue;
-        };
-        // An OS lock, not a PID/age heuristic, owns an active invocation.
-        let Some(lock) = crate::runtime::acquire_task_lock(
-            &config
-                .home
-                .join("run")
-                .join(format!("request-{}.lock", crate::digest(&id))),
-        )?
-        else {
+        // A lock row owned by a live process, not a PID/age heuristic, owns
+        // an active invocation; rows of exited owners are free.
+        let Some(lock) = crate::request_lock::RequestLock::acquire(config, &id)? else {
             continue;
         };
         // The owner may have completed after the scan. Re-read while holding its lock.
@@ -448,20 +422,8 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
             if config.offline {
                 command.arg("--offline");
             }
-            use std::os::fd::AsRawFd;
-            let fd = dispatch_lock.as_raw_fd();
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            // Drop only the request lock. The separate dispatch lock stays held across exec.
-            drop(lock);
             let mut child = command
-                .args(["resume", &id, "--dispatch-fd", &fd.to_string()])
+                .args(["resume", &id, "--dispatched"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
@@ -469,6 +431,8 @@ async fn dispatch_inner(config: &Config) -> Result<()> {
                 .inspect_err(|_| {
                     SPAWN_FAILURES.fetch_add(1, Ordering::Relaxed);
                 })?;
+            // The child keeps the lock row until its run ends.
+            lock.transfer(child.id().context("resume exited before hand-over")?)?;
             let supervisor = config.clone();
             let identity = crate::digest(&job);
             launched = launched.saturating_add(1);

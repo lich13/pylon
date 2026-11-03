@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-import fcntl
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -374,14 +373,32 @@ def _task_summary_database_state(home: Path) -> tuple[list[dict], dict]:
     }
 
 
-def _request_lock_is_free(path: Path) -> bool:
-    with path.open("a+b") as lock_file:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return False
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+def _process_identity(pid: int) -> str | None:
+    try:
+        stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    start = stat_line.rsplit(")", 1)[1].split()[19]
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    return f"{boot}:{pid}:{start}"
+
+
+def _request_lock_is_free(home: Path, request_id: str) -> bool:
+    """A request lock is a `locks` row whose owner process is still alive."""
+    with sqlite3.connect(
+        f"file:{home / 'supervisor/task-state.sqlite3'}?mode=ro", uri=True, timeout=2.0
+    ) as database:
+        row = database.execute(
+            "SELECT owner FROM locks WHERE name=?", (f"request:{request_id}",)
+        ).fetchone()
+    if row is None:
         return True
+    owner = row[0]
+    try:
+        pid = int(owner.split(":")[1])
+    except (IndexError, ValueError):
+        return True
+    return _process_identity(pid) != owner
 
 
 def test_64_slow_clear_buttons_calls_do_not_starve_three_bot_deliveries(isolated_root):
@@ -836,9 +853,9 @@ def test_executor_refreshes_summary_while_run_finish_rpc_is_blocked(isolated_roo
         assert len(completed_rows) == 1, completed_rows
         report_id = completed_rows[0]["id"]
 
-        request_lock = case.home / "run" / f"request-{hashlib.sha256(report_id.encode()).hexdigest()}.lock"
-        assert request_lock.is_file(), "completed execute did not create its request lock"
-        assert _request_lock_is_free(request_lock), "execute left a request lock behind"
+        legacy_lock = case.home / "run" / f"request-{hashlib.sha256(report_id.encode()).hexdigest()}.lock"
+        assert not legacy_lock.exists(), "request locks must live in SQLite"
+        assert _request_lock_is_free(case.home, report_id), "execute left a request lock behind"
 
         token = open_context(case.home, "alpha", "job_alpha")["token"]
         report = {
@@ -865,7 +882,7 @@ def test_executor_refreshes_summary_while_run_finish_rpc_is_blocked(isolated_roo
 
         # No business process is active now: the executor itself must own the
         # request lock while its run.finish RPC waits for the gateway DB lock.
-        wait_for(lambda: not _request_lock_is_free(request_lock), timeout=5.0)
+        wait_for(lambda: not _request_lock_is_free(case.home, report_id), timeout=5.0)
         assert executor.poll() is None, "executor exited while run.finish was blocked"
         assert case.requests_in("reporting")
         summary_path = case.home / "run/task-summary.json"
@@ -901,7 +918,7 @@ def test_executor_refreshes_summary_while_run_finish_rpc_is_blocked(isolated_roo
         ), refreshed
         assert refreshed["totals"]["queued_count"] == 1, refreshed["totals"]
         assert executor.poll() is None, "reporting RPC should remain blocked until the DB lock is released"
-        assert not _request_lock_is_free(request_lock), "executor released the reporting request lock early"
+        assert not _request_lock_is_free(case.home, report_id), "executor released the reporting request lock early"
 
         database_lock.execute("ROLLBACK")
         database_lock.close()

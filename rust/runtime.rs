@@ -82,6 +82,7 @@ pub(crate) fn task_lock_current(path: &Path, file: &File) -> Result<bool> {
         && actual.dev() == expected.dev()
         && actual.ino() == expected.ino())
 }
+#[cfg(test)]
 pub(crate) fn acquire_task_lock(path: &Path) -> Result<Option<File>> {
     for _ in 0..4 {
         let file = open_task_lock(path)?;
@@ -117,46 +118,6 @@ pub(crate) fn existing_task_lock_held(path: &Path) -> Result<bool> {
         "task lock changed during inspection"
     );
     Ok(held)
-}
-
-pub fn inherited_dispatch_lock(
-    config: &Config,
-    run: &str,
-    fd: Option<i32>,
-) -> Result<Option<File>> {
-    let Some(fd) = fd else { return Ok(None) };
-    ensure!(
-        fd >= 3 && (config.offline || unsafe { libc::geteuid() } == 0),
-        "invalid dispatch descriptor"
-    );
-    use std::os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::fs::MetadataExt,
-    };
-    let file = unsafe { File::from_raw_fd(fd) };
-    let path = config
-        .home
-        .join("run")
-        .join(format!("dispatch-{}.lock", crate::digest(run)));
-    let actual = file.metadata()?;
-    let expected = fs::symlink_metadata(&path)?;
-    ensure!(
-        actual.is_file()
-            && expected.is_file()
-            && actual.dev() == expected.dev()
-            && actual.ino() == expected.ino(),
-        "dispatch descriptor identity mismatch"
-    );
-    ensure!(try_lock(&file)?, "dispatch lock is held by another process");
-    ensure!(
-        task_lock_current(&path, &file)?,
-        "dispatch descriptor identity mismatch"
-    );
-    ensure!(
-        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } >= 0,
-        "cannot protect dispatch descriptor"
-    );
-    Ok(Some(file))
 }
 
 pub struct Lease {
@@ -732,20 +693,19 @@ pub async fn execute(config: &Config, id: &str) -> Result<i32> {
         job.model,
         &trigger,
     )?;
-    let code = resume(config, &run).await?;
+    let code = resume(config, &run, false).await?;
     if crate::queue::optional_state(config, &run)?.as_deref() == Some("queued") {
         println!("{}", json!({"task":id,"status":"queued","request_id":run}));
     }
     Ok(code)
 }
-pub async fn resume(config: &Config, run: &str) -> Result<i32> {
-    let Some(_request_lock) = acquire_task_lock(
-        &config
-            .home
-            .join("run")
-            .join(format!("request-{}.lock", crate::digest(run))),
-    )?
-    else {
+pub async fn resume(config: &Config, run: &str, dispatched: bool) -> Result<i32> {
+    let request_lock = if dispatched {
+        crate::request_lock::RequestLock::adopt(config, run)?
+    } else {
+        crate::request_lock::RequestLock::acquire(config, run)?
+    };
+    let Some(_request_lock) = request_lock else {
         return Ok(0);
     };
     if crate::queue::optional_state(config, run)?.as_deref() != Some("queued")

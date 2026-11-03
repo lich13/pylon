@@ -385,21 +385,8 @@ async fn command_once_with_stop(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(false);
     };
-    let initial = crate::completion::Completion::command(
-        id,
-        uid,
-        &payload,
-        "gateway",
-        Value::Null,
-        "uncertain",
-        &[],
-    );
-    let _hold = crate::completion::Hold::new(&app.store, &initial, stop)
-        .await
-        .context(crate::errors::ReconcileRequired)?;
-    crate::completion::stage(&app.store, initial)
-        .await
-        .context(crate::errors::ReconcileRequired)?;
+    // The update is claimed `running`; until its result commits, retirement or
+    // startup recovery reconciles it as uncertain without re-execution.
     let message: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
     if kind == "callback_query" && !message.is_null() {
         let query = json!({"callback_query_id":message["id"]});
@@ -848,9 +835,13 @@ fn log_deferral_exhausted(bot: &str, connection: &Value) {
 }
 
 pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
-    app.store
-        .blocking(|s| crate::completion::reconcile(&s))
-        .await?;
+    // v0.5.30 writes completions directly. Records from an older mailbox
+    // must be finished by that release; refuse instead of dropping them.
+    let legacy = crate::completion::pending_count(&app.store.path)?;
+    anyhow::ensure!(
+        legacy == 0,
+        "{legacy} completion records from an older gateway are pending; start the previous release to reconcile them"
+    );
     app.store.blocking(|s| s.recover()).await?;
     let personal = app
         .snapshot
@@ -872,8 +863,6 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
         tokio::select! { _ = shutdown.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
         let _ = shutdown_tx.send(true);
     }));
-    let journal_store = app.store.clone();
-    let reconciler = Child(tokio::spawn(crate::completion::run(journal_store)));
     let maintenance = Child(tokio::spawn(crate::retention::gateway(
         app.clone(),
         stopping.clone(),
@@ -1065,7 +1054,6 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
     // runtime shutdown in main, within the global eight-second gateway budget.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     rpc.abort();
-    reconciler.abort();
     maintenance.abort();
     let bot_ids = workers.keys().cloned().collect::<Vec<_>>();
     for (_, stop, _) in workers.values() {

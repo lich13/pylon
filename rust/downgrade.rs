@@ -1,11 +1,9 @@
 //! Read-only compatibility inspection. Never initialize or reconcile live state.
 use crate::config::Config;
-use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use anyhow::{Result, ensure};
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
-use serde_json::Value;
 use std::{
-    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     os::{
         fd::AsRawFd,
@@ -23,6 +21,19 @@ pub struct Report {
     pub reason: Option<&'static str>,
 }
 
+/// Highest gateway state version (`PRAGMA user_version`) a rollback target can
+/// run on. Every supported release ignores `user_version` and `runs.result`,
+/// and names the `runs` columns it reads, so v0.5.30 state (1) stays readable.
+/// v0.5.18 was withdrawn; v0.5.10 and older lack retained-history support.
+fn readable_state(target: &str) -> Option<i64> {
+    let minor = target.strip_prefix("0.5.")?;
+    if minor.is_empty() || minor.starts_with('0') || !minor.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let patch: u32 = minor.parse().ok()?;
+    ((11..=29).contains(&patch) && patch != 18).then_some(1)
+}
+
 pub fn check(config: &Config, target: &str) -> Report {
     let mut report = Report {
         ok: false,
@@ -30,38 +41,11 @@ pub fn check(config: &Config, target: &str) -> Report {
         completions_pending: None,
         reason: None,
     };
-    if !matches!(
-        target,
-        "0.5.3"
-            | "0.5.4"
-            | "0.5.5"
-            | "0.5.6"
-            | "0.5.7"
-            | "0.5.8"
-            | "0.5.9"
-            | "0.5.10"
-            | "0.5.11"
-            | "0.5.12"
-            | "0.5.13"
-            | "0.5.14"
-            | "0.5.15"
-            | "0.5.16"
-            | "0.5.17"
-            | "0.5.19"
-            | "0.5.20"
-            | "0.5.21"
-            | "0.5.22"
-            | "0.5.23"
-            | "0.5.24"
-            | "0.5.25"
-            | "0.5.26"
-            | "0.5.27"
-            | "0.5.28"
-    ) {
+    let Some(readable) = readable_state(target) else {
         report.reason = Some("unsupported_target");
         return report;
-    }
-    match inspect(config, target, &mut report.completions_pending) {
+    };
+    match inspect(config, readable, &mut report.completions_pending) {
         Ok(reason) => {
             report.ok = reason.is_none();
             report.reason = reason;
@@ -76,7 +60,7 @@ pub fn check(config: &Config, target: &str) -> Report {
 
 fn inspect(
     config: &Config,
-    target: &str,
+    readable: i64,
     pending: &mut Option<u64>,
 ) -> Result<Option<&'static str>> {
     let path = config.contained("gateway/state.sqlite3")?;
@@ -86,6 +70,7 @@ fn inspect(
         unsafe { libc::geteuid() } == 0 || original.uid() == unsafe { libc::geteuid() },
         "downgrade state owner mismatch"
     );
+    // Older releases may have left records in their completion mailbox.
     let count = crate::completion::pending_count(&path)?;
     *pending = Some(count);
     if count != 0 {
@@ -93,79 +78,11 @@ fn inspect(
     }
     let (_lock, db) = read_only_state(&path)?;
     db.busy_timeout(Duration::from_secs(1))?;
-    db.execute_batch("PRAGMA query_only=ON; BEGIN;")?;
-    let mut history = db.prepare("SELECT key,value FROM kv WHERE (key>='event-gone:' AND key<'event-gone;') OR (key>='event-gone-msg:' AND key<'event-gone-msg;')")?;
-    for row in history.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
-        let (key, raw) = row?;
-        // These releases understand retained records. Still validate their shape.
-        if crate::event_history::expires(&key, &raw)? > crate::now()
-            && !matches!(
-                target,
-                "0.5.11"
-                    | "0.5.12"
-                    | "0.5.13"
-                    | "0.5.14"
-                    | "0.5.15"
-                    | "0.5.16"
-                    | "0.5.17"
-                    | "0.5.19"
-                    | "0.5.20"
-                    | "0.5.21"
-                    | "0.5.22"
-                    | "0.5.23"
-                    | "0.5.24"
-                    | "0.5.25"
-                    | "0.5.26"
-                    | "0.5.27"
-                    | "0.5.28"
-            )
-        {
-            return Ok(Some("retained_events_require_newer_gateway"));
-        }
-    }
-    let counter = state(&db, "uncertain:counter:v2")?;
-    let retired = state(&db, "uncertain:counter:v2:retired")?;
-    for counter in counter.iter().chain(retired.iter()) {
-        ensure!(
-            counter["version"].as_u64() == Some(2)
-                && counter["pending"].as_u64().is_some()
-                && counter["last_day"].is_string(),
-            "invalid uncertain counter"
-        );
-    }
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     db.query_row("SELECT count(*) FROM events WHERE 0", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    if target == "0.5.3" {
-        let triggers = state(&db, "uncertain:triggers")?;
-        ensure!(
-            triggers.is_none() || triggers == Some(serde_json::json!(3)),
-            "unknown uncertain triggers"
-        );
-        if counter.is_some() || (triggers.is_some() && retired.is_none()) {
-            return Ok(Some("legacy_counter_preparation_required"));
-        }
-        let watermark =
-            state(&db, "uncertain:watermark")?.context("legacy uncertain watermark missing")?;
-        let seen: BTreeSet<String> = serde_json::from_value(watermark)?;
-        let mut query = db.prepare(
-            "SELECT id FROM events WHERE status='uncertain' AND job_id<>'uncertain-summary'",
-        )?;
-        for id in query.query_map([], |row| row.get::<_, String>(0))? {
-            ensure!(seen.contains(&id?), "legacy uncertain watermark incomplete");
-        }
-    } else if counter.is_none()
-        && let Some(watermark) = state(&db, "uncertain:watermark")?
-    {
-        // Current versions initialize an absent counter at startup. Inspect its
-        // legacy input now without creating a seed or changing the old watermark.
-        let _: BTreeSet<String> = serde_json::from_value(watermark)?;
-    }
-    // Catch a writer that added a completion during the read transaction. This
-    // remains an advisory check; deployment must freeze, drain, stop and recheck.
-    let count = crate::completion::pending_count(&path)?;
-    *pending = Some(count);
-    Ok((count != 0).then_some("pending_completions"))
+    Ok((version > readable).then_some("state_requires_newer_gateway"))
 }
 
 /// SQLite mode=ro can still create WAL/SHM sidecars. Hold a POSIX database lock
@@ -247,13 +164,4 @@ fn database_lock(file: &File, kind: impl Into<libc::c_int>) -> Result<()> {
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
-}
-
-fn state(db: &Connection, key: &str) -> Result<Option<Value>> {
-    let raw: Option<String> = db
-        .query_row("SELECT value FROM kv WHERE key=?", [key], |row| row.get(0))
-        .optional()?;
-    raw.map(|raw| serde_json::from_str(&raw))
-        .transpose()
-        .map_err(Into::into)
 }

@@ -1,4 +1,4 @@
-"""Offline lifecycle regressions for the gateway completion buffer and shutdown."""
+"""Offline lifecycle regressions for gateway completion persistence and shutdown."""
 
 from __future__ import annotations
 
@@ -33,15 +33,7 @@ def round3_root():
         yield Path(directory)
 
 
-def _completion_files(home: Path) -> list[Path] | None:
-    directory = home / "gateway/completions"
-    try:
-        return [path for path in directory.iterdir() if path.is_file()]
-    except (FileNotFoundError, NotADirectoryError):
-        return None
-
-
-def test_received_receipt_is_buffered_before_sigterm_and_recovered_after_sqlite_lock(
+def test_receipt_blocked_by_sqlite_lock_through_sigterm_becomes_uncertain_without_resend(
     round3_root,
 ):
     telegram = _LocalTelegram(block_send_message_response=True)
@@ -82,11 +74,8 @@ def test_received_receipt_is_buffered_before_sigterm_and_recovered_after_sqlite_
         telegram.release_send_message_response()
         assert telegram.send_message_response_sent.wait(timeout=5.0), "fake Telegram did not return the receipt"
 
-        buffered_files = wait_for(lambda: _completion_files(home) or None, timeout=5.0)
-        completion_dir = home / "gateway/completions"
-        assert stat.S_IMODE(completion_dir.stat().st_mode) == 0o700
-        assert buffered_files
-        assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in buffered_files)
+        time.sleep(0.5)
+        assert not (home / "gateway/completions").exists(), "v0.5.30 must not write the completion mailbox"
         assert telegram.method_count("sendMessage", text=message + "\n") == 1
 
         elapsed = gateway.stop(timeout=8.0)
@@ -98,9 +87,10 @@ def test_received_receipt_is_buffered_before_sigterm_and_recovered_after_sqlite_
         database_lock = None
 
         gateway.start()
-        delivered = wait_for(lambda: event_status(home, event_id, "delivered"), timeout=10.0)
-        assert delivered["attempts"] == 1
-        assert delivered["receipt"] == [{"message_id": 7001, "chat_id": 101}]
+        recovered = wait_for(lambda: event_status(home, event_id, "uncertain"), timeout=10.0)
+        assert recovered["attempts"] == 1
+        time.sleep(1.0)
+        assert event_status(home, event_id, "uncertain")
         assert telegram.count(tokens["bot_one"], "sendMessage") == 1
     finally:
         telegram.release_send_message_response()
@@ -163,7 +153,7 @@ def test_unconfirmed_slow_send_becomes_uncertain_on_sigterm_and_is_not_replayed(
         telegram.close()
 
 
-def test_returned_command_result_is_buffered_and_recovered_without_rerunning_handler(
+def test_returned_command_result_blocked_through_sigterm_is_uncertain_without_rerunning_handler(
     round3_root,
 ):
     telegram = _LocalTelegram(block_getupdates_at_or_after=2)
@@ -235,26 +225,14 @@ def test_returned_command_result_is_buffered_and_recovered_without_rerunning_han
         (case.data / "release-completion").touch()
         wait_for((case.data / "handler-returned").is_file, timeout=5.0)
 
-        completion_dir = case.home / "gateway/completions"
-
-        def buffered_command_result():
-            try:
-                candidates = completion_dir.glob("*.json")
-                return next(
-                    (path for path in candidates if reply_text in path.read_text(encoding="utf-8")),
-                    None,
-                )
-            except (FileNotFoundError, NotADirectoryError):
-                return None
-
-        completion_file = wait_for(buffered_command_result, timeout=5.0)
-        assert stat.S_IMODE(completion_file.stat().st_mode) == 0o600
+        time.sleep(0.5)
+        assert not (case.home / "gateway/completions").exists(), "v0.5.30 must not write the completion mailbox"
 
         with sqlite3.connect(state_path, timeout=3.0) as database:
             context_count = database.execute(
                 "SELECT count(*) FROM contexts WHERE module='alpha' AND bot='bot_one' AND origin='command'"
             ).fetchone()[0]
-        assert context_count == 1, "command context disappeared before its buffered result was applied"
+        assert context_count == 1, "command context disappeared before its result was committed"
 
         def reply_rows():
             with sqlite3.connect(state_path, timeout=3.0) as database:
@@ -287,36 +265,13 @@ def test_returned_command_result_is_buffered_and_recovered_without_rerunning_han
         database_lock = None
 
         case.gateway.start()
-        wait_for(lambda: update_status() == ("done",), timeout=8.0)
-        recovered = wait_for(
-            lambda: next((row for row in reply_rows() if row["status"] == "delivered"), None),
-            timeout=8.0,
-        )
-        assert recovered["attempts"] == 1
-        assert recovered["module"] == "alpha"
-        assert recovered["job_id"] == "bot"
-        assert recovered["payload"] == {"text": reply_text, "reply_to_message_id": 11}
-        assert telegram.method_count("getUpdates") > polls_before_restart
+        wait_for(lambda: update_status() == ("uncertain",), timeout=8.0)
+        wait_for(lambda: telegram.method_count("getUpdates") > polls_before_restart, timeout=8.0)
+        time.sleep(1.0)
+        assert update_status() == ("uncertain",)
+        assert reply_rows() == [], "an unconfirmed command result must not be replayed"
         assert case.count("completion-count") == 1
-        assert telegram.send_fragment_count(_fake_token("bot_one", "101"), reply_text) == 1
-
-        with sqlite3.connect(state_path, timeout=3.0) as database:
-            remaining_contexts = database.execute(
-                "SELECT count(*) FROM contexts WHERE module='alpha' AND bot='bot_one' AND origin='command'"
-            ).fetchone()[0]
-        assert remaining_contexts == 0, "recovery did not clean up the command context"
-
-        with telegram._lock:
-            reply_calls = [
-                request
-                for token, method, request in telegram._calls
-                if token == _fake_token("bot_one", "101")
-                and method == "sendMessage"
-                and request.get("text") == reply_text + "\n"
-            ]
-        assert len(reply_calls) == 1
-        assert str(reply_calls[0].get("chat_id")) == "101"
-        assert reply_calls[0].get("reply_parameters") == {"message_id": 11}
+        assert telegram.send_fragment_count(_fake_token("bot_one", "101"), reply_text) == 0
     finally:
         (case.data / "release-completion").touch(exist_ok=True)
         if database_lock is not None:

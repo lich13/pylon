@@ -29,7 +29,6 @@ from test_gateway_contract import (
 OPTIMIZATION_KEYS = {
     "reload_full",
     "reload_skipped",
-    "completion_scans",
     "delivery_empty_claims",
 }
 
@@ -51,7 +50,7 @@ def performance_telegram():
 
 def _diagnostics(home: Path) -> dict:
     value = rpc_value(home, "diagnostics")
-    assert value["version"] == "0.5.29"
+    assert value["version"] == "0.5.30"
     optimization = value["metrics"].get("optimization")
     assert isinstance(optimization, dict)
     assert OPTIMIZATION_KEYS <= optimization.keys()

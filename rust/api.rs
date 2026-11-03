@@ -525,17 +525,18 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
                 "completed run already has a different result"
             );
             if finished.is_none() {
+                // The result statuses live on the run row (v0.5.30), not in kv.
                 tx.execute(
-                    "UPDATE runs SET status=?,finished_at=?,detail=? WHERE id=? AND job_id=?",
+                    "UPDATE runs SET status=?,finished_at=?,detail=?,result=? WHERE id=? AND job_id=?",
                     rusqlite::params![
                         p["status"].as_str().context("invalid run status")?,
                         crate::now(),
                         p["detail"].as_str().unwrap_or(""),
+                        json!({"execution_status":p["execution_status"],"completion_status":p["completion_status"],"notification_status":p["notification_status"]}).to_string(),
                         id,
                         job
                     ],
                 )?;
-                tx.execute("INSERT INTO kv VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![format!("run-result:{id}"),json!({"execution_status":p["execution_status"],"completion_status":p["completion_status"],"notification_status":p["notification_status"]}).to_string()])?;
             }
             tx.commit()?;
             Ok(Value::Null)

@@ -2,9 +2,17 @@
 
 Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
+## v0.5.30 请求锁入库、状态版本与完成缓冲下线
+
+- **请求锁改存 SQLite**：每个请求的 `run/request-<哈希>.lock`／`run/dispatch-<哈希>.lock` 改为任务库 `supervisor/task-state.sqlite3` 中 `locks` 表的一行（`request:<请求>`），持有者记为 `<boot_id>:<pid>:<进程启动时刻>`；持有进程退出即视为释放，不按时间猜测。调度器取锁后把所有权移交给 `resume` 子进程。旧的锁回收器（`lock_reaper`）移除，改为每小时（及解冻后）清理已失效的行和未被持有的空旧锁文件；`diagnostics.locks` 改为 `{held, released, legacy_files_removed, directory_entries, …}`。job、配额、准入、摘要、守护进程、运维、模块租约与部署锁仍是文件锁。`pylon drain-status` 同时检查新表与旧锁文件。
+- **状态版本**：网关库使用 `PRAGMA user_version` 记录格式版本（本版为 1，只前进不后退）；启动时在同一写事务内补齐 `runs.result` 列并写入版本，遇到更高版本拒绝启动。`downgrade-check` 改为按目标版本可读的最高状态版本判断：支持目标 0.5.11–0.5.29（不含已撤回的 0.5.18），状态版本高于目标可读上限时返回 `state_requires_newer_gateway`；0.5.10 及更早目标不再支持。旧完成缓冲仍须为空。
+- **完成缓冲下线**：投递回执与命令结果直接写入数据库（数据库忙时最多重试 75 秒，覆盖 60 秒的写锁，并响应停止信号），不再写 `gateway/completions/`。未写入的结果保持 `sending`／`running`，由工作线程退出或重启恢复标为待核对，不会重发或重复执行。启动时若发现旧版本遗留的完成记录则拒绝启动，需先用旧版本处理完毕。`completions_pending` 仍报告旧缓冲文件数（应为 0）；诊断移除 `completion_scans`。
+- **运行结果并入 runs**：`run.finish` 把结果写入 `runs.result`，不再写 `run-result:` 键；每日孤儿清理把旧键并入对应 run 后删除，删除 run 时同时删除旧键。
+- 支持回退至 v0.5.29：新增的表、列和 `user_version` 对旧版本无影响，旧版本不读取 `runs.result`；回退前 `downgrade-check --target-version 0.5.29` 须通过。
+
 ## v0.5.29 模块级授权、默认路由与单模块拒绝
 
-- **模块级能力授权**（`/etc/pylon/capabilities.json`，root 所有）：授权条目写 `"modules": ["<模块>"]` 且不写 `origins`（或 `origins` 含 `"module:*"`），或在 `origins` 中写 `"module:<模块>"`，即对该模块的所有执行来源生效（`command`、`callback`、`service:<id>`、`job:<id>`、文档等），模块新增任务无需再改授权文件。仍然要求：模块 `module.json` 的 `capabilities` 声明了该能力、helper 的 `trusted()` 参数与 `trusted_paths` 校验通过、授权文件由 root 所有。原有写法不变：`origins` 列出具体来源时只对这些来源生效，`job:<id>` 绑定的授权可省略 `modules`；`"origins": []` 或空条目 `{}` 一律拒绝。注意：v0.5.28 及更早版本不认识模块级写法，回退前需改回具体来源。
+- **模块级能力授权**（`config/capabilities.json`，须 root 所有）：授权条目写 `"modules": ["<模块>"]` 且不写 `origins`（或 `origins` 含 `"module:*"`），或在 `origins` 中写 `"module:<模块>"`，即对该模块的所有执行来源生效（`command`、`callback`、`service:<id>`、`job:<id>`、文档等），模块新增任务无需再改授权文件。仍然要求：模块 `module.json` 的 `capabilities` 声明了该能力、helper 的 `trusted()` 参数与 `trusted_paths` 校验通过、授权文件由 root 所有。原有写法不变：`origins` 列出具体来源时只对这些来源生效，`job:<id>` 绑定的授权可省略 `modules`；`"origins": []` 或空条目 `{}` 一律拒绝。注意：v0.5.28 及更早版本不认识模块级写法，回退前需改回具体来源。
 - **默认路由**：未在 `routes` 中配置的话题（任务、服务、命令、通知）改由默认路由发送。默认路由用 `pylon routes set '*' <bot>` 显式配置（`routes["*"]`）；未配置时使用名为 `default` 且已启用的机器人；两者都没有时该话题仍视为未配置，只拒绝使用它的模块。临时覆盖（`route_overrides`）只作用于显式配置的话题。`delivery.submit` 未指定话题时仍用当前上下文的机器人。使用默认路由的话题在加载时写一条警告日志（`{"event":"warning","kind":"route-fallback","bot":…,"topics":[…]}`），`diagnostics` 新增 `route_fallback: {bot, topics}`；`pylon routes list` 输出 `fallback`。
 - **单模块拒绝**：清单错误、命令／回调／任务冲突（按模块 ID 顺序，后者被拒）、依赖缺失或循环、工作区或话题未配置只拒绝出错的模块，其余模块照常加载，不再整体拒绝配置（`configuration_rejected` 只用于设置或凭据本身无效）。被拒模块写警告日志（`kind: module-rejected`，含模块 ID 与原因），`diagnostics.modules_rejected` 列出 `{模块: 原因}`，被拒模块不计入目录哈希。`pylon check` 与 `pylon modules check` 仍在有被拒模块时失败；安装、回滚和 `pylon ops` 变更只要新增被拒模块（或目标模块被拒）就失败。
 - **工作区自动注册**：安装模块时，清单引用但 `bots.json` 中不存在的工作区会像运行身份一样自动注册（`root: profiles/<id>`、`env: profiles/<id>/.env`，目录 `2770 root:<profiles 属组>`），并写警告日志 `workspace-registered`。

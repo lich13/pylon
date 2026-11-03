@@ -63,17 +63,22 @@ pub fn drain_status(config: &Config) -> Result<DrainStatus> {
     };
     let mut query = queue.prepare("SELECT id FROM requests WHERE state='queued'")?;
     for id in query.query_map([], |r| r.get::<_, String>(0))? {
-        let hash = crate::digest(id?);
+        let id = id?;
+        // Request locks live in SQLite; also honour lock files of an older
+        // gateway that is still running while this binary inspects it.
+        let hash = crate::digest(&id);
+        let mut held = crate::request_lock::held(&queue, &id)?;
         for prefix in ["request", "dispatch"] {
-            if runtime::existing_task_lock_held(
-                &config
-                    .home
-                    .join("run")
-                    .join(format!("{prefix}-{hash}.lock")),
-            )? {
-                status.starting += 1;
-                break;
-            }
+            held = held
+                || runtime::existing_task_lock_held(
+                    &config
+                        .home
+                        .join("run")
+                        .join(format!("{prefix}-{hash}.lock")),
+                )?;
+        }
+        if held {
+            status.starting += 1;
         }
     }
     status.completions = status
@@ -147,6 +152,25 @@ mod tests {
         assert_eq!(status.starting, 1);
         assert!(!status.ready);
         drop(lock);
+        assert!(drain_status(&config).unwrap().ready);
+        // v0.5.30 request locks are SQLite rows owned by a live process.
+        db.execute_batch(crate::request_lock::SCHEMA).unwrap();
+        let owner = crate::request_lock::identity(std::process::id())
+            .unwrap()
+            .unwrap();
+        db.execute(
+            "INSERT INTO locks VALUES('request:old-active',?,0)",
+            [&owner],
+        )
+        .unwrap();
+        let status = drain_status(&config).unwrap();
+        assert_eq!(status.starting, 1);
+        assert!(!status.ready);
+        db.execute(
+            "UPDATE locks SET owner='dead-boot:1:1' WHERE name='request:old-active'",
+            [],
+        )
+        .unwrap();
         assert!(drain_status(&config).unwrap().ready);
         fs::remove_file(config.home.join("run/freeze")).unwrap();
         assert!(!drain_status(&config).unwrap().ready);

@@ -1,35 +1,24 @@
-//! Private, durable completion mailbox. Reconciliation never performs remote work.
+//! Direct, transactional completion writes. v0.5.30 removed the file mailbox:
+//! a result that cannot be committed leaves its row `sending`/`running`, which
+//! worker retirement or startup recovery marks uncertain. Nothing is replayed.
 use crate::db::Store;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, atomic::Ordering},
+    fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::Path,
     time::Duration,
 };
 use tokio::sync::watch;
 
-const LIMIT: u64 = 16 * 1024 * 1024;
-static ACTIVE: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
-// Serialize checkpoint replacement with commit/unlink, never SQLite lock waits.
-static FILES: Mutex<()> = Mutex::new(());
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 pub(crate) struct Completion {
-    version: u32,
-    nonce: String,
     result: Outcome,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "type", deny_unknown_fields)]
+#[derive(Clone)]
 enum Outcome {
     Delivery {
         id: String,
@@ -61,8 +50,6 @@ impl Completion {
         delay: f64,
     ) -> Result<Self> {
         Ok(Self {
-            version: 1,
-            nonce: uuid::Uuid::new_v4().to_string(),
             result: Outcome::Delivery {
                 id: event["id"].as_str().context("event id missing")?.into(),
                 bot: event["profile"]
@@ -92,8 +79,6 @@ impl Completion {
         contexts: &[String],
     ) -> Self {
         Self {
-            version: 1,
-            nonce: uuid::Uuid::new_v4().to_string(),
             result: Outcome::Command {
                 bot: bot.into(),
                 update,
@@ -105,41 +90,10 @@ impl Completion {
             },
         }
     }
-
-    fn name(&self) -> String {
-        let key = match &self.result {
-            Outcome::Delivery { id, bot, .. } => format!("delivery:{bot}:{id}"),
-            Outcome::Command { bot, update, .. } => format!("command:{bot}:{update}"),
-        };
-        format!("{}.json", crate::digest(key))
-    }
 }
 
-pub(crate) fn directory(store: &Store) -> Result<PathBuf> {
-    let path = store
-        .path
-        .parent()
-        .context("missing state directory")?
-        .join("completions");
-    match fs::DirBuilder::new().mode(0o700).create(&path) {
-        Ok(()) => {
-            File::open(path.parent().context("missing state directory")?)?.sync_all()?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
-    }
-    let metadata = fs::symlink_metadata(&path)?;
-    ensure!(
-        metadata.is_dir()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.permissions().mode() & 0o777 == 0o700,
-        "unsafe completion directory"
-    );
-    Ok(path)
-}
-
-/// Inspect the private mailbox without creating it or reading result payloads.
-/// A disappearing entry was reconciled concurrently; an unsafe entry is not empty.
+/// Count records left in the mailbox of v0.5.29 and older without reading
+/// them. This release cannot apply them; deployment requires zero.
 pub(crate) fn pending_count(database: &Path) -> Result<u64> {
     let state = fs::symlink_metadata(database)?;
     ensure!(
@@ -191,140 +145,9 @@ pub(crate) fn pending_count(database: &Path) -> Result<u64> {
     Ok(count)
 }
 
-/// Prevent the reconciler from finalizing a still-owned partial delivery.
-pub(crate) struct Hold(PathBuf, Option<Arc<crate::optimization::Runtime>>);
-impl Hold {
-    pub(crate) async fn delivery(
-        store: &Store,
-        event: &Value,
-        stop: &mut watch::Receiver<bool>,
-    ) -> Result<Self> {
-        Self::new(
-            store,
-            &Completion::delivery(event, "sending", None, "", 0.0)?,
-            stop,
-        )
-        .await
-    }
-    pub(crate) async fn new(
-        store: &Store,
-        result: &Completion,
-        stop: &mut watch::Receiver<bool>,
-    ) -> Result<Self> {
-        let path = directory(store)?.join(result.name());
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            {
-                let mut active = ACTIVE
-                    .get_or_init(Default::default)
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("completion ownership unavailable"))?;
-                if active.insert(path.clone()) {
-                    return Ok(Self(path, Some(store.runtime.clone())));
-                }
-            }
-            // Reconciliation may just have committed pending, allowing the next
-            // claim before its file unlink completes. Wait for ownership transfer.
-            if *stop.borrow() {
-                return Err(crate::errors::ReconcileRequired.into());
-            }
-            tokio::select! {
-                _ = stop.changed() => return Err(crate::errors::ReconcileRequired.into()),
-                _ = tokio::time::sleep_until(deadline) => return Err(crate::errors::ReconcileRequired.into()),
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
-            }
-        }
-    }
-}
-impl Drop for Hold {
-    fn drop(&mut self) {
-        if let Ok(mut active) = ACTIVE.get_or_init(Default::default).lock() {
-            active.remove(&self.0);
-        }
-        if let Some(runtime) = &self.1 {
-            runtime.completion.notify();
-        }
-    }
-}
-
-fn read(path: &Path) -> Result<Completion> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.nlink() == 1
-            && metadata.permissions().mode() & 0o777 == 0o600
-            && metadata.len() <= LIMIT,
-        "unsafe completion file"
-    );
-    let mut bytes = Vec::new();
-    (&mut file).take(LIMIT + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() as u64 <= LIMIT, "completion too large");
-    let value: Completion = serde_json::from_slice(&bytes)?;
-    ensure!(
-        value.version == 1
-            && path.file_name().and_then(|s| s.to_str()) == Some(value.name().as_str()),
-        "invalid completion identity"
-    );
-    Ok(value)
-}
-
-fn save(store: &Store, record: &Completion) -> Result<PathBuf> {
-    let _files = FILES
-        .lock()
-        .map_err(|_| anyhow::anyhow!("completion writer unavailable"))?;
-    let root = directory(store)?;
-    let path = root.join(record.name());
-    if fs::symlink_metadata(&path).is_ok() {
-        read(&path)?;
-    }
-    let temporary = root.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)?;
-        let bytes = serde_json::to_vec(record)?;
-        ensure!(bytes.len() as u64 <= LIMIT, "completion too large");
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, &path)?;
-        File::open(&root)?.sync_all()?;
-        Ok(())
-    })();
-    if temporary.exists() {
-        fs::remove_file(&temporary)?;
-    }
-    result?;
-    store.runtime.completion.notify();
-    Ok(path)
-}
-
-fn apply(store: &Store, path: &Path, recovering: bool) -> Result<()> {
+fn apply(store: &Store, record: &Completion) -> Result<()> {
     let mut db = store.connect()?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let _files = FILES
-        .lock()
-        .map_err(|_| anyhow::anyhow!("completion writer unavailable"))?;
-    // Read after acquiring the write transaction, so an older queued attempt cannot
-    // overwrite a later checkpoint. Missing files were already committed/removed.
-    let record = match read(path) {
-        Ok(value) => value,
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
     let mut ready = None;
     match &record.result {
         Outcome::Delivery {
@@ -367,7 +190,7 @@ fn apply(store: &Store, path: &Path, recovering: bool) -> Result<()> {
                 if let (Some(Value::Array(old)), Some(Value::Array(new))) = (&previous, receipt) {
                     ensure!(new.starts_with(old), "completion receipt regressed");
                 }
-                let status = if status == "sending" && (recovering || current == "uncertain") {
+                let status = if status == "sending" && current == "uncertain" {
                     "uncertain"
                 } else {
                     status
@@ -421,26 +244,17 @@ fn apply(store: &Store, path: &Path, recovering: bool) -> Result<()> {
             .runtime
             .delivery_ready(&bot, crate::optimization::Lane::delivery(bark));
     }
-    // Keep partial checkpoints until the next outcome or reconciliation. A
-    // blocking writer may finish after its async waiter times out; deleting this
-    // checkpoint could otherwise leave an ownerless `sending` row forever.
-    let partial = !recovering
-        && matches!(&record.result, Outcome::Delivery { status, .. } if status == "sending");
-    // A crash here is harmless: applying the same completed record is idempotent.
-    if !partial && read(path).is_ok_and(|current| current.nonce == record.nonce) {
-        fs::remove_file(path)?;
-        File::open(path.parent().context("missing completion directory")?)?.sync_all()?;
-    }
     Ok(())
 }
 
-/// False means durably deferred, not failed or permission to repeat remote work.
+/// False means not committed before stop/deadline; never permission to repeat
+/// remote work. The claimed row stays for uncertain reconciliation.
 pub(crate) async fn persist(
     store: &Store,
     record: Completion,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<bool> {
-    persist_for(store, record, stop, Duration::from_secs(60)).await
+    persist_for(store, record, stop, Duration::from_secs(75)).await
 }
 
 async fn persist_for(
@@ -449,12 +263,12 @@ async fn persist_for(
     stop: &mut watch::Receiver<bool>,
     budget: Duration,
 ) -> Result<bool> {
-    let path = stage(store, record).await?;
+    let record = std::sync::Arc::new(record);
     let deadline = tokio::time::Instant::now() + budget;
     let mut backoff = Duration::from_millis(250);
     loop {
-        let path = path.clone();
-        let attempt = store.blocking(move |store| apply(&store, &path, false));
+        let record = record.clone();
+        let attempt = store.blocking(move |store| apply(&store, &record));
         if *stop.borrow() {
             // Give an available database a brief chance to commit the final
             // result; a busy database cannot hold up worker retirement.
@@ -485,91 +299,7 @@ async fn persist_for(
     }
 }
 
-pub(crate) async fn stage(store: &Store, record: Completion) -> Result<PathBuf> {
-    let saved = store.clone();
-    tokio::task::spawn_blocking(move || save(&saved, &record))
-        .await
-        .context("completion writer failed")?
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct Scan {
-    entries: u64,
-    active: u64,
-    failed: u64,
-}
-impl Scan {
-    fn empty(&self) -> bool {
-        self.entries == 0 && self.active == 0 && self.failed == 0
-    }
-}
-
-pub(crate) fn reconcile(store: &Store) -> Result<()> {
-    reconcile_scan(store).map(|_| ())
-}
-
-fn reconcile_scan(store: &Store) -> Result<Scan> {
-    store
-        .runtime
-        .metrics
-        .completion_scans
-        .fetch_add(1, Ordering::Relaxed);
-    let mut scan = Scan::default();
-    let root = directory(store)?;
-    for entry in fs::read_dir(root)? {
-        let path = entry?.path();
-        scan.entries += 1;
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let mut active = ACTIVE
-            .get_or_init(Default::default)
-            .lock()
-            .map_err(|_| anyhow::anyhow!("completion ownership unavailable"))?;
-        if !active.insert(path.clone()) {
-            scan.active += 1;
-            continue;
-        }
-        drop(active);
-        let _hold = Hold(path.clone(), None);
-        if let Err(error) = apply(store, &path, true) {
-            scan.failed += 1;
-            crate::errors::log("completion-reconcile", &error);
-            if crate::errors::retryable(&error) {
-                return Err(error);
-            }
-        }
-    }
-    Ok(scan)
-}
-
-pub(crate) async fn run(store: Store) {
-    let mut changed = store.runtime.completion.subscribe();
-    let mut idle = crate::optimization::Idle::default();
-    loop {
-        // Mark before scanning: a write during/after the scan must stay unseen.
-        changed.borrow_and_update();
-        let result = store.blocking(|s| reconcile_scan(&s)).await;
-        let delay = match result {
-            Ok(scan) if scan.empty() => idle.next(&crate::optimization::COMPLETION_IDLE),
-            other => {
-                idle.reset();
-                if let Err(error) = other {
-                    crate::errors::log("completion-reconcile", &error);
-                }
-                Duration::from_secs(1)
-            }
-        };
-        tokio::select! {
-            _ = changed.changed() => {},
-            _ = tokio::time::sleep(delay) => {},
-        }
-    }
-}
-
 pub(crate) fn interrupt_bot(store: &Store, bot: &str) -> Result<()> {
-    // Known results win over generic interrupted-state reconciliation.
-    reconcile(store)?;
     let mut db = store.connect()?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute("UPDATE events SET status='uncertain',error='delivery worker interrupted',updated_at=? WHERE profile=? AND status='sending'", params![crate::now(),bot])?;
