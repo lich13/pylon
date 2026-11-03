@@ -336,7 +336,19 @@ mod tests {
         assert_eq!(sweep(&config).unwrap()["legacy_files_removed"], 1);
         assert!(!free.exists() && busy.exists() && job.exists());
         drop(holder);
-        assert_eq!(sweep(&config).unwrap()["legacy_files_removed"], 1);
+        // A child forked concurrently by another test can briefly share the
+        // released descriptor until its exec closes it; the next sweep retries.
+        let mut removed = 0;
+        for _ in 0..50 {
+            removed += sweep(&config).unwrap()["legacy_files_removed"]
+                .as_u64()
+                .unwrap();
+            if removed > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(removed, 1);
         assert!(!busy.exists() && job.exists());
     }
 }
