@@ -28,6 +28,9 @@ pub struct App {
     pub store: Store,
     pub snapshot: Arc<RwLock<Arc<Snapshot>>>,
     pub(crate) reload_guard: Arc<Mutex<Option<Arc<crate::reload::Inputs>>>>,
+    /// Wakes the supervisor after a forced reload so new or changed bots
+    /// start without waiting for the next five-second pass.
+    pub(crate) reloaded: Arc<tokio::sync::Notify>,
 }
 impl App {
     pub fn new(config: Config) -> Result<Self> {
@@ -43,6 +46,7 @@ impl App {
             store,
             snapshot: Arc::new(RwLock::new(Arc::new(snapshot))),
             reload_guard: Arc::new(Mutex::new(Some(Arc::new(inputs)))),
+            reloaded: Arc::new(tokio::sync::Notify::new()),
         })
     }
     pub async fn reload(&self) -> Result<()> {
@@ -77,6 +81,9 @@ impl App {
         };
         *self.snapshot.write().await = Arc::new(snapshot);
         *guard = Some(Arc::new(inputs));
+        if force {
+            self.reloaded.notify_one();
+        }
         Ok(true)
     }
 }
@@ -103,6 +110,53 @@ pub async fn rpc(config: &Config, method: &str, params: Value, context: &str) ->
     );
     Ok(response["value"].clone())
 }
+/// The topic a module context serves: a job's or service's topic, or the
+/// module's default notification topic for its CLI commands.
+pub(crate) fn context_topic<'a>(
+    module: &'a crate::catalog::Module,
+    origin: &str,
+) -> Option<&'a String> {
+    if let Some(id) = origin.strip_prefix("job:") {
+        module.manifest.jobs.get(id).map(|j| &j.topic)
+    } else if let Some(id) = origin.strip_prefix("service:") {
+        module.manifest.services.get(id).map(|s| &s.topic)
+    } else if origin.starts_with("cli:") {
+        module.manifest.notifications.get("default")
+    } else {
+        None
+    }
+}
+
+/// Module contexts fix their bot at `context.open`. Rebind job, service and
+/// CLI contexts to the topic's current route so bot removal or rerouting
+/// needs no module restart. Telegram-origin contexts keep the stored bot.
+async fn rebind(app: &App, ctx: &mut Value) {
+    let snapshot = app.snapshot.read().await.clone();
+    let origin = ctx["origin"].as_str().unwrap_or("");
+    let Some(module) = snapshot
+        .catalog
+        .modules
+        .get(ctx["module"].as_str().unwrap_or(""))
+    else {
+        return;
+    };
+    let Some(topic) = context_topic(module, origin) else {
+        return;
+    };
+    let stored = ctx["bot"].as_str().unwrap_or("");
+    let route = match snapshot.settings.route_overrides.get(topic.as_str()) {
+        // Only consult connection state when an override needs it.
+        Some(_) => snapshot.settings.effective_route(&app.store, topic),
+        None => snapshot.settings.routes.get(topic.as_str()).cloned(),
+    };
+    if let Some(route) = route
+        && route != stored
+        && snapshot.settings.bots.contains_key(&route)
+    {
+        ctx["bot"] = Value::String(route);
+    }
+}
+
 pub async fn dispatch(app: &App, r: &Value) -> Result<Value> {
     if r["api_version"] == 2 && r["method"] == "health" {
         return Ok(
@@ -169,9 +223,9 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
         };
         let bot = snapshot
             .settings
-            .routes
-            .get(topic)
+            .effective_route(&app.store, topic)
             .context("topic has no route")?;
+        let bot = bot.as_str();
         let token = crate::auth::context(&app.store, module, bot, workspace, origin)?;
         return Ok(
             json!({"token":token,"bot":bot,"workspace":workspace,"module_hash":module.hash}),
@@ -180,7 +234,8 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
     let token = r["context"]
         .as_str()
         .context("execution context required")?;
-    let ctx = crate::auth::inspect(&app.store, token)?;
+    let mut ctx = crate::auth::inspect(&app.store, token)?;
+    rebind(app, &mut ctx).await;
     let module = ctx["module"].as_str().context("module missing")?;
     if method.starts_with("auth.") {
         return crate::auth::request(app, &ctx, method, p).await;
@@ -233,17 +288,16 @@ async fn dispatch_inner(app: &App, r: &Value) -> Result<Value> {
         "delivery.submit" => {
             let snapshot = app.snapshot.read().await.clone();
             let fallback = ctx["bot"].as_str().context("bot missing")?;
+            let routed;
             let bot = if p["retain_target"] == true {
                 p["profile"]
                     .as_str()
                     .context("existing event target required")?
             } else {
-                snapshot
+                routed = snapshot
                     .settings
-                    .routes
-                    .get(p["topic"].as_str().unwrap_or(""))
-                    .map(String::as_str)
-                    .unwrap_or(fallback)
+                    .effective_route(&app.store, p["topic"].as_str().unwrap_or(""));
+                routed.as_deref().unwrap_or(fallback)
             };
             ensure!(snapshot.settings.bots.contains_key(bot), "unknown bot");
             ensure!(
@@ -620,6 +674,6 @@ fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
         .flatten();
     let freeze_alert = app.store.get("freeze-alert:last")?;
     Ok(
-        json!({"api_version":2,"metrics":{"storage":storage,"retention":retention,"optimization":app.store.runtime.metrics.snapshot(),"sqlite_busy":crate::db::busy_count(),"telegram_proxy_invalid":proxy_invalid,"telegram_response_invalid":response_invalid,"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"completions_pending":completions_pending,"sampled_at":crate::now(),"maintenance":freeze_present,"freeze":{"present":freeze_present,"age_seconds":freeze_age_seconds,"alert_after_seconds":snapshot.settings.admission.freeze_alert_after_seconds,"last_alert":freeze_alert},"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
+        json!({"api_version":2,"metrics":{"storage":storage,"retention":retention,"optimization":app.store.runtime.metrics.snapshot(),"sqlite_busy":crate::db::busy_count(),"telegram_proxy_invalid":proxy_invalid,"telegram_response_invalid":response_invalid,"workers":worker_metrics,"queued_count":queued_count,"oldest_queued_seconds":oldest_wait,"new_uncertain":new_uncertain},"version":env!("CARGO_PKG_VERSION"),"completions_pending":completions_pending,"sampled_at":crate::now(),"maintenance":freeze_present,"freeze":{"present":freeze_present,"age_seconds":freeze_age_seconds,"alert_after_seconds":snapshot.settings.admission.freeze_alert_after_seconds,"last_alert":freeze_alert},"bots":bots,"delivery":deliveries,"tasks":crate::queue::public(&app.config),"recent_failures":failures,"latest_runs":latest,"modules":snapshot.catalog.modules.iter().map(|(id,m)|json!({"id":id,"version":m.hash})).collect::<Vec<_>>(),"configuration_rejected":app.store.get("configuration-rejected")?,"settings_digest":crate::config::settings_digest(&snapshot.settings),"runtime":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pid":std::process::id()}}),
     )
 }

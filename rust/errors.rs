@@ -253,7 +253,11 @@ pub fn cli_message(error: &Error) -> &'static str {
         {
             return "symbolic link rejected";
         }
-        let safe = match cause.to_string().as_str() {
+        let text = cause.to_string();
+        if let Some(message) = crate::ops::MESSAGES.iter().find(|m| **m == text) {
+            return message;
+        }
+        let safe = match text.as_str() {
             "duplicate bot credential" => "duplicate bot credential",
             "duplicate or invalid command" => "duplicate or invalid command",
             "unsafe supervisor state directory" => "unsafe supervisor state directory",

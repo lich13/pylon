@@ -20,7 +20,8 @@ import time
 from pathlib import Path
 
 RELEASE = re.compile(r"(?:v\d+\.\d+\.\d+|stability|hardening)-[0-9a-f]{40}")
-BACKUP = re.compile(r"gateway-(\d{8}T\d{6}Z)(?:-[A-Za-z0-9._-]+)?")
+# gateway-<UTC>[-suffix] from deploys, gateway-ops-<UTC>-<op> from operator changes.
+BACKUP = re.compile(r"gateway-(?:ops-)?(\d{8}T\d{6}Z)(?:-[A-Za-z0-9._-]+)?")
 
 
 def release_of(path: Path, releases: Path) -> str | None:

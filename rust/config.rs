@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -79,6 +80,105 @@ pub struct Settings {
     pub groups: BTreeMap<String, ResourceGroup>,
     #[serde(default)]
     pub runtime_users: BTreeMap<String, RuntimeUser>,
+    /// Temporary topic routes; the base `routes` entry applies again after
+    /// `until` or once the base bot has been healthy long enough.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub route_overrides: BTreeMap<String, RouteOverride>,
+    #[serde(default)]
+    pub delivery: DeliveryPolicy,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RouteOverride {
+    pub bot: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert_when_healthy: Option<RevertWhenHealthy>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RevertWhenHealthy {
+    pub bot: String,
+    pub healthy_seconds: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DeliveryPolicy {
+    pub defer_while_failing: bool,
+    pub defer_window_seconds: u64,
+    pub defer_error_classes: Vec<String>,
+    pub max_defer_seconds: u64,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub paused: BTreeMap<String, Paused>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Paused {
+    pub until: f64,
+}
+pub const DEFER_CLASSES: &[&str] = &["timeout", "connect", "dns", "http_5xx"];
+pub const MIN_DURATION: u64 = 60;
+pub const MAX_DURATION: u64 = 7 * 86400;
+impl Default for DeliveryPolicy {
+    fn default() -> Self {
+        Self {
+            defer_while_failing: true,
+            defer_window_seconds: 120,
+            defer_error_classes: DEFER_CLASSES.iter().map(|c| c.to_string()).collect(),
+            max_defer_seconds: 3600,
+            paused: BTreeMap::new(),
+        }
+    }
+}
+impl DeliveryPolicy {
+    /// Pause end for a bot, when a planned outage is still in effect.
+    pub fn paused_until(&self, bot: &str, now: f64) -> Option<f64> {
+        self.paused
+            .get(bot)
+            .map(|p| p.until)
+            .filter(|until| *until > now)
+    }
+}
+impl Settings {
+    /// The bot that serves a topic now. An override applies while it has not
+    /// expired and, with `revert_when_healthy`, while the base bot has not been
+    /// connected for `healthy_seconds`. `connection` returns a bot's
+    /// `connection:<bot>` record. The daemon never rewrites configuration.
+    pub fn effective_route_with(
+        &self,
+        topic: &str,
+        now: f64,
+        connection: impl Fn(&str) -> Value,
+    ) -> Option<String> {
+        let base = self.routes.get(topic);
+        if let Some(o) = self.route_overrides.get(topic)
+            && o.until.is_none_or(|until| now < until)
+            && self.bots.get(&o.bot).is_some_and(|b| b.enabled)
+        {
+            let healthy = o.revert_when_healthy.as_ref().is_some_and(|r| {
+                let c = connection(&r.bot);
+                c["status"] == "ok"
+                    && c["since"]
+                        .as_f64()
+                        .is_some_and(|since| now - since >= r.healthy_seconds as f64)
+            });
+            if !healthy {
+                return Some(o.bot.clone());
+            }
+        }
+        base.cloned()
+    }
+    pub fn effective_route(&self, store: &crate::db::Store, topic: &str) -> Option<String> {
+        self.effective_route_with(topic, crate::now(), |bot| {
+            store
+                .get(&format!("connection:{bot}"))
+                .unwrap_or(Value::Null)
+        })
+    }
+    /// Whether a configured override has expired (removed by `routes clear --expired`).
+    pub fn override_expired(o: &RouteOverride, now: f64) -> bool {
+        o.until.is_some_and(|until| now >= until)
+    }
 }
 fn default_ip_family() -> String {
     "ipv4".into()
@@ -144,6 +244,47 @@ impl Config {
         }
         for target in s.routes.values() {
             ensure!(s.bots.contains_key(target), "unknown route bot");
+        }
+        let enabled = |id: &str| s.bots.get(id).is_some_and(|b| b.enabled);
+        for (topic, o) in &s.route_overrides {
+            ensure!(
+                crate::identifier(topic) && enabled(&o.bot),
+                "route override bot must exist and be enabled"
+            );
+            let base = s
+                .routes
+                .get(topic)
+                .context("route override needs a base route")?;
+            ensure!(
+                s.bots[base].owner == s.bots[&o.bot].owner,
+                "route override bot has a different owner"
+            );
+            ensure!(
+                o.until.is_none_or(|u| u.is_finite() && u > 0.0) && o.reason.len() <= 200,
+                "invalid route override"
+            );
+            if let Some(r) = &o.revert_when_healthy {
+                ensure!(
+                    s.bots.contains_key(&r.bot)
+                        && (MIN_DURATION..=MAX_DURATION).contains(&r.healthy_seconds),
+                    "invalid route override"
+                );
+            }
+        }
+        let d = &s.delivery;
+        ensure!(
+            (MIN_DURATION..=MAX_DURATION).contains(&d.defer_window_seconds)
+                && (MIN_DURATION..=MAX_DURATION).contains(&d.max_defer_seconds)
+                && d.defer_error_classes
+                    .iter()
+                    .all(|c| DEFER_CLASSES.contains(&c.as_str())),
+            "invalid delivery policy"
+        );
+        for (bot, paused) in &d.paused {
+            ensure!(
+                enabled(bot) && paused.until.is_finite() && paused.until > 0.0,
+                "paused bot must exist and be enabled"
+            );
         }
         let mut runtime_ids = BTreeSet::new();
         for (id, user) in &s.runtime_users {
@@ -251,16 +392,7 @@ impl Config {
             "credential changed while reading"
         );
         let token = token.trim().to_owned();
-        ensure!(
-            token
-                .split_once(':')
-                .is_some_and(|(a, b)| a.bytes().all(|c| c.is_ascii_digit())
-                    && !a.is_empty()
-                    && b.len() >= 20
-                    && b.bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))),
-            "invalid credential format"
-        );
+        ensure!(valid_token(&token), "invalid credential format");
         Ok(token)
     }
     pub fn db(&self) -> PathBuf {
@@ -329,10 +461,31 @@ impl Config {
     }
     pub fn resolve_bot(&self, topic: &str, fallback: &str) -> Result<String> {
         let s = self.settings()?;
-        let target = s.routes.get(topic).map(String::as_str).unwrap_or(fallback);
-        ensure!(s.bots.contains_key(target), "unknown bot");
-        Ok(target.to_string())
+        let routed = if self.db().is_file() {
+            s.effective_route(&crate::db::Store::new(&self.db())?, topic)
+        } else {
+            s.effective_route_with(topic, crate::now(), |_| Value::Null)
+        };
+        let target = routed.unwrap_or_else(|| fallback.to_owned());
+        ensure!(s.bots.contains_key(&target), "unknown bot");
+        Ok(target)
     }
+}
+/// Telegram bot token shape: numeric bot id, colon, secret part.
+pub fn valid_token(token: &str) -> bool {
+    token.len() <= 256
+        && token.split_once(':').is_some_and(|(a, b)| {
+            a.bytes().all(|c| c.is_ascii_digit())
+                && !a.is_empty()
+                && b.len() >= 20
+                && b.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+        })
+}
+/// Stable digest of normalized settings; diagnostics reports the loaded one so
+/// an operator change can confirm the gateway applied exactly what it wrote.
+pub fn settings_digest(settings: &Settings) -> String {
+    crate::digest(serde_json::to_vec(settings).unwrap_or_default())
 }
 pub fn read_env(path: &Path) -> Result<BTreeMap<String, String>> {
     if !path.exists() {

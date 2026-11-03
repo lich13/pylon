@@ -220,24 +220,53 @@ pub(crate) fn record(
 /// Whether a Telegram delivery should stay pending because the bot's poll
 /// failed recently with a transient upstream class. Stale records expire.
 pub fn should_defer(connection: &Value, now: f64) -> bool {
-    if connection["status"] != "failed" {
+    should_defer_with(connection, now, &crate::config::DeliveryPolicy::default())
+}
+
+/// Policy-driven form. Past `max_defer_seconds` of continuous failure the send
+/// is attempted anyway (see `deferral_exhausted`).
+pub fn should_defer_with(
+    connection: &Value,
+    now: f64,
+    policy: &crate::config::DeliveryPolicy,
+) -> bool {
+    if !policy.defer_while_failing || connection["status"] != "failed" {
         return false;
     }
     let Some(at) = connection["at"].as_f64() else {
         return false;
     };
     let age = now - at;
-    if !(0.0..=DEFER_WINDOW).contains(&age) {
+    if !(0.0..=policy.defer_window_seconds as f64).contains(&age) {
         return false;
     }
+    if deferral_exhausted(connection, now, policy) {
+        return false;
+    }
+    let allowed = |class: &str| policy.defer_error_classes.iter().any(|c| c == class);
     match connection["error_class"].as_str() {
-        Some("timeout" | "connect" | "dns") => true,
-        Some("http_status") => connection["http_status"]
-            .as_u64()
-            .or_else(|| connection["telegram_error_code"].as_u64())
-            .is_some_and(|code| code >= 500),
+        Some(class @ ("timeout" | "connect" | "dns")) => allowed(class),
+        Some("http_status") => {
+            allowed("http_5xx")
+                && connection["http_status"]
+                    .as_u64()
+                    .or_else(|| connection["telegram_error_code"].as_u64())
+                    .is_some_and(|code| code >= 500)
+        }
         _ => false,
     }
+}
+
+/// The bot has been failing continuously for longer than the policy allows.
+pub fn deferral_exhausted(
+    connection: &Value,
+    now: f64,
+    policy: &crate::config::DeliveryPolicy,
+) -> bool {
+    connection["status"] == "failed"
+        && connection["since"]
+            .as_f64()
+            .is_some_and(|since| now - since > policy.max_defer_seconds as f64)
 }
 
 /// Diagnose view: every field is present; older records keep their values.
@@ -411,6 +440,59 @@ mod tests {
             now
         ));
         assert!(!should_defer(&Value::Null, now));
+    }
+
+    #[test]
+    fn deferral_follows_the_configured_policy() {
+        let now = 10_000.0;
+        let failed = |class: &str, http: Value, since: f64| json!({"status":"failed","at":now - 1.0,"since":since,"error_class":class,"http_status":http});
+        let mut policy = crate::config::DeliveryPolicy::default();
+        assert!(should_defer_with(
+            &failed("timeout", Value::Null, now - 10.0),
+            now,
+            &policy
+        ));
+        assert!(!should_defer_with(
+            &failed("timeout", Value::Null, now - 3601.0),
+            now,
+            &policy
+        ));
+        assert!(deferral_exhausted(
+            &failed("timeout", Value::Null, now - 3601.0),
+            now,
+            &policy
+        ));
+        policy.defer_error_classes = vec!["dns".into()];
+        assert!(!should_defer_with(
+            &failed("timeout", Value::Null, now),
+            now,
+            &policy
+        ));
+        assert!(!should_defer_with(
+            &failed("http_status", json!(502), now),
+            now,
+            &policy
+        ));
+        assert!(should_defer_with(
+            &failed("dns", Value::Null, now),
+            now,
+            &policy
+        ));
+        policy.defer_while_failing = false;
+        assert!(!should_defer_with(
+            &failed("dns", Value::Null, now),
+            now,
+            &policy
+        ));
+        let mut wide = crate::config::DeliveryPolicy {
+            defer_window_seconds: 600,
+            ..Default::default()
+        };
+        let old =
+            json!({"status":"failed","at":now - 300.0,"since":now - 300.0,"error_class":"connect"});
+        assert!(should_defer_with(&old, now, &wide));
+        wide.defer_window_seconds = 120;
+        assert!(!should_defer_with(&old, now, &wide));
     }
 
     #[test]

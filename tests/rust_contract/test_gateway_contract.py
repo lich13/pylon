@@ -1020,6 +1020,9 @@ def test_fourth_bot_and_module_reload_without_replacing_gateway_or_binary(workdi
             "404",
             "--username",
             "bot_four",
+            "--skip-getme",
+            "--reason",
+            "fixture",
             input_text=_fake_token("bot_four", "404") + "\n",
         )
         assert added.returncode == 0, added.stderr

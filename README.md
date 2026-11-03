@@ -2,6 +2,35 @@
 
 Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
+## v0.5.28 机器人、路由与投递的运维命令
+
+所有写操作仅限 root（`--offline` 测试环境或家目录属主除外），持 `run/ops.lock` 串行执行，部署冻结（`run/freeze`）期间拒绝。每个写命令都支持 `--dry-run`：只输出预览（配置差异、凭据写入／移出数量、数据库计划、受影响的投递 ID），不写任何文件、不建备份（`"backup": null`）。预览和结果里的 `owner`、`credential`、`chat`、`chat_id`、`token` 一律显示为 `***`，不输出令牌、会话 ID 或消息正文。
+
+执行顺序：校验新配置（含凭据格式与唯一性、模块目录检查，数据库计划先在回滚事务里完整演练）→ 备份 → 写凭据与 `config/bots.json`（保留原权限与属主）→ 通知网关立即加载（`admin.reload`，核对 `diagnostics.settings_digest` 一致且 `configuration_rejected` 为空；非 root 时回落为 5 秒内自动加载）→ 执行数据库计划 → 按需等待机器人连接正常（60 秒）与菜单同步确认（75 秒）。中途失败时输出结果 JSON 和 `pylon ops restore <备份目录>`，并以“operator change failed; run the printed restore command”退出。
+
+命令一览：
+
+- `pylon bots list`：机器人、路由、连接与菜单状态、暂停投递截止时间（不显示 owner）。
+- `pylon bots add <id> --owner <数字> [--username <名>] [--token-file <文件>] [--skip-getme --reason <原因>] [--dry-run]`：令牌从标准输入或文件读取；默认先用 `getMe` 核对令牌，`--skip-getme` 必须附 `--reason`。重复令牌、格式错误拒绝。
+- `pylon bots rotate <id> [--token-file <文件>] [--skip-getme --reason <原因>] [--wait-healthy] [--dry-run]`：同一机器人换令牌（数字前缀必须一致），旧令牌留在备份里。
+- `pylon bots enable <id>`；`pylon bots disable <id> [--reroute-to <bot>] [--pending keep|retarget|discard] [--to <bot>]`：有路由指向该机器人时必须 `--reroute-to`，否则拒绝并列出相关话题；默认待发投递保留（`keep`）。
+- `pylon bots remove <id> [--reroute-to <bot>] [--pending retarget|discard] [--to <bot>] [--purge-state]`：有待发投递时必须指定 `--pending`；改投目标必须投递到同一会话。凭据文件移入备份，`--purge-state` 同时清理该机器人的运行状态行。
+- `pylon bots prune-state [--dry-run]`：删除已不在配置中的机器人的运行状态（`connection:`、`menu:`、`menu-state:`、`offset:`、`bot_started:`、`worker:<bot>:*`、`delivery-timing:<bot>:*` 等 kv 行，以及已结束的 `updates` 行）。只删除上述按机器人命名的状态键；投递历史、消息映射、`delivery-resolution:*` 与共享的 `uncertain:summary:<日期>` 不会删除；进行中的 `updates` 保留并在 `updates_kept` 中计数。
+- `pylon bots menu-resync <id>... | --all`：重新推送命令菜单并等待确认。`pylon bots check [--online]`、`pylon bots reload`（现在会等待网关确认加载）。
+- `pylon routes list`：每个话题的基础路由、临时覆盖与当前实际发送的机器人。`pylon routes set <topic> <bot>`（旧写法 `pylon routes <topic> <bot>` 仍可用）、`pylon routes unset <topic>`。
+- `pylon routes override <topic> --to <bot> (--for 30m|--until <RFC 3339>|--revert-when-healthy 10m) [--reason <原因>]`：临时改由另一个同会话的机器人发送，时长 60 秒到 7 天；`--revert-when-healthy` 在基础机器人连续正常达到该时长后自动回到基础路由。`pylon routes clear <topic> | --expired` 移除覆盖。
+- `pylon deliveries retarget <id>... | --from-bot <bot> --to <bot>`（v0.5.27，来源机器人已移除或已停用）、`pylon deliveries purge-bot <bot> --discard`（把该机器人全部待发投递标记为不发送）、`pylon deliveries defer <bot> --for <时长>` / `undefer <bot>`（计划内停机期间暂停发送尝试，投递保持待发）。`confirm`／`discard`／`resend` 新增 `--dry-run`。
+- `pylon ops restore <备份目录> [--dry-run]`：恢复 `bots.json` 与凭据；数据库变更不会回滚（结果中 `database_not_reverted: true`）。
+
+配置新增字段（`config/bots.json`）：
+
+- `route_overrides`：`{"<topic>": {"bot": "<bot>", "until": <unix 秒>, "revert_when_healthy": {"bot": "<基础机器人>", "healthy_seconds": <秒>}, "reason": "<原因>"}}`，覆盖机器人必须存在、启用且 owner 与基础路由相同。
+- `delivery.paused`：`{"<bot>": {"until": <unix 秒>}}`。
+
+模块的任务、服务与 CLI 执行上下文现在按话题的当前路由（含覆盖）重新绑定机器人，移除或改路由机器人后无需重启模块；Telegram 来源的上下文仍使用原机器人。管理加载后菜单在 1 秒内重新同步。
+
+备份目录为 `backups/gateway-ops-<UTC 时间>-<操作>`（0700，内含 `bots.json`、`secrets/<凭据>`、`db-plan.json`，文件 0600），发布清理脚本按名称中的时间识别；审计记录写入 `logs/ops.jsonl`（root 时同时写入 `pylon-ops` 系统日志），只含元数据。`diagnostics` 新增 `settings_digest`。支持回退至 v0.5.27：旧版本忽略 `route_overrides` 与 `delivery.paused`。
+
 ## v0.5.27 已移除机器人的待发投递改投
 
 - `pylon deliveries retarget <id>... --to <bot>` 或 `pylon deliveries retarget --from-bot <已移除的机器人> --to <bot>`（仅 root）：把配置中已不存在的机器人名下的待发（`pending`）文本／文件投递改由另一个已配置且启用的机器人发送。目标机器人的接收会话必须与原机器人历史送达回执中的会话完全一致（原会话未知或不一致时拒绝，输出不含会话 ID），已有回执（部分已发送）的记录、仍在配置中的来源机器人、非待发记录一律拒绝。所选记录在同一事务内全部改投或全部不变，不重置尝试次数，不会重复发送已送达的内容；`uncertain`、`sending` 等其他状态不会改投。正文中的 `reply_to_message_id` 指向原机器人会话的消息，改投时移除并在结果中标记 `reply_reference_removed`，按钮（`reply_markup`）保留。

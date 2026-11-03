@@ -29,6 +29,7 @@ fn fixture() -> (tempfile::TempDir, App, Bot) {
             credentials: BTreeMap::new(),
         }))),
         reload_guard: Arc::default(),
+        reloaded: Arc::default(),
     };
     (temp, app, bot)
 }

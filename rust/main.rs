@@ -1,9 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use pylon::{
-    api,
-    config::{Bot, Config, atomic_json},
-};
+use pylon::{api, config::Config};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -52,18 +49,31 @@ enum Command {
         #[arg(long, default_value = "{}")]
         params: String,
     },
+    /// Manage bots (writes are root only, backed up and audited).
     Bots {
         #[command(subcommand)]
         action: Bots,
     },
+    /// Show or change topic routes. `routes <topic> <bot>` is the old form of
+    /// `routes set`.
+    #[command(args_conflicts_with_subcommands = true)]
     Routes {
-        topic: String,
-        bot: String,
+        #[command(subcommand)]
+        action: Option<Routes>,
+        #[arg(hide = true)]
+        topic: Option<String>,
+        #[arg(hide = true)]
+        bot: Option<String>,
     },
     /// Inspect or resolve deliveries (root only; never prints message bodies).
     Deliveries {
         #[command(subcommand)]
         action: Deliveries,
+    },
+    /// Operator change backups.
+    Ops {
+        #[command(subcommand)]
+        action: Ops,
     },
     Modules {
         #[command(subcommand)]
@@ -71,21 +81,151 @@ enum Command {
     },
 }
 #[derive(Subcommand)]
+enum Ops {
+    /// Restore bots.json and credentials from a gateway-ops backup. Database
+    /// changes are not reverted.
+    Restore {
+        dir: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+#[derive(clap::Args)]
+struct Token {
+    /// Read the token from this file instead of stdin.
+    #[arg(long)]
+    token_file: Option<PathBuf>,
+    /// Do not verify the token with Telegram getMe (needs --reason).
+    #[arg(long)]
+    skip_getme: bool,
+    #[arg(long, default_value = "")]
+    reason: String,
+}
+#[derive(Subcommand)]
 enum Bots {
+    /// Bots with routes, connection and menu state (owners are not shown).
+    List,
+    /// Register a bot; the token is read from stdin or --token-file.
     Add {
         id: String,
         #[arg(long)]
         owner: String,
         #[arg(long, default_value = "")]
         username: String,
+        #[command(flatten)]
+        token: Token,
+        #[arg(long)]
+        dry_run: bool,
     },
+    /// Replace a bot token (same bot id); the old token is kept in the backup.
+    Rotate {
+        id: String,
+        #[command(flatten)]
+        token: Token,
+        /// Wait until the bot polls successfully with the new token.
+        #[arg(long)]
+        wait_healthy: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Enable a bot.
+    Enable {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Disable a bot; routed topics need --reroute-to.
+    Disable {
+        id: String,
+        #[arg(long, value_enum, default_value = "keep")]
+        pending: pylon::ops::Pending,
+        #[arg(long)]
+        to: Option<String>,
+        /// Move topics the bot serves to this bot.
+        #[arg(long)]
+        reroute_to: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove a bot; its credential moves into the backup.
+    Remove {
+        id: String,
+        #[arg(long, value_enum)]
+        pending: Option<pylon::ops::Pending>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        reroute_to: Option<String>,
+        /// Also delete the bot's runtime state rows.
+        #[arg(long)]
+        purge_state: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Delete runtime state rows of bots that are no longer configured.
+    PruneState {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Push the command menu again and wait for Telegram to confirm it.
+    MenuResync {
+        ids: Vec<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Validate credentials; --online also calls getMe.
     Check {
         #[arg(long)]
         online: bool,
     },
+    /// Ask the gateway to load the configuration now.
     Reload,
-    Disable {
-        id: String,
+}
+#[derive(Subcommand)]
+enum Routes {
+    /// Base route, override and the bot serving each topic now.
+    List,
+    /// Route a topic to an enabled bot.
+    Set {
+        topic: String,
+        bot: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove a topic route.
+    Unset {
+        topic: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Temporarily serve a topic from another bot.
+    Override {
+        topic: String,
+        #[arg(long)]
+        to: String,
+        /// Duration such as 30m, 2h or 1d (60s to 7d).
+        #[arg(long = "for")]
+        duration: Option<String>,
+        /// RFC 3339 end time.
+        #[arg(long)]
+        until: Option<String>,
+        /// Return to the base bot once it has been healthy this long.
+        #[arg(long)]
+        revert_when_healthy: Option<String>,
+        #[arg(long, default_value = "")]
+        reason: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove a topic override, or every expired one.
+    Clear {
+        topic: Option<String>,
+        #[arg(long)]
+        expired: bool,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 #[derive(Subcommand)]
@@ -98,26 +238,60 @@ enum Deliveries {
         limit: usize,
     },
     /// Mark an uncertain delivery as delivered after checking Telegram.
-    Confirm { id: String },
+    Confirm {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Mark an uncertain delivery as suppressed; nothing is sent.
-    Discard { id: String },
+    Discard {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Return an uncertain delivery to pending once; may duplicate a message.
     Resend {
         id: String,
         #[arg(long)]
         accept_duplicate_risk: bool,
+        #[arg(long)]
+        dry_run: bool,
     },
-    /// Move pending deliveries of a removed bot to a configured bot that
-    /// delivers to the same chat. All selected items move or none do.
+    /// Move pending deliveries of a removed or disabled bot to an enabled bot
+    /// that delivers to the same chat. All selected items move or none do.
     Retarget {
         /// Delivery ids (alternatively use --from-bot).
         ids: Vec<String>,
-        /// Select every pending delivery of this removed bot.
+        /// Select every pending delivery of this bot.
         #[arg(long)]
         from_bot: Option<String>,
         /// Configured, enabled bot that will deliver them.
         #[arg(long)]
         to: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Suppress every pending delivery of a bot.
+    PurgeBot {
+        bot: String,
+        #[arg(long)]
+        discard: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Hold new delivery attempts of a bot for a while (60s to 7d).
+    Defer {
+        bot: String,
+        #[arg(long = "for")]
+        duration: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Lift a deferral early.
+    Undefer {
+        bot: String,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 #[derive(Subcommand)]
@@ -325,55 +499,107 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
             .await?
         }
         Command::Bots { action } => match action {
+            Bots::List => pylon::ops::bots_list(&config)?,
             Bots::Add {
                 id,
                 owner,
                 username,
+                token,
+                dry_run,
             } => {
-                ensure!(
-                    pylon::identifier(&id)
-                        && !owner.is_empty()
-                        && owner.bytes().all(|b| b.is_ascii_digit()),
-                    "invalid bot identity"
-                );
-                let mut settings = config.settings()?;
-                ensure!(!settings.bots.contains_key(&id), "bot already registered");
-                let token = pylon::config::credential_input()?;
-                let credential = format!("bot-{id}");
-                let path = config.home.join("gateway/secrets").join(&credential);
-                std::fs::create_dir_all(path.parent().context("credential parent missing")?)?;
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut file = std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&path)?;
-                file.write_all(token.as_bytes())?;
-                file.sync_all()?;
-                if unsafe { libc::geteuid() } == 0 {
-                    use std::os::unix::fs::MetadataExt;
-                    let parent =
-                        std::fs::metadata(path.parent().context("credential parent missing")?)?;
-                    std::os::unix::fs::chown(&path, Some(parent.uid()), Some(parent.gid()))?;
-                }
-                settings.bots.insert(
-                    id.clone(),
-                    Bot {
-                        require_start: true,
-                        owner,
-                        credential,
-                        username,
-                        enabled: true,
-                        menus: vec![],
-                    },
-                );
-                if let Err(e) = config.validate_credentials(&settings) {
-                    std::fs::remove_file(path)?;
-                    return Err(e);
-                }
-                atomic_json(&config.home.join("config/bots.json"), &settings, 0o644)?;
-                json!({"ok":true,"bot":id})
+                let secret = read_token(&token, dry_run, None)?;
+                pylon::ops::preflight_token(&config, &secret.0, None)?;
+                let verified = verify(&config, &token, &secret, &username, dry_run).await?;
+                let args = json!({"id":id,"owner":owner,"username":username,"skip_getme":token.skip_getme,"reason":token.reason});
+                pylon::ops::run(&config, "bots-add", args, dry_run, |ctx| {
+                    let mut change = pylon::ops::bots_add(ctx, &id, &owner, &username, &secret.0)?;
+                    change.notes.insert("getme".into(), verified);
+                    Ok(change)
+                })
+                .await?
+            }
+            Bots::Rotate {
+                id,
+                token,
+                wait_healthy,
+                dry_run,
+            } => {
+                let settings = config.settings()?;
+                let bot = settings.bots.get(&id).context("unknown bot")?;
+                let current = config.token(bot)?;
+                let prefix = current.split_once(':').map(|(a, _)| a).unwrap_or("");
+                let secret = read_token(&token, dry_run, Some(prefix))?;
+                pylon::ops::preflight_token(&config, &secret.0, Some(&id))?;
+                let verified = verify(&config, &token, &secret, &bot.username, dry_run).await?;
+                let args = json!({"id":id,"skip_getme":token.skip_getme,"reason":token.reason,"wait_healthy":wait_healthy});
+                pylon::ops::run(&config, "bots-rotate", args, dry_run, |ctx| {
+                    let mut change = pylon::ops::bots_rotate(ctx, &id, &secret.0)?;
+                    change.notes.insert("getme".into(), verified);
+                    if wait_healthy {
+                        change.wait_healthy = vec![id.clone()];
+                    }
+                    Ok(change)
+                })
+                .await?
+            }
+            Bots::Enable { id, dry_run } => {
+                pylon::ops::run(&config, "bots-enable", json!({"id":id}), dry_run, |ctx| {
+                    pylon::ops::bots_enable(ctx, &id)
+                })
+                .await?
+            }
+            Bots::Disable {
+                id,
+                pending,
+                to,
+                reroute_to,
+                dry_run,
+            } => {
+                let args = json!({"id":id,"pending":format!("{pending:?}").to_lowercase(),"to":to,"reroute_to":reroute_to});
+                pylon::ops::run(&config, "bots-disable", args, dry_run, |ctx| {
+                    pylon::ops::bots_disable(
+                        ctx,
+                        &id,
+                        pending,
+                        to.as_deref(),
+                        reroute_to.as_deref(),
+                    )
+                })
+                .await?
+            }
+            Bots::Remove {
+                id,
+                pending,
+                to,
+                reroute_to,
+                purge_state,
+                dry_run,
+            } => {
+                let args = json!({"id":id,"pending":pending.map(|p| format!("{p:?}").to_lowercase()),"to":to,"reroute_to":reroute_to,"purge_state":purge_state});
+                pylon::ops::run(&config, "bots-remove", args, dry_run, |ctx| {
+                    pylon::ops::bots_remove(
+                        ctx,
+                        &id,
+                        pending,
+                        to.as_deref(),
+                        reroute_to.as_deref(),
+                        purge_state,
+                    )
+                })
+                .await?
+            }
+            Bots::PruneState { dry_run } => {
+                pylon::ops::run(&config, "bots-prune-state", json!({}), dry_run, |ctx| {
+                    pylon::ops::bots_prune_state(ctx)
+                })
+                .await?
+            }
+            Bots::MenuResync { ids, all, dry_run } => {
+                let args = json!({"ids":ids,"all":all});
+                pylon::ops::run(&config, "bots-menu-resync", args, dry_run, |ctx| {
+                    pylon::ops::bots_menu_resync(ctx, &ids, all)
+                })
+                .await?
             }
             Bots::Check { online } => {
                 let settings = config.settings()?;
@@ -422,13 +648,97 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
                 let s = config.settings()?;
                 config.validate_credentials(&s)?;
                 api::rpc(&config, "health", json!({}), "").await?;
-                json!({"ok":true,"reload":"configuration will apply within five seconds"})
+                match pylon::ops::reload(&config, &s).await? {
+                    "applied" => json!({"ok":true,"reload":"applied"}),
+                    _ => json!({"ok":true,"reload":"configuration will apply within five seconds"}),
+                }
             }
-            Bots::Disable { id } => {
-                let mut s = config.settings()?;
-                s.bots.get_mut(&id).context("unknown bot")?.enabled = false;
-                atomic_json(&config.home.join("config/bots.json"), &s, 0o644)?;
-                json!({"ok":true,"bot":id,"enabled":false})
+        },
+        Command::Routes { action, topic, bot } => match action {
+            None => {
+                let (Some(topic), Some(bot)) = (topic, bot) else {
+                    anyhow::bail!("unknown topic")
+                };
+                pylon::ops::run(
+                    &config,
+                    "routes-set",
+                    json!({"topic":topic,"bot":bot}),
+                    false,
+                    |ctx| pylon::ops::routes_set(ctx, &topic, &bot),
+                )
+                .await?
+            }
+            Some(Routes::List) => pylon::ops::routes_list(&config)?,
+            Some(Routes::Set {
+                topic,
+                bot,
+                dry_run,
+            }) => {
+                pylon::ops::run(
+                    &config,
+                    "routes-set",
+                    json!({"topic":topic,"bot":bot}),
+                    dry_run,
+                    |ctx| pylon::ops::routes_set(ctx, &topic, &bot),
+                )
+                .await?
+            }
+            Some(Routes::Unset { topic, dry_run }) => {
+                pylon::ops::run(
+                    &config,
+                    "routes-unset",
+                    json!({"topic":topic}),
+                    dry_run,
+                    |ctx| pylon::ops::routes_unset(ctx, &topic),
+                )
+                .await?
+            }
+            Some(Routes::Override {
+                topic,
+                to,
+                duration,
+                until,
+                revert_when_healthy,
+                reason,
+                dry_run,
+            }) => {
+                let args = json!({"topic":topic,"to":to,"for":duration,"until":until,
+                    "revert_when_healthy":revert_when_healthy,"reason":reason});
+                pylon::ops::run(&config, "routes-override", args, dry_run, |ctx| {
+                    pylon::ops::routes_override(
+                        ctx,
+                        &topic,
+                        &pylon::ops::OverrideArgs {
+                            to: &to,
+                            duration: duration.as_deref(),
+                            until: until.as_deref(),
+                            revert_when_healthy: revert_when_healthy.as_deref(),
+                            reason: &reason,
+                        },
+                        pylon::now(),
+                    )
+                })
+                .await?
+            }
+            Some(Routes::Clear {
+                topic,
+                expired,
+                dry_run,
+            }) => {
+                let args = json!({"topic":topic,"expired":expired});
+                pylon::ops::run(&config, "routes-clear", args, dry_run, |ctx| {
+                    pylon::ops::routes_clear(ctx, topic.as_deref(), expired, pylon::now())
+                })
+                .await?
+            }
+        },
+        Command::Ops { action } => match action {
+            Ops::Restore { dir, dry_run } => {
+                let args = json!({"dir":dir.display().to_string()});
+                pylon::ops::run(&config, "ops-restore", args, dry_run, |ctx| {
+                    pylon::ops::restore(ctx, &dir)
+                })
+                .await?
             }
         },
         Command::Deliveries { action } => {
@@ -440,53 +750,94 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
             ensure!(path.is_file(), "gateway state missing");
             let store = pylon::db::Store::new(&path)?;
             let actor = format!("uid:{}", unsafe { libc::geteuid() });
+            let preview = |id: &str, action: &str| -> Result<Value> {
+                let event = store.event(id)?;
+                Ok(
+                    json!({"ok":true,"dry_run":true,"action":action,"backup":null,
+                    "delivery":{"id":event["id"],"bot":event["profile"],"module":event["module"],
+                        "status":event["status"],"attempts":event["attempts"],"updated_at":event["updated_at"],
+                        "has_receipt":!event["receipt"].is_null()}}),
+                )
+            };
             match action {
                 Deliveries::List { status, limit } => {
                     let rows = store.deliveries(&status, limit)?;
                     json!({"status":status,"count":rows.len(),"deliveries":rows})
                 }
-                Deliveries::Confirm { id } => store.resolve_delivery(&id, "confirm", &actor)?,
-                Deliveries::Discard { id } => store.resolve_delivery(&id, "discard", &actor)?,
+                Deliveries::Confirm { id, dry_run: true } => preview(&id, "confirm")?,
+                Deliveries::Discard { id, dry_run: true } => preview(&id, "discard")?,
+                Deliveries::Confirm { id, .. } => store.resolve_delivery(&id, "confirm", &actor)?,
+                Deliveries::Discard { id, .. } => store.resolve_delivery(&id, "discard", &actor)?,
                 Deliveries::Resend {
                     id,
                     accept_duplicate_risk,
+                    dry_run,
                 } => {
-                    ensure!(
-                        accept_duplicate_risk,
-                        "resend can duplicate a message; pass --accept-duplicate-risk"
-                    );
-                    store.resolve_delivery(&id, "resend", &actor)?
-                }
-                Deliveries::Retarget { ids, from_bot, to } => {
-                    let s = config.settings()?;
-                    let target = s.bots.get(&to).context("unknown bot")?;
-                    ensure!(target.enabled, "target bot is disabled");
-                    let mut ids = ids;
-                    if let Some(source) = from_bot {
+                    if dry_run {
+                        preview(&id, "resend")?
+                    } else {
                         ensure!(
-                            !s.bots.contains_key(&source),
-                            "source bot is still configured"
+                            accept_duplicate_risk,
+                            "resend can duplicate a message; pass --accept-duplicate-risk"
                         );
-                        for id in store.pending_for_bot(&source)? {
-                            if !ids.contains(&id) {
-                                ids.push(id);
-                            }
-                        }
+                        store.resolve_delivery(&id, "resend", &actor)?
                     }
-                    let configured = s.bots.keys().cloned().collect::<Vec<_>>();
-                    let rows =
-                        store.retarget_deliveries(&ids, &to, &target.owner, &configured, &actor)?;
-                    json!({"ok":true,"to":to,"count":rows.len(),"deliveries":rows})
+                }
+                Deliveries::Retarget {
+                    ids,
+                    from_bot,
+                    to,
+                    dry_run,
+                } => {
+                    let args = json!({"ids":ids,"from_bot":from_bot,"to":to});
+                    let mut value =
+                        pylon::ops::run(&config, "deliveries-retarget", args, dry_run, |ctx| {
+                            pylon::ops::deliveries_retarget(ctx, &ids, from_bot.as_deref(), &to)
+                        })
+                        .await?;
+                    if !dry_run {
+                        value["to"] = json!(to);
+                        value["count"] = value["database"]["retargeted"].clone();
+                        value["deliveries"] = value["database"]["deliveries"].take();
+                    }
+                    value
+                }
+                Deliveries::PurgeBot {
+                    bot,
+                    discard,
+                    dry_run,
+                } => {
+                    pylon::ops::run(
+                        &config,
+                        "deliveries-purge-bot",
+                        json!({"bot":bot}),
+                        dry_run,
+                        |ctx| pylon::ops::deliveries_purge_bot(ctx, &bot, discard),
+                    )
+                    .await?
+                }
+                Deliveries::Defer {
+                    bot,
+                    duration,
+                    dry_run,
+                } => {
+                    let args = json!({"bot":bot,"for":duration});
+                    pylon::ops::run(&config, "deliveries-defer", args, dry_run, |ctx| {
+                        pylon::ops::deliveries_defer(ctx, &bot, &duration, pylon::now())
+                    })
+                    .await?
+                }
+                Deliveries::Undefer { bot, dry_run } => {
+                    pylon::ops::run(
+                        &config,
+                        "deliveries-undefer",
+                        json!({"bot":bot}),
+                        dry_run,
+                        |ctx| pylon::ops::deliveries_undefer(ctx, &bot),
+                    )
+                    .await?
                 }
             }
-        }
-        Command::Routes { topic, bot } => {
-            let mut s = config.settings()?;
-            ensure!(s.bots.contains_key(&bot), "unknown bot");
-            ensure!(pylon::identifier(&topic), "invalid topic");
-            s.routes.insert(topic, bot);
-            atomic_json(&config.home.join("config/bots.json"), &s, 0o644)?;
-            json!({"ok":true})
         }
         Command::Modules { action } => {
             pylon::isolated(async move {
@@ -582,4 +933,53 @@ fn developer_tool(directory: Option<PathBuf>, action: &str, args: &[String]) -> 
         .status()?;
     ensure!(status.success(), "module operation failed");
     Ok(())
+}
+
+/// Token text and whether it was supplied. A dry run without a token uses a
+/// well-formed placeholder so the preview still shows the change.
+fn read_token(token: &Token, dry_run: bool, prefix: Option<&str>) -> Result<(String, bool)> {
+    use std::io::{IsTerminal, Read};
+    let text = match &token.token_file {
+        Some(path) => {
+            let mut text = String::new();
+            std::fs::File::open(path)?
+                .take(4096)
+                .read_to_string(&mut text)?;
+            text.trim().to_owned()
+        }
+        None if dry_run => {
+            let mut text = String::new();
+            if !std::io::stdin().is_terminal() {
+                std::io::stdin().take(4096).read_to_string(&mut text)?;
+            }
+            text.trim().to_owned()
+        }
+        None => pylon::config::credential_input()?,
+    };
+    if text.is_empty() {
+        ensure!(dry_run, "credential required on stdin");
+        let id = prefix.filter(|p| !p.is_empty()).unwrap_or("1000000000");
+        return Ok((format!("{id}:{}", "x".repeat(35)), false));
+    }
+    Ok((text, true))
+}
+
+async fn verify(
+    config: &Config,
+    token: &Token,
+    secret: &(String, bool),
+    username: &str,
+    dry_run: bool,
+) -> Result<Value> {
+    if token.skip_getme {
+        ensure!(
+            !token.reason.trim().is_empty(),
+            "skipping getMe needs --reason"
+        );
+        return Ok(json!({"skipped":true}));
+    }
+    if dry_run && !secret.1 {
+        return Ok(json!({"skipped":true,"credential":"not supplied"}));
+    }
+    pylon::ops::verify_token(config, &secret.0, username).await
 }

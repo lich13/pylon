@@ -15,6 +15,7 @@ pub mod errors;
 mod event_history;
 mod lock_reaper;
 pub mod modules;
+pub mod ops;
 mod optimization;
 mod output;
 pub mod queue;

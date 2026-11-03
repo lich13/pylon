@@ -26,6 +26,7 @@ from test_gateway_contract import (
     event_status,
     open_context,
     rpc,
+    write_registry,
     rpc_value,
     seed_home,
     wait_for,
@@ -311,7 +312,9 @@ def test_connect_failure_leaves_delivery_pending(short_tmp_path):
         telegram.close()
 
 
-def test_removed_bot_old_context_submission_is_a_controlled_error_after_reload(short_tmp_path):
+def test_removed_bot_old_context_follows_route_or_is_a_controlled_error(short_tmp_path):
+    # v0.5.28: job/service/CLI contexts follow the topic's current route, so a
+    # removed bot needs no module restart. Contexts that cannot be rebound still fail.
     telegram = _LocalTelegram()
     try:
         home = short_tmp_path / "home"
@@ -330,6 +333,19 @@ def test_removed_bot_old_context_submission_is_a_controlled_error_after_reload(s
             settings["routes"]["topic_alpha"] = "bot_two"
             _write_settings(home, settings)
 
+            assert rpc_value(home, "admin.reload") == {"ok": True}
+            accepted = rpc(
+                home,
+                "delivery.submit",
+                _delivery_params("rerouted-context-event", "rerouted"),
+                context,
+            )
+            assert accepted.get("ok") is True, accepted
+            assert event_row(home, "rerouted-context-event")["profile"] == "bot_two"
+
+            # A context whose module left the catalog cannot be rebound and
+            # still carries the removed bot.
+            write_registry(home / "modules", [])
             assert rpc_value(home, "admin.reload") == {"ok": True}
             rejected = rpc(
                 home,

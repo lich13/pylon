@@ -94,3 +94,23 @@ def test_unresolved_previous_release_skips_release_pruning(tmp_path):
     result = run(home, units, "--keep", str(tmp_path / "elsewhere/pylon"))
     assert result["releases"]["status"] == "skipped_unresolved"
     assert sorted(p.name for p in releases.iterdir()) == before
+
+
+def test_operator_backups_are_dated_by_name_not_mtime(tmp_path):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("gateway_prune", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    home, _, backups, units, names = layout(tmp_path)
+    old = backups / "gateway-ops-20261001T000000Z-bots-remove"
+    recent = backups / "gateway-ops-20261030T120000Z-routes-set"
+    for path in (old, recent):
+        path.mkdir()
+    expected = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc).timestamp()
+    assert module.backup_time(old) == expected
+    assert module.backup_time(recent) == dt.datetime(2026, 10, 30, 12, tzinfo=dt.timezone.utc).timestamp()
+    result = run(home, units, "--keep", str(home / "releases" / names["previous"]))
+    assert "gateway-ops-20261001T000000Z-bots-remove" in result["backups"]["deleted"]
+    assert "gateway-ops-20261030T120000Z-routes-set" in result["backups"]["kept"]
+    assert not old.exists() and recent.exists()

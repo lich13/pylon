@@ -838,6 +838,7 @@ async fn maintenance_waits_ten_minutes_then_skips_frozen_hourly_rounds() {
             credentials: BTreeMap::new(),
         }))),
         reload_guard: Arc::default(),
+        reloaded: Arc::default(),
     };
     let (stop, receiver) = watch::channel(false);
     let gateway_task = tokio::spawn(gateway(app, receiver.clone()));

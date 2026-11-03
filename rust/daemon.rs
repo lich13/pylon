@@ -563,6 +563,7 @@ async fn lane_once_mode(
             },
         ),
         "menu" => {
+            let synced = app.snapshot.read().await.clone();
             let result = tokio::select! {
                 biased;
                 _ = stop.changed() => return Ok(LaneOutcome::Wait(0.0)),
@@ -578,7 +579,19 @@ async fn lane_once_mode(
                 })
                 .await?;
             result?;
-            Ok(LaneOutcome::Wait(30.0))
+            // Resync every 30 seconds, or within a second of a configuration
+            // or module catalog reload (routes and commands may have moved).
+            for _ in 0..30 {
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => return Ok(LaneOutcome::Wait(0.0)),
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+                if !std::sync::Arc::ptr_eq(&synced, &*app.snapshot.read().await) {
+                    break;
+                }
+            }
+            Ok(LaneOutcome::Wait(0.0))
         }
         _ => {
             if bot.require_start {
@@ -588,13 +601,21 @@ async fn lane_once_mode(
                 }
             }
             if lane == "telegram" {
+                let policy = app.snapshot.read().await.settings.delivery.clone();
+                let now = crate::now();
+                // A planned outage (`deliveries defer`) keeps events pending.
+                if let Some(until) = policy.paused_until(&id, now) {
+                    return Ok(LaneOutcome::Empty(Some(until.min(now + 30.0))));
+                }
                 // While polling shows a recent transient upstream failure, a
                 // send would most likely end uncertain. Keep events pending.
                 let key = format!("connection:{id}");
                 let connection = app.store.blocking(move |s| s.get(&key)).await?;
-                let now = crate::now();
-                if crate::connection::should_defer(&connection, now) {
+                if crate::connection::should_defer_with(&connection, now, &policy) {
                     return Ok(LaneOutcome::Empty(Some(now + 5.0)));
+                }
+                if crate::connection::deferral_exhausted(&connection, now, &policy) {
+                    log_deferral_exhausted(&id, &connection);
                 }
             }
             let claimed_bot = id.clone();
@@ -813,13 +834,31 @@ pub fn acquire_lock(config: &crate::config::Config) -> Result<std::fs::File> {
     Ok(lock)
 }
 
+/// Log once per failure episode that deferral gave up and sends are attempted.
+fn log_deferral_exhausted(bot: &str, connection: &Value) {
+    static SEEN: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::new(BTreeMap::new());
+    let since = connection["since"].as_f64().unwrap_or(0.0) as u64;
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.insert(bot.to_owned(), since) != Some(since) {
+        eprintln!(
+            "{}",
+            json!({"event":"delivery-deferral-exhausted","bot":bot,"failing_since":since})
+        );
+    }
+}
+
 pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
     app.store
         .blocking(|s| crate::completion::reconcile(&s))
         .await?;
     app.store.blocking(|s| s.recover()).await?;
-    if let Some(target) = app.snapshot.read().await.settings.routes.get("personal") {
-        let target = target.clone();
+    let personal = app
+        .snapshot
+        .read()
+        .await
+        .settings
+        .effective_route(&app.store, "personal");
+    if let Some(target) = personal {
         app.store
             .blocking(move |s| s.uncertain_digest(&target))
             .await?;
@@ -867,9 +906,7 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
                         .read()
                         .await
                         .settings
-                        .routes
-                        .get("personal")
-                        .cloned();
+                        .effective_route(&app.store, "personal");
                     match app
                         .store
                         .blocking(move |s| s.configuration_rejected(&hash, target.as_deref()))
@@ -969,11 +1006,10 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
                     (hash, tx, task)
                 });
             }
-            if let Some(target) = snapshot.settings.routes.get("personal")
-                && crate::now() >= next_digest
+            if crate::now() >= next_digest
+                && let Some(target) = snapshot.settings.effective_route(&app.store, "personal")
             {
                 next_digest = crate::now() + 60.0;
-                let target = target.clone();
                 if let Err(error) = app
                     .store
                     .blocking(move |s| s.uncertain_digest(&target))
@@ -991,9 +1027,8 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    if let Some(target) = snapshot.settings.routes.get("personal") {
-                        let target = target.clone();
-                        if let Err(error) = app
+                    if let Some(target) = snapshot.settings.effective_route(&app.store, "personal")
+                        && let Err(error) = app
                             .store
                             .blocking(move |s| {
                                 s.freeze_alert(
@@ -1004,9 +1039,8 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
                                 )
                             })
                             .await
-                        {
-                            crate::errors::log("freeze-alert", &error);
-                        }
+                    {
+                        crate::errors::log("freeze-alert", &error);
                     }
                 }
             }
@@ -1014,7 +1048,10 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
                 (&mut rpc).await.context("gateway RPC listener failed")??;
                 anyhow::bail!("gateway RPC listener stopped")
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                _ = app.reloaded.notified() => {}
+            }
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
@@ -1147,6 +1184,7 @@ mod tests {
                 credentials: BTreeMap::new(),
             }))),
             reload_guard: Arc::default(),
+            reloaded: Arc::default(),
         };
         let wanted = menu(&*app.snapshot.read().await);
         store

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{
@@ -95,6 +95,150 @@ fn source_chats(db: &Connection, bot: &str) -> Result<BTreeSet<String>> {
         }
     }
     Ok(chats)
+}
+
+/// Runtime state key families that belong to one bot. Delivery history and
+/// shared rows are deliberately absent.
+const BOT_STATE_PREFIXES: &[&str] = &[
+    "connection:",
+    "menu:",
+    "menu-state:",
+    "offset:",
+    "bot_started:",
+];
+const BOT_LANES: &[&str] = &["bark", "command", "menu", "poll", "telegram"];
+pub(crate) fn bot_state_key(key: &str) -> Option<&str> {
+    for prefix in BOT_STATE_PREFIXES {
+        if let Some(bot) = key.strip_prefix(prefix) {
+            return crate::identifier(bot).then_some(bot);
+        }
+    }
+    for prefix in ["worker:", "delivery-timing:"] {
+        if let Some((bot, lane)) = key.strip_prefix(prefix).and_then(|k| k.split_once(':'))
+            && BOT_LANES.contains(&lane)
+            && crate::identifier(bot)
+        {
+            return Some(bot);
+        }
+    }
+    None
+}
+#[derive(Debug, Default, serde::Serialize)]
+pub struct StaleState {
+    pub kv: Vec<String>,
+    /// Finished updates that would be removed, by bot.
+    pub updates: BTreeMap<String, i64>,
+    /// Pending or running updates that are kept, by bot.
+    pub updates_kept: BTreeMap<String, i64>,
+}
+pub(crate) struct RetargetRule<'a> {
+    pub target: &'a str,
+    pub target_owner: &'a str,
+    /// Configured and enabled bots; their deliveries never move.
+    pub live: &'a [String],
+    /// Configured owners of sources that are still configured.
+    pub known_owners: &'a BTreeMap<String, String>,
+}
+/// Selects deliveries by id or, at apply time, every pending one of a bot.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Selection {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_bot: Option<String>,
+}
+impl Selection {
+    fn resolve(&self, db: &Connection) -> Result<Vec<String>> {
+        let mut ids = self.ids.clone();
+        if let Some(bot) = &self.from_bot {
+            for id in ids_for_bot(db, bot, "pending")? {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+}
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct RetargetStep {
+    #[serde(flatten)]
+    pub select: Selection,
+    pub to: String,
+    #[serde(skip)]
+    pub to_owner: String,
+}
+impl RetargetStep {
+    fn resolve(&self, db: &Connection) -> Result<Vec<String>> {
+        self.select.resolve(db)
+    }
+}
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct DiscardStep {
+    #[serde(flatten)]
+    pub select: Selection,
+    pub reason: String,
+}
+impl DiscardStep {
+    fn resolve(&self, db: &Connection) -> Result<Vec<String>> {
+        self.select.resolve(db)
+    }
+}
+/// Database part of an operator change. Applied after configuration reload.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct OperatorPlan {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retarget: Vec<RetargetStep>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discard: Vec<DiscardStep>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delete_kv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delete_updates_for: Vec<String>,
+}
+impl OperatorPlan {
+    pub fn is_empty(&self) -> bool {
+        self.retarget.is_empty()
+            && self.discard.is_empty()
+            && self.delete_kv.is_empty()
+            && self.delete_updates_for.is_empty()
+    }
+}
+fn ids_for_bot(db: &Connection, bot: &str, status: &str) -> Result<Vec<String>> {
+    let mut query =
+        db.prepare("SELECT id FROM events WHERE status=? AND profile=? ORDER BY created_at,id")?;
+    let ids = query
+        .query_map([status, bot], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+fn resolution_on(db: &Connection, id: &str) -> Result<Value> {
+    let old: Option<String> = db
+        .query_row(
+            "SELECT value FROM kv WHERE key=?",
+            [format!("{RESOLUTION_PREFIX}{id}")],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(old
+        .and_then(|v| serde_json::from_str::<Value>(&v).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({})))
+}
+fn put_on(db: &Connection, key: &str, value: &Value) -> Result<()> {
+    db.execute(
+        "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, value.to_string()],
+    )?;
+    Ok(())
+}
+/// Operator output carries metadata only; receipts can name chats.
+fn public_event(mut event: Value) -> Value {
+    if let Some(object) = event.as_object_mut() {
+        let receipt = object.remove("receipt").unwrap_or(Value::Null);
+        object.insert("has_receipt".into(), json!(!receipt.is_null()));
+    }
+    event
 }
 
 pub(crate) const RESOLUTION_PREFIX: &str = "delivery-resolution:";
@@ -523,27 +667,49 @@ impl Store {
         }
         Ok(result)
     }
-    /// Moves pending deliveries whose bot was removed from configuration to
-    /// another configured bot, in one transaction (all or nothing). Only
-    /// untouched text/document items without receipts move, and only when
-    /// every chat the removed bot delivered to equals `target_owner`, so the
-    /// destination chat never changes and nothing already sent is re-sent.
-    /// Operator output carries metadata only.
+    /// Moves pending deliveries whose bot is no longer live (removed from
+    /// configuration, or disabled) to another enabled bot, in one transaction
+    /// (all or nothing). Only untouched text/document items without receipts
+    /// move, and only to the chat the source bot delivered to: `known_owners`
+    /// gives the configured owner of a still-configured source; otherwise every
+    /// chat in the source's receipts must equal `target_owner`. The destination
+    /// chat never changes and nothing already sent is re-sent. Operator output
+    /// carries metadata only.
     pub fn retarget_deliveries(
         &self,
         ids: &[String],
         target: &str,
         target_owner: &str,
-        configured: &[String],
+        live: &[String],
         actor: &str,
     ) -> Result<Vec<Value>> {
-        ensure!(!ids.is_empty(), "no deliveries selected");
-        ensure!(
-            configured.iter().any(|b| b == target) && !target_owner.is_empty(),
-            "target bot is not configured"
-        );
+        let rule = RetargetRule {
+            target,
+            target_owner,
+            live,
+            known_owners: &BTreeMap::new(),
+        };
         let mut db = self.connect()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let results = self.retarget_on(&tx, ids, &rule, actor)?;
+        tx.commit()?;
+        self.runtime
+            .delivery_ready(target, crate::optimization::Lane::delivery(false));
+        Ok(results)
+    }
+    pub(crate) fn retarget_on(
+        &self,
+        tx: &Connection,
+        ids: &[String],
+        rule: &RetargetRule<'_>,
+        actor: &str,
+    ) -> Result<Vec<Value>> {
+        let target = rule.target;
+        ensure!(!ids.is_empty(), "no deliveries selected");
+        ensure!(
+            rule.live.iter().any(|b| b == target) && !rule.target_owner.is_empty(),
+            "target bot is not configured"
+        );
         let now = crate::now();
         let mut checked_sources = BTreeSet::new();
         let mut results = Vec::new();
@@ -562,7 +728,7 @@ impl Store {
             );
             ensure!(source != target, "delivery already uses the target bot");
             ensure!(
-                !configured.contains(&source),
+                !rule.live.contains(&source),
                 "source bot is still configured"
             );
             ensure!(
@@ -575,15 +741,22 @@ impl Store {
                 .is_some_and(|r| !r.is_null() && r.as_array().is_none_or(|a| !a.is_empty()));
             ensure!(!partial, "delivery already has a receipt");
             if !checked_sources.contains(&source) {
-                let chats = source_chats(&tx, &source)?;
-                ensure!(
-                    !chats.is_empty(),
-                    "original chat of the removed bot is unknown"
-                );
-                ensure!(
-                    chats.len() == 1 && chats.contains(target_owner),
-                    "target bot delivers to a different chat"
-                );
+                if let Some(owner) = rule.known_owners.get(&source) {
+                    ensure!(
+                        owner == rule.target_owner,
+                        "target bot delivers to a different chat"
+                    );
+                } else {
+                    let chats = source_chats(tx, &source)?;
+                    ensure!(
+                        !chats.is_empty(),
+                        "original chat of the removed bot is unknown"
+                    );
+                    ensure!(
+                        chats.len() == 1 && chats.contains(rule.target_owner),
+                        "target bot delivers to a different chat"
+                    );
+                }
                 checked_sources.insert(source.clone());
             }
             // Message ids belong to the old bot's conversation; a reply
@@ -599,14 +772,7 @@ impl Store {
                 params![target, payload.to_string(), now, now, id, source],
             )?;
             ensure!(changed == 1, "delivery changed concurrently");
-            let key = format!("{RESOLUTION_PREFIX}{id}");
-            let old: Option<String> = tx
-                .query_row("SELECT value FROM kv WHERE key=?", [&key], |r| r.get(0))
-                .optional()?;
-            let mut resolution = old
-                .and_then(|v| serde_json::from_str::<Value>(&v).ok())
-                .filter(Value::is_object)
-                .unwrap_or_else(|| json!({}));
+            let mut resolution = resolution_on(tx, id)?;
             resolution["retargeted_from"] = json!(source);
             resolution["retargeted_to"] = json!(target);
             resolution["retargeted_at"] = json!(now);
@@ -614,21 +780,199 @@ impl Store {
             if reply_removed {
                 resolution["reply_reference_removed"] = json!(true);
             }
-            tx.execute(
-                "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![key, resolution.to_string()],
+            put_on(tx, &format!("{RESOLUTION_PREFIX}{id}"), &resolution)?;
+            results.push(public_event(
+                self.event_on(tx, id)?.context("unknown event")?,
+            ));
+        }
+        Ok(results)
+    }
+    /// Suppresses pending deliveries; nothing is sent. Records who and why.
+    pub(crate) fn discard_pending_on(
+        &self,
+        tx: &Connection,
+        ids: &[String],
+        reason: &str,
+        actor: &str,
+    ) -> Result<Vec<Value>> {
+        let now = crate::now();
+        let mut results = Vec::new();
+        for id in ids {
+            let previous: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT error FROM events WHERE id=? AND status='pending'",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let previous_error = previous.context("only pending deliveries can be discarded")?;
+            let changed = tx.execute(
+                "UPDATE events SET status='suppressed',error=?,updated_at=? WHERE id=? AND status='pending'",
+                params![reason, now, id],
             )?;
-            let mut result = self.event_on(&tx, id)?.context("unknown event")?;
-            if let Some(object) = result.as_object_mut() {
-                let receipt = object.remove("receipt").unwrap_or(Value::Null);
-                object.insert("has_receipt".into(), json!(!receipt.is_null()));
+            ensure!(changed == 1, "delivery changed concurrently");
+            let mut resolution = resolution_on(tx, id)?;
+            resolution["resolution"] = json!("discard");
+            resolution["resolved_at"] = json!(now);
+            resolution["resolved_by"] = json!(actor);
+            resolution["previous_status"] = json!("pending");
+            resolution["previous_error"] = json!(previous_error);
+            resolution["reason"] = json!(reason);
+            put_on(tx, &format!("{RESOLUTION_PREFIX}{id}"), &resolution)?;
+            results.push(public_event(
+                self.event_on(tx, id)?.context("unknown event")?,
+            ));
+        }
+        Ok(results)
+    }
+    /// Delivery ids of a bot in one status, oldest first.
+    pub fn deliveries_for_bot(&self, bot: &str, status: &str) -> Result<Vec<String>> {
+        let db = self.connect()?;
+        ids_for_bot(&db, bot, status)
+    }
+    /// Per-bot runtime state rows of bots that are not configured: kv rows of
+    /// the per-bot families and finished Telegram updates. Delivery history
+    /// (`event-gone*`), delivery resolutions and shared rows such as
+    /// `uncertain:summary:<day>` are never selected; pending or running updates
+    /// are kept. `only` restricts the selection to the named bots.
+    pub fn stale_bot_state(
+        &self,
+        configured: &BTreeSet<String>,
+        only: Option<&[String]>,
+    ) -> Result<StaleState> {
+        let db = self.connect()?;
+        let selected = |bot: &str| {
+            crate::identifier(bot)
+                && !configured.contains(bot)
+                && only.is_none_or(|o| o.iter().any(|b| b == bot))
+        };
+        let mut state = StaleState::default();
+        let mut query = db.prepare("SELECT key FROM kv ORDER BY key")?;
+        for key in query.query_map([], |r| r.get::<_, String>(0))? {
+            let key = key?;
+            if let Some(bot) = bot_state_key(&key)
+                && selected(bot)
+            {
+                state.kv.push(key);
             }
-            results.push(result);
+        }
+        let mut query = db.prepare(
+            "SELECT profile,status IN ('pending','running'),count(*) FROM updates GROUP BY profile,status IN ('pending','running') ORDER BY profile",
+        )?;
+        let rows = query
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, bool>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (bot, open, count) in rows {
+            if selected(&bot) {
+                let entry = if open {
+                    &mut state.updates_kept
+                } else {
+                    &mut state.updates
+                };
+                *entry.entry(bot).or_default() += count;
+            }
+        }
+        Ok(state)
+    }
+    /// Applies one operator plan in a single IMMEDIATE transaction.
+    pub fn apply_plan(
+        &self,
+        plan: &OperatorPlan,
+        live: &[String],
+        known_owners: &BTreeMap<String, String>,
+        actor: &str,
+    ) -> Result<Value> {
+        self.run_plan(plan, live, known_owners, actor, true)
+    }
+    /// Run every check of `apply_plan` and roll back, so refusals happen
+    /// before any backup or configuration write.
+    pub fn check_plan(
+        &self,
+        plan: &OperatorPlan,
+        live: &[String],
+        known_owners: &BTreeMap<String, String>,
+        actor: &str,
+    ) -> Result<Value> {
+        self.run_plan(plan, live, known_owners, actor, false)
+    }
+    fn run_plan(
+        &self,
+        plan: &OperatorPlan,
+        live: &[String],
+        known_owners: &BTreeMap<String, String>,
+        actor: &str,
+        commit: bool,
+    ) -> Result<Value> {
+        let mut db = self.connect()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut result = json!({"retargeted":0,"discarded":0,"kv_deleted":0,"updates_deleted":0});
+        let mut ready = BTreeSet::new();
+        let mut rows = Vec::new();
+        for step in &plan.retarget {
+            let ids = step.resolve(&tx)?;
+            if ids.is_empty() {
+                continue;
+            }
+            let rule = RetargetRule {
+                target: &step.to,
+                target_owner: &step.to_owner,
+                live,
+                known_owners,
+            };
+            let moved = self.retarget_on(&tx, &ids, &rule, actor)?;
+            result["retargeted"] =
+                json!(result["retargeted"].as_u64().unwrap_or(0) + moved.len() as u64);
+            rows.extend(moved);
+            ready.insert(step.to.clone());
+        }
+        for step in &plan.discard {
+            let ids = step.resolve(&tx)?;
+            if ids.is_empty() {
+                continue;
+            }
+            let reason = if step.reason.is_empty() {
+                "operator discarded"
+            } else {
+                step.reason.as_str()
+            };
+            let gone = self.discard_pending_on(&tx, &ids, reason, actor)?;
+            result["discarded"] =
+                json!(result["discarded"].as_u64().unwrap_or(0) + gone.len() as u64);
+        }
+        let mut kv = 0;
+        for key in &plan.delete_kv {
+            ensure!(
+                bot_state_key(key).is_some(),
+                "only per-bot state can be pruned"
+            );
+            kv += tx.execute("DELETE FROM kv WHERE key=?", [key])?;
+        }
+        let mut updates = 0;
+        for bot in &plan.delete_updates_for {
+            updates += tx.execute(
+                "DELETE FROM updates WHERE profile=? AND status NOT IN ('pending','running')",
+                [bot],
+            )?;
+        }
+        result["deliveries"] = json!(rows);
+        result["kv_deleted"] = json!(kv);
+        result["updates_deleted"] = json!(updates);
+        if !commit {
+            tx.rollback()?;
+            return Ok(result);
         }
         tx.commit()?;
-        self.runtime
-            .delivery_ready(target, crate::optimization::Lane::delivery(false));
-        Ok(results)
+        for bot in ready {
+            self.runtime
+                .delivery_ready(&bot, crate::optimization::Lane::delivery(false));
+        }
+        Ok(result)
     }
     /// Pending delivery ids still bound to `bot`.
     pub fn pending_for_bot(&self, bot: &str) -> Result<Vec<String>> {
