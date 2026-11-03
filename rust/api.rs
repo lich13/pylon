@@ -561,7 +561,7 @@ fn diagnostics_snapshot(app: &App, snapshot: &Snapshot) -> Result<Value> {
     let failures=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"finished_at":r.get::<_,Option<f64>>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     let mut q=db.prepare("WITH RECURSIVE jobs(job) AS (SELECT min(job_id) FROM runs UNION ALL SELECT (SELECT min(job_id) FROM runs WHERE job_id>jobs.job) FROM jobs WHERE job IS NOT NULL) SELECT r.id,r.job_id,r.status,r.finished_at FROM jobs JOIN runs r ON r.job_id=jobs.job AND r.started_at=(SELECT max(started_at) FROM runs WHERE job_id=jobs.job)")?;
     let latest=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"job_id":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"finished_at":r.get::<_,Option<f64>>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
-    let bots=snapshot.settings.bots.iter().map(|(id,bot)|Ok(json!({"id":id,"enabled":bot.enabled,"connection":app.store.get(&format!("connection:{id}"))?,"menu":app.store.get(&format!("menu-state:{id}"))?}))).collect::<Result<Vec<_>>>()?;
+    let bots=snapshot.settings.bots.iter().map(|(id,bot)|Ok(json!({"id":id,"enabled":bot.enabled,"connection":crate::connection::public(&app.store.get(&format!("connection:{id}"))?),"menu":app.store.get(&format!("menu-state:{id}"))?}))).collect::<Result<Vec<_>>>()?;
     let tasks = crate::queue::public(&app.config);
     let queued = tasks["requests"]
         .as_array()

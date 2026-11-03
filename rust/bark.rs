@@ -132,6 +132,7 @@ fn network_failure(error: reqwest::Error) -> Failure {
         },
         reason: "Bark network error".into(),
         delay: 30.0,
+        ..Default::default()
     }
 }
 
@@ -142,6 +143,7 @@ async fn response(response: reqwest::Response) -> Result<Value> {
             status: "pending",
             reason: "Bark rate limit".into(),
             delay: 60.0,
+            ..Default::default()
         }
         .into());
     }
@@ -149,6 +151,7 @@ async fn response(response: reqwest::Response) -> Result<Value> {
         status: "uncertain",
         reason: "Bark response invalid".into(),
         delay: 0.0,
+        ..Default::default()
     })?;
     if (200..300).contains(&status)
         && (!value.is_object()
@@ -159,6 +162,7 @@ async fn response(response: reqwest::Response) -> Result<Value> {
             status: "uncertain",
             reason: "Bark response invalid".into(),
             delay: 0.0,
+            ..Default::default()
         }
         .into());
     }
@@ -169,6 +173,7 @@ async fn response(response: reqwest::Response) -> Result<Value> {
             status: if status >= 500 { "uncertain" } else { "failed" },
             reason: format!("Bark HTTP {status}"),
             delay: 0.0,
+            ..Default::default()
         }
         .into());
     }
@@ -207,6 +212,7 @@ pub async fn send(payload: &Value) -> Result<Value> {
                 status: "pending",
                 reason: "Bark name resolution unavailable".into(),
                 delay: 30.0,
+                ..Default::default()
             })
         } else {
             e

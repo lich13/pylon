@@ -2,6 +2,16 @@
 
 Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
+## v0.5.26 Telegram 连接状态、轮询退避与待核对处理
+
+- 错误分类：Telegram 请求失败带固定取值的 `class`（`timeout`、`dns`、`tls`、`connect`、`http_status`、`unauthorized`、`conflict`、`rate_limited`、`invalid_response`）以及 `http_status`、`telegram_error_code`。传输错误先去掉请求 URL（含 token）再分类，不记录原始错误文本或 Telegram 描述。
+- 连接状态：`connection:<bot>` 与诊断 `bots[].connection` 字段为 `status`、`at`、`since`、`last_ok_at`、`consecutive_failures`、`error_class`、`http_status`、`telegram_error_code`、`elapsed_ms`、`retry_after`、`next_attempt_at`，诊断另含 `delivery_deferred`。仅在状态变化时（正常→失败、失败类别或 HTTP 状态改变、恢复）向 journal 写一行 `telegram-connection`，恢复时附 `outage_seconds`。
+- 轮询退避：连续失败按 `min(60, 2·2^(n-1))` 秒乘以 0.5–1 的随机系数退避，成功即复位；429 遵守 `retry_after`；401/404、409 固定等待 300 秒并在状态中标出类别。
+- 投递暂缓：某机器人的轮询在 120 秒内因 5xx、超时、连接或 DNS 失败时，该机器人的 Telegram 投递保持待发不再发送（避免变成待核对），轮询恢复后立即继续；超过 120 秒未更新的失败状态视为过期，不再暂缓。暂缓期间超过 `expires_at` 的事件按原规则不再发送。
+- 待核对处理（仅 root）：`pylon deliveries list --status uncertain [--limit 50]` 只列元数据（不含正文与回执）；`pylon deliveries confirm <id>` 标为已送达；`pylon deliveries discard <id>` 标为不再发送；`pylon deliveries resend <id> --accept-duplicate-risk` 退回待发，每条仅允许一次，可能产生重复消息。只作用于 `uncertain` 记录，单事务完成，结果写入 `delivery-resolution:<id>`，模块经 `delivery.get` 看到新状态及 `resolution`（`resolution`、`resolved_at`、`resolved_by`、`previous_status`、`previous_error`、`resend_count`）。
+- `pylon bots check --online` 逐个机器人各输出一行 JSON（`id`、`verified`、`error_class`、`http_status`、`telegram_error_code`、`elapsed_ms`），任一失败时退出码为 1。
+- 仅新增状态键与 JSON 字段，不改表结构；支持回退至 v0.5.25。
+
 ## v0.5.25 权限与锁回收审计
 
 - 锁回收：`run/` 下 `dispatch-*.lock`／`request-*.lock` 的过期阈值由 24 小时改为 1 小时（`STALE_AFTER`，诊断 `locks.stale_after_seconds`）。仍只删除未被持有（非阻塞 flock 探测）、空、单链接、所属请求已完成或已不存在的锁文件，并在删除前复核 inode 与请求状态；任务、进程、配额锁不受影响。稳态由约一天的锁文件降为约两小时。
@@ -138,7 +148,7 @@ target/debug/pylon modules deploy example --directory ../pylon-tasks --host prod
 
 ```sh
 pylon bots add example --owner 123456 --username example_bot
-pylon bots check --online
+pylon bots check --online   # 每个机器人一行，任一失败退出码 1
 pylon routes topic_example example
 pylon bots reload
 pylon bots disable example

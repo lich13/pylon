@@ -510,36 +510,46 @@ async fn lane_once_mode(
                 .as_i64()
                 .unwrap_or(0);
             let query = json!({"offset":offset,"timeout":25,"allowed_updates":["message","callback_query"]});
+            let started = std::time::Instant::now();
             let result = tokio::select! {
                 biased;
                 _ = stop.changed() => return Ok(LaneOutcome::Wait(0.0)),
                 result = tg.call("getUpdates", &query, true) => result,
             };
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             match result {
                 Ok(value) => {
                     let updates = value.as_array().context("invalid updates")?.clone();
                     let empty = updates.is_empty();
+                    let wait = if empty { 1.0 } else { 0.1 };
                     let work = app.clone();
-                    app.store
+                    let bot_id = id.clone();
+                    let recovered = app
+                        .store
                         .blocking(move |s| {
-                            save_updates(&work, &id, &bot, &updates)?;
-                            s.put(
-                                &format!("connection:{id}"),
-                                &json!({"status":"ok","at":crate::now()}),
+                            save_updates(&work, &bot_id, &bot, &updates)?;
+                            crate::connection::record(
+                                &s,
+                                &bot_id,
+                                &crate::connection::Attempt::succeeded(elapsed_ms),
+                                wait,
                             )
                         })
-                        .await?;
-                    Ok(LaneOutcome::Wait(if empty { 1.0 } else { 0.1 }))
+                        .await?
+                        .1;
+                    if recovered {
+                        // Deliveries deferred during the outage resume now.
+                        app.store
+                            .runtime
+                            .delivery_ready(&id, crate::optimization::Lane::Telegram);
+                    }
+                    Ok(LaneOutcome::Wait(wait))
                 }
                 Err(failure) => {
-                    let delay = failure.delay.max(5.0);
-                    app.store
-                        .blocking(move |s| {
-                            s.put(
-                                &format!("connection:{id}"),
-                                &json!({"status":"failed","at":crate::now(),"retry_after":delay}),
-                            )
-                        })
+                    let attempt = crate::connection::Attempt::failed(&failure, elapsed_ms);
+                    let (delay, _) = app
+                        .store
+                        .blocking(move |s| crate::connection::record(&s, &id, &attempt, 0.0))
                         .await?;
                     Ok(LaneOutcome::Wait(delay))
                 }
@@ -575,6 +585,16 @@ async fn lane_once_mode(
                 let key = format!("bot_started:{id}");
                 if app.store.blocking(move |s| s.get(&key)).await? != json!(true) {
                     return Ok(LaneOutcome::Wait(1.0));
+                }
+            }
+            if lane == "telegram" {
+                // While polling shows a recent transient upstream failure, a
+                // send would most likely end uncertain. Keep events pending.
+                let key = format!("connection:{id}");
+                let connection = app.store.blocking(move |s| s.get(&key)).await?;
+                let now = crate::now();
+                if crate::connection::should_defer(&connection, now) {
+                    return Ok(LaneOutcome::Empty(Some(now + 5.0)));
                 }
             }
             let claimed_bot = id.clone();

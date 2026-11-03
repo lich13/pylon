@@ -413,6 +413,14 @@ pub(crate) fn batch(
                         "events",
                         tx.execute("DELETE FROM events WHERE rowid=?", [row])?,
                     );
+                    tx.execute(
+                        "DELETE FROM kv WHERE key=?",
+                        [format!(
+                            "{}{}",
+                            crate::db::RESOLUTION_PREFIX,
+                            event["id"].as_str().unwrap_or("")
+                        )],
+                    )?;
                 }
                 Kind::Requests => {
                     let cutoff = now - f64::from(policy.requests_days) * 86400.0;

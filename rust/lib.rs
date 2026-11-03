@@ -6,6 +6,7 @@ pub mod catalog;
 mod check_process;
 mod completion;
 pub mod config;
+pub mod connection;
 pub mod daemon;
 pub mod db;
 pub mod deployment;

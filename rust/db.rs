@@ -72,6 +72,15 @@ pub(crate) fn align_owner(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) const RESOLUTION_PREFIX: &str = "delivery-resolution:";
+pub const DELIVERY_STATUSES: &[&str] = &[
+    "pending",
+    "sending",
+    "delivered",
+    "uncertain",
+    "failed",
+    "suppressed",
+];
 #[derive(Clone)]
 pub struct Store {
     pub path: PathBuf,
@@ -393,9 +402,101 @@ impl Store {
             Ok(json!({"id":r.get::<_,String>(0)?,"profile":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"attempts":r.get::<_,i64>(3)?,"next_attempt":r.get::<_,f64>(4)?,"updated_at":r.get::<_,f64>(5)?,"receipt":receipt.and_then(|s|serde_json::from_str::<Value>(&s).ok()),"error":r.get::<_,Option<String>>(7)?,"module":r.get::<_,String>(8)?}))
         }).optional()?;
         match event {
-            Some(event) => Ok(Some(event)),
+            Some(mut event) => {
+                // Present only after an operator resolved an uncertain delivery.
+                let resolution: Option<String> = db
+                    .query_row(
+                        "SELECT value FROM kv WHERE key=?",
+                        [format!("{RESOLUTION_PREFIX}{id}")],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(value) = resolution.and_then(|v| serde_json::from_str::<Value>(&v).ok())
+                {
+                    event["resolution"] = value;
+                }
+                Ok(Some(event))
+            }
             None => Ok(self.history(db, id)?.map(|g| g.result())),
         }
+    }
+    /// Delivery metadata for operators. Payloads and receipts are never read.
+    pub fn deliveries(&self, status: &str, limit: usize) -> Result<Vec<Value>> {
+        ensure!(
+            DELIVERY_STATUSES.contains(&status),
+            "invalid delivery status"
+        );
+        let db = self.connect()?;
+        let mut query = db.prepare("SELECT e.id,e.profile,e.module,e.job_id,e.kind,e.status,e.error,e.attempts,e.created_at,e.updated_at,e.receipt IS NOT NULL,CASE WHEN json_valid(e.receipt) AND json_type(e.receipt)='array' THEN json_array_length(e.receipt) WHEN e.receipt IS NOT NULL THEN 1 ELSE 0 END,k.value FROM events e LEFT JOIN kv k ON k.key='delivery-resolution:'||e.id WHERE e.status=? ORDER BY e.updated_at,e.id LIMIT ?")?;
+        let rows = query
+            .query_map(params![status, limit.clamp(1, 1000)], |r| {
+                let resolution: Option<String> = r.get(12)?;
+                Ok(json!({"id":r.get::<_,String>(0)?,"bot":r.get::<_,String>(1)?,"module":r.get::<_,String>(2)?,"job_id":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,"error":r.get::<_,Option<String>>(6)?,"attempts":r.get::<_,i64>(7)?,"created_at":r.get::<_,f64>(8)?,"updated_at":r.get::<_,f64>(9)?,"has_receipt":r.get::<_,bool>(10)?,"receipt_parts":r.get::<_,i64>(11)?,"resolution":resolution.and_then(|v|serde_json::from_str::<Value>(&v).ok())}))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    /// Operator resolution of one uncertain delivery, in one transaction.
+    /// `confirm` marks it delivered, `discard` suppresses it, and `resend`
+    /// returns it to pending once; a resend can duplicate a message.
+    pub fn resolve_delivery(&self, id: &str, action: &str, actor: &str) -> Result<Value> {
+        let (status, error) = match action {
+            "confirm" => ("delivered", "operator confirmed delivered"),
+            "discard" => ("suppressed", "operator discarded"),
+            "resend" => ("pending", "operator resend"),
+            _ => anyhow::bail!("invalid delivery resolution"),
+        };
+        let mut db = self.connect()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(String, Option<String>, String, String)> = tx
+            .query_row(
+                "SELECT status,error,profile,kind FROM events WHERE id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (previous, previous_error, bot, kind) = row.context("unknown event")?;
+        ensure!(
+            previous == "uncertain",
+            "only uncertain deliveries can be resolved"
+        );
+        let key = format!("{RESOLUTION_PREFIX}{id}");
+        let old: Option<String> = tx
+            .query_row("SELECT value FROM kv WHERE key=?", [&key], |r| r.get(0))
+            .optional()?;
+        let old = old
+            .and_then(|v| serde_json::from_str::<Value>(&v).ok())
+            .unwrap_or(Value::Null);
+        let resends = old["resend_count"].as_u64().unwrap_or(0);
+        ensure!(
+            action != "resend" || resends == 0,
+            "delivery was already resent once"
+        );
+        let now = crate::now();
+        let changed = tx.execute(
+            "UPDATE events SET status=?,error=?,next_attempt=?,updated_at=? WHERE id=? AND status='uncertain'",
+            params![status, error, now, now, id],
+        )?;
+        ensure!(changed == 1, "delivery changed concurrently");
+        let resolution = json!({"resolution":action,"resolved_at":now,"resolved_by":actor,
+            "previous_status":previous,"previous_error":previous_error,
+            "resend_count":resends + u64::from(action == "resend")});
+        tx.execute(
+            "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, resolution.to_string()],
+        )?;
+        let mut result = self.event_on(&tx, id)?.context("unknown event")?;
+        tx.commit()?;
+        // Operator output carries metadata only; receipts can name chats.
+        if let Some(object) = result.as_object_mut() {
+            let receipt = object.remove("receipt").unwrap_or(Value::Null);
+            object.insert("has_receipt".into(), json!(!receipt.is_null()));
+        }
+        if action == "resend" {
+            self.runtime
+                .delivery_ready(&bot, crate::optimization::Lane::delivery(kind == "bark"));
+        }
+        Ok(result)
     }
     pub fn cancel(&self, module: &str, id: &str) -> Result<Value> {
         self.cancel_or_insert(module, id, None)
@@ -1006,5 +1107,112 @@ mod owner_tests {
         assert_eq!(should_align((993, 986), (0, 2, true)), None);
         assert_eq!(should_align((993, 986), (0, 1, false)), None);
         assert_eq!(should_align((0, 0), (0, 1, true)), None);
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    fn uncertain(store: &Store, id: &str) {
+        store
+            .submit(
+                "fixture",
+                &json!({"id":id,"kind":"text","payload":{"text":"private body"}}),
+                "fixture",
+            )
+            .unwrap();
+        let event = store.claim("fixture").unwrap().unwrap();
+        assert_eq!(event["id"], id);
+        store
+            .finish(
+                id,
+                "uncertain",
+                Some(&json!([{"message_id":1,"chat_id":4242}])),
+                "Telegram 回执未确认",
+                0.0,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn operator_resolutions_apply_once_to_uncertain_deliveries_only() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::new(&temporary.path().join("state.sqlite3")).unwrap();
+        for id in ["resolve-a", "resolve-b", "resolve-c"] {
+            uncertain(&store, id);
+        }
+        let listed = store.deliveries("uncertain", 50).unwrap();
+        assert_eq!(listed.len(), 3);
+        let text = serde_json::to_string(&listed).unwrap();
+        assert!(!text.contains("private body") && !text.contains("4242"));
+        assert_eq!(listed[0]["has_receipt"], true);
+        assert_eq!(listed[0]["receipt_parts"], 1);
+        assert!(store.deliveries("bogus", 5).is_err());
+
+        let confirmed = store
+            .resolve_delivery("resolve-a", "confirm", "uid:0")
+            .unwrap();
+        assert_eq!(confirmed["status"], "delivered");
+        assert!(confirmed.get("receipt").is_none());
+        assert_eq!(confirmed["resolution"]["resolution"], "confirm");
+        assert_eq!(confirmed["resolution"]["previous_status"], "uncertain");
+        assert!(
+            store
+                .resolve_delivery("resolve-a", "discard", "uid:0")
+                .is_err()
+        );
+        // Modules read the resolution through delivery.get.
+        assert_eq!(
+            store.event("resolve-a").unwrap()["resolution"]["resolved_by"],
+            "uid:0"
+        );
+
+        let discarded = store
+            .resolve_delivery("resolve-b", "discard", "uid:0")
+            .unwrap();
+        assert_eq!(discarded["status"], "suppressed");
+
+        let resent = store
+            .resolve_delivery("resolve-c", "resend", "uid:0")
+            .unwrap();
+        assert_eq!(resent["status"], "pending");
+        assert_eq!(resent["resolution"]["resend_count"], 1);
+        let claimed = store.claim("fixture").unwrap().unwrap();
+        assert_eq!(claimed["id"], "resolve-c");
+        assert_eq!(claimed["receipt"][0]["message_id"], 1);
+        store
+            .finish("resolve-c", "uncertain", None, "Telegram 回执未确认", 0.0)
+            .unwrap();
+        let error = store
+            .resolve_delivery("resolve-c", "resend", "uid:0")
+            .unwrap_err();
+        assert!(error.to_string().contains("already resent"));
+        assert!(
+            store
+                .resolve_delivery("resolve-c", "bogus", "uid:0")
+                .is_err()
+        );
+        assert!(
+            store
+                .resolve_delivery("missing", "confirm", "uid:0")
+                .is_err()
+        );
+        assert!(store.event("plain").is_err());
+        assert_eq!(store.deliveries("uncertain", 50).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn events_without_resolution_keep_their_shape() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::new(&temporary.path().join("state.sqlite3")).unwrap();
+        uncertain(&store, "plain-event");
+        assert!(
+            store
+                .event("plain-event")
+                .unwrap()
+                .get("resolution")
+                .is_none()
+        );
     }
 }

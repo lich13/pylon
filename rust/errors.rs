@@ -262,6 +262,18 @@ pub fn cli_message(error: &Error) -> &'static str {
             "task topic is not configured" => "task topic is not configured",
             "module stop preparation failed" => "module stop preparation failed",
             "module health check rejected" => "module health check rejected",
+            "deliveries requires root" => "deliveries requires root",
+            "gateway state missing" => "gateway state missing",
+            "unknown event" => "unknown event",
+            "invalid delivery status" => "invalid delivery status",
+            "only uncertain deliveries can be resolved" => {
+                "only uncertain deliveries can be resolved"
+            }
+            "delivery was already resent once" => "delivery was already resent once",
+            "delivery changed concurrently" => "delivery changed concurrently",
+            "resend can duplicate a message; pass --accept-duplicate-risk" => {
+                "resend can duplicate a message; pass --accept-duplicate-risk"
+            }
             _ => continue,
         };
         return safe;

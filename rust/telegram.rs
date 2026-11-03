@@ -49,6 +49,23 @@ pub struct Failure {
     pub status: &'static str,
     pub reason: String,
     pub delay: f64,
+    /// Stable connection class (see `crate::connection::CLASSES`); empty when
+    /// the failure did not come from a Telegram request.
+    pub class: &'static str,
+    pub http_status: Option<u16>,
+    pub telegram_error_code: Option<i64>,
+}
+impl Default for Failure {
+    fn default() -> Self {
+        Self {
+            status: "failed",
+            reason: String::new(),
+            delay: 0.0,
+            class: "",
+            http_status: None,
+            telegram_error_code: None,
+        }
+    }
 }
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -123,27 +140,40 @@ impl Telegram {
         result: std::result::Result<reqwest::Response, reqwest::Error>,
         read_only: bool,
     ) -> std::result::Result<Value, Failure> {
-        let pending = |s: String| Failure {
-            status: "pending",
-            reason: s,
-            delay: 30.0,
-        };
-        let uncertain = |s: String| Failure {
-            status: if read_only { "pending" } else { "uncertain" },
-            reason: s,
-            delay: 30.0,
-        };
-        let response = result.map_err(|e| {
-            if e.is_connect() {
-                pending("连接 Telegram 失败".into())
-            } else {
-                uncertain("Telegram 回执未确认".into())
+        let response = result.map_err(|error| {
+            // The request URL carries the bot token. Drop it before anything
+            // can inspect or display this error.
+            let error = error.without_url();
+            let class = crate::connection::transport_class(&error);
+            Failure {
+                status: if error.is_connect() || read_only {
+                    "pending"
+                } else {
+                    "uncertain"
+                },
+                reason: if error.is_connect() {
+                    "连接 Telegram 失败"
+                } else {
+                    "Telegram 回执未确认"
+                }
+                .into(),
+                delay: 30.0,
+                class,
+                ..Default::default()
             }
         })?;
         let status = response.status().as_u16();
+        let invalid = || Failure {
+            status: if read_only { "pending" } else { "uncertain" },
+            reason: format!("Telegram HTTP {status}: invalid response"),
+            delay: 30.0,
+            class: "invalid_response",
+            http_status: Some(status),
+            telegram_error_code: None,
+        };
         let value: Value = response.json().await.map_err(|_| {
             invalid_response(status, read_only);
-            uncertain(format!("Telegram HTTP {status}: invalid response"))
+            invalid()
         })?;
         if value["ok"] == true
             && value.get("result").is_some_and(|v| !v.is_null())
@@ -153,9 +183,7 @@ impl Telegram {
         }
         if value["ok"] != false || value["error_code"].as_u64().is_none() {
             invalid_response(status, read_only);
-            return Err(uncertain(format!(
-                "Telegram HTTP {status}: invalid response"
-            )));
+            return Err(invalid());
         }
         let code = value["error_code"].as_u64().unwrap_or(status as u64);
         // Telegram descriptions can contain request data. Persist only the code.
@@ -177,6 +205,9 @@ impl Telegram {
             } else {
                 30.0
             },
+            class: crate::connection::api_class(code),
+            http_status: Some(status),
+            telegram_error_code: i64::try_from(code).ok(),
         })
     }
     pub async fn call(
@@ -394,6 +425,7 @@ fn valid_receipt(value: &Value, owner: &str) -> Result<()> {
             status: "uncertain",
             reason: "Telegram receipt invalid".into(),
             delay: 0.0,
+            ..Default::default()
         }
         .into());
     }
@@ -419,6 +451,7 @@ fn interrupted() -> anyhow::Error {
         status: "uncertain",
         reason: "delivery interrupted before acknowledgement".into(),
         delay: 0.0,
+        ..Default::default()
     }
     .into()
 }
@@ -487,12 +520,12 @@ pub(crate) async fn deliver_with_stop(
     let result: Result<Value> = async {
         let check_expiry = || -> Result<()> {
             if payload["expires_at"].as_f64().is_some_and(|v| v <= crate::now()) {
-                return Err(Failure { status: "suppressed", reason: "notification expired".into(), delay: 0.0 }.into());
+                return Err(Failure { status: "suppressed", reason: "notification expired".into(), delay: 0.0, ..Default::default() }.into());
             }
             Ok(())
         };
         if *stop.borrow() {
-            return Err(Failure { status: "pending", reason: "stopped before send".into(), delay: 0.0 }.into());
+            return Err(Failure { status: "pending", reason: "stopped before send".into(), delay: 0.0, ..Default::default() }.into());
         }
         check_expiry()?;
         match event["kind"].as_str().unwrap_or("") {
@@ -532,7 +565,7 @@ pub(crate) async fn deliver_with_stop(
             "bark" => write_with_stop(async {
                 match tokio::time::timeout(Duration::from_secs(60), crate::bark::send(payload)).await {
                     Ok(result) => result,
-                    Err(_) => Err(Failure { status:"uncertain", reason:"Bark total deadline exceeded; reconcile before retry".into(), delay:0.0 }.into()),
+                    Err(_) => Err(Failure { status:"uncertain", reason:"Bark total deadline exceeded; reconcile before retry".into(), delay:0.0, ..Default::default() }.into()),
                 }
             }, stop).await,
             _=>anyhow::bail!("unsupported delivery kind")
@@ -657,5 +690,135 @@ mod stability_tests {
         assert_eq!(result["status"], "delivered");
         assert_eq!(result["receipt"][0]["message_id"], 7);
         assert_eq!(result["attempts"], 1);
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TOKEN: &str = "123456:SECRET-fixture-token";
+
+    fn client(base: String, timeout: Duration) -> Telegram {
+        Telegram {
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(timeout)
+                .build()
+                .unwrap(),
+            token: TOKEN.into(),
+            base,
+            config: Config::new(Default::default()),
+        }
+    }
+
+    async fn respond(status: &str, body: &str) -> Failure {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            let _ = connection.read(&mut request).await.unwrap();
+            connection.write_all(response.as_bytes()).await.unwrap();
+        });
+        let failure = client(format!("http://{address}"), Duration::from_secs(4))
+            .call("getUpdates", &json!({}), true)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        failure
+    }
+
+    fn assert_redacted(failure: &Failure) {
+        let text = format!("{failure:?} {failure}");
+        assert!(!text.contains("SECRET"), "{text}");
+        assert!(!text.contains("127.0.0.1"), "{text}");
+        assert!(crate::connection::CLASSES.contains(&failure.class));
+    }
+
+    #[tokio::test]
+    async fn api_errors_are_classified() {
+        let failure = respond(
+            "502 Bad Gateway",
+            r#"{"ok":false,"error_code":502,"description":"Bad Gateway"}"#,
+        )
+        .await;
+        assert_eq!(
+            (
+                failure.class,
+                failure.http_status,
+                failure.telegram_error_code
+            ),
+            ("http_status", Some(502), Some(502))
+        );
+        assert_eq!(failure.status, "pending");
+        assert_eq!(failure.reason, "Telegram API 502");
+        assert_redacted(&failure);
+        let failure = respond("502 Bad Gateway", "<html>bad gateway</html>").await;
+        assert_eq!(
+            (
+                failure.class,
+                failure.http_status,
+                failure.telegram_error_code
+            ),
+            ("invalid_response", Some(502), None)
+        );
+        assert_redacted(&failure);
+        let failure = respond(
+            "401 Unauthorized",
+            r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#,
+        )
+        .await;
+        assert_eq!(failure.class, "unauthorized");
+        assert_eq!(failure.status, "failed");
+        let failure = respond(
+            "409 Conflict",
+            r#"{"ok":false,"error_code":409,"description":"Conflict"}"#,
+        )
+        .await;
+        assert_eq!(failure.class, "conflict");
+        let failure = respond(
+            "429 Too Many Requests",
+            r#"{"ok":false,"error_code":429,"parameters":{"retry_after":7}}"#,
+        )
+        .await;
+        assert_eq!(failure.class, "rate_limited");
+        assert_eq!(failure.delay, 7.0);
+        assert_redacted(&failure);
+    }
+
+    #[tokio::test]
+    async fn transport_errors_are_classified_without_the_token() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let failure = client(format!("http://{address}"), Duration::from_secs(2))
+            .call("getUpdates", &json!({}), true)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.class, "connect");
+        assert_eq!(failure.status, "pending");
+        assert_redacted(&failure);
+
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = silent.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let (connection, _) = silent.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(connection);
+        });
+        let failure = client(format!("http://{address}"), Duration::from_millis(300))
+            .call("sendMessage", &json!({}), false)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.class, "timeout");
+        assert_eq!(failure.status, "uncertain");
+        assert_redacted(&failure);
+        hold.abort();
     }
 }

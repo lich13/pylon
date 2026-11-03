@@ -60,6 +60,11 @@ enum Command {
         topic: String,
         bot: String,
     },
+    /// Inspect or resolve deliveries (root only; never prints message bodies).
+    Deliveries {
+        #[command(subcommand)]
+        action: Deliveries,
+    },
     Modules {
         #[command(subcommand)]
         action: Modules,
@@ -81,6 +86,26 @@ enum Bots {
     Reload,
     Disable {
         id: String,
+    },
+}
+#[derive(Subcommand)]
+enum Deliveries {
+    /// List delivery metadata by status (no payloads or receipts).
+    List {
+        #[arg(long, default_value = "uncertain")]
+        status: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Mark an uncertain delivery as delivered after checking Telegram.
+    Confirm { id: String },
+    /// Mark an uncertain delivery as suppressed; nothing is sent.
+    Discard { id: String },
+    /// Return an uncertain delivery to pending once; may duplicate a message.
+    Resend {
+        id: String,
+        #[arg(long)]
+        accept_duplicate_risk: bool,
     },
 }
 #[derive(Subcommand)]
@@ -341,23 +366,45 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
             Bots::Check { online } => {
                 let settings = config.settings()?;
                 config.validate_credentials(&settings)?;
-                let mut bots = vec![];
+                let mut failed = false;
+                // One line per bot; a failing bot never hides the others.
                 for (id, bot) in settings.bots.iter().filter(|(_, b)| b.enabled) {
-                    let verified = if online {
-                        let value = pylon::telegram::Telegram::new(&config, bot)?
+                    let mut line = json!({"id":id,"enabled":true,"verified":false,"error_class":null,
+                        "http_status":null,"telegram_error_code":null,"elapsed_ms":null});
+                    if online {
+                        let started = std::time::Instant::now();
+                        let result = pylon::telegram::Telegram::new(&config, bot)?
                             .call("getMe", &json!({}), true)
-                            .await?;
-                        ensure!(
-                            bot.username.is_empty() || value["username"] == bot.username,
-                            "bot username does not match configured credential"
-                        );
-                        true
-                    } else {
-                        false
-                    };
-                    bots.push(json!({"id":id,"enabled":true,"verified":verified}));
+                            .await;
+                        line["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+                        match result {
+                            Ok(value)
+                                if bot.username.is_empty() || value["username"] == bot.username =>
+                            {
+                                line["verified"] = json!(true)
+                            }
+                            Ok(_) => {
+                                failed = true;
+                                line["error_class"] = json!("username_mismatch");
+                            }
+                            Err(failure) => {
+                                failed = true;
+                                line["error_class"] = json!(if failure.class.is_empty() {
+                                    "invalid_response"
+                                } else {
+                                    failure.class
+                                });
+                                line["http_status"] = json!(failure.http_status);
+                                line["telegram_error_code"] = json!(failure.telegram_error_code);
+                            }
+                        }
+                    }
+                    println!("{line}");
                 }
-                json!(bots)
+                if failed {
+                    std::process::exit(1)
+                }
+                Value::Null
             }
             Bots::Reload => {
                 let s = config.settings()?;
@@ -372,6 +419,34 @@ async fn run(args: Args, lock: Option<&std::fs::File>) -> Result<()> {
                 json!({"ok":true,"bot":id,"enabled":false})
             }
         },
+        Command::Deliveries { action } => {
+            ensure!(
+                unsafe { libc::geteuid() } == 0 || config.offline,
+                "deliveries requires root"
+            );
+            let path = config.db();
+            ensure!(path.is_file(), "gateway state missing");
+            let store = pylon::db::Store::new(&path)?;
+            let actor = format!("uid:{}", unsafe { libc::geteuid() });
+            match action {
+                Deliveries::List { status, limit } => {
+                    let rows = store.deliveries(&status, limit)?;
+                    json!({"status":status,"count":rows.len(),"deliveries":rows})
+                }
+                Deliveries::Confirm { id } => store.resolve_delivery(&id, "confirm", &actor)?,
+                Deliveries::Discard { id } => store.resolve_delivery(&id, "discard", &actor)?,
+                Deliveries::Resend {
+                    id,
+                    accept_duplicate_risk,
+                } => {
+                    ensure!(
+                        accept_duplicate_risk,
+                        "resend can duplicate a message; pass --accept-duplicate-risk"
+                    );
+                    store.resolve_delivery(&id, "resend", &actor)?
+                }
+            }
+        }
         Command::Routes { topic, bot } => {
             let mut s = config.settings()?;
             ensure!(s.bots.contains_key(&bot), "unknown bot");
