@@ -1,7 +1,7 @@
 use pylon::{config::Config, db::Store, queue};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 fn insert_uncertain_event(db: &Connection, id: &str, job_id: &str) {
     db.execute(
@@ -83,67 +83,63 @@ fn delivery_lanes_claim_independently_and_once() {
 }
 
 #[test]
-fn uncertain_baseline_and_daily_summary_never_replay_history_or_recurse() {
+fn uncertain_deliveries_resend_once_when_healthy_then_resolve_without_operator() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("events.sqlite3");
-    create_legacy_db(&path, &[("historic", "fixture")], Some(json!(["historic"])));
+    create_legacy_db(&path, &[("historic", "fixture")], None);
     let store = Store::new(&path).unwrap();
-    let event = |id| json!({"id":id,"kind":"text","payload":{"text":"fixture"}});
-    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 0);
-    store.uncertain_digest("fixture").unwrap();
-    assert_eq!(summary_count(&store), 0);
-    store
-        .submit("fixture", &event("new-first"), "fixture")
-        .unwrap();
-    store
-        .finish("new-first", "uncertain", None, "fixture", 0.0)
-        .unwrap();
-    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
-    store.uncertain_digest("fixture").unwrap();
-    assert_eq!(summary_count(&store), 1);
-    store
-        .connect()
-        .unwrap()
-        .execute(
-            "UPDATE events SET status='uncertain' WHERE job_id='uncertain-summary'",
-            [],
-        )
-        .unwrap();
-    store
-        .submit("fixture", &event("new-later"), "fixture")
-        .unwrap();
-    store
-        .finish("new-later", "uncertain", None, "fixture", 0.0)
-        .unwrap();
-    store.uncertain_digest("fixture").unwrap();
-    assert_eq!(summary_count(&store), 1);
-    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
-    assert_eq!(store.event("historic").unwrap()["attempts"], 0);
-    assert_eq!(store.event("historic").unwrap()["status"], "uncertain");
-
-    // Simulate a summary event committed before its daily marker. It must prevent
-    // this day's retry from clearing the pending count or creating another event.
-    let blocked_day = "2099-01-02";
-    let blocked_id = pylon::digest(format!("uncertain:summary:{blocked_day}"));
-    let db = store.connect().unwrap();
-    insert_uncertain_event(&db, &blocked_id[..32], "uncertain-summary");
-    drop(db);
+    let healthy = |at: f64| BTreeMap::from([("fixture".to_owned(), at)]);
+    let now = pylon::now();
+    // A bot that has not polled successfully since the uncertainty, or an item
+    // younger than a minute, stays uncertain.
     assert!(
         store
-            .get(&format!("uncertain:summary:{blocked_day}"))
+            .auto_resolve_uncertain(&BTreeMap::new(), now)
             .unwrap()
-            .is_null()
+            .is_empty()
     );
-    store.uncertain_digest_day("fixture", blocked_day).unwrap();
-    assert_eq!(summary_count(&store), 2);
-    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
-    store.uncertain_digest_day("fixture", "2099-01-02").unwrap();
-    assert_eq!(summary_count(&store), 2);
-    store.uncertain_digest_day("fixture", "2099-01-03").unwrap();
-    assert_eq!(summary_count(&store), 3);
+    assert!(
+        store
+            .auto_resolve_uncertain(&healthy(0.5), now)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .auto_resolve_uncertain(&healthy(2.0), 30.0)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.event("historic").unwrap()["status"], "uncertain");
+
+    let changed = store.auto_resolve_uncertain(&healthy(2.0), now).unwrap();
+    assert_eq!(
+        changed,
+        vec![("historic".to_owned(), "fixture".to_owned(), "resend")]
+    );
+    let event = store.event("historic").unwrap();
+    assert_eq!(event["status"], "pending");
+    assert_eq!(event["resolution"]["resolved_by"], "gateway");
+    assert_eq!(event["resolution"]["resend_count"], 1);
     assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 0);
-    store.uncertain_digest_day("fixture", "2099-01-04").unwrap();
-    assert_eq!(summary_count(&store), 3);
+
+    // The automatic resend also ends uncertain: assumed delivered, never resent.
+    store
+        .finish("historic", "uncertain", None, "fixture", 0.0)
+        .unwrap();
+    let changed = store.auto_resolve_uncertain(&BTreeMap::new(), now).unwrap();
+    assert_eq!(changed[0].2, "assume_delivered");
+    let event = store.event("historic").unwrap();
+    assert_eq!(event["status"], "delivered");
+    assert_eq!(event["resolution"]["resolution"], "assume_delivered");
+    assert_eq!(event["resolution"]["resend_count"], 1);
+    assert!(
+        store
+            .auto_resolve_uncertain(&healthy(now), now + 120.0)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(summary_count(&store), 0);
 }
 
 #[test]
@@ -170,7 +166,7 @@ fn fresh_uncertain_store_counts_before_first_digest_and_preserves_existing_count
     let reopened = Store::new(&path).unwrap();
     assert_eq!(reopened.get("uncertain:counter:v2").unwrap()["pending"], 1);
     reopened
-        .uncertain_digest_day("fixture", "2099-02-01")
+        .auto_resolve_uncertain(&BTreeMap::new(), pylon::now())
         .unwrap();
     assert_eq!(reopened.get("uncertain:counter:v2").unwrap()["pending"], 0);
 
@@ -179,7 +175,7 @@ fn fresh_uncertain_store_counts_before_first_digest_and_preserves_existing_count
         reopened_again.get("uncertain:counter:v2").unwrap()["pending"],
         0
     );
-    assert_eq!(summary_count(&reopened_again), 1);
+    assert_eq!(summary_count(&reopened_again), 0);
 }
 
 #[test]
@@ -197,10 +193,10 @@ fn legacy_uncertain_history_without_watermark_seeds_counter_once() {
     let reopened = Store::new(&path).unwrap();
     assert_eq!(reopened.get("uncertain:counter:v2").unwrap()["pending"], 2);
     reopened
-        .uncertain_digest_day("fixture", "2099-02-02")
+        .auto_resolve_uncertain(&BTreeMap::new(), pylon::now())
         .unwrap();
     assert_eq!(reopened.get("uncertain:counter:v2").unwrap()["pending"], 0);
-    assert_eq!(summary_count(&reopened), 1);
+    assert_eq!(summary_count(&reopened), 0);
 }
 
 #[test]
@@ -320,8 +316,6 @@ fn counter_migration_is_atomic_idempotent_and_does_not_count_receipt_retries() {
 
     let store = Store::new(&path).unwrap();
     assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
-    store.uncertain_digest_day("fixture", "2099-01-01").unwrap();
-    assert_eq!(store.get("uncertain:counter:v2").unwrap()["pending"], 1);
     store
         .finish("unreported", "uncertain", None, "fixture", 0.0)
         .unwrap();
@@ -329,7 +323,7 @@ fn counter_migration_is_atomic_idempotent_and_does_not_count_receipt_retries() {
     let reopened = Store::new(&path).unwrap();
     assert_eq!(reopened.get("uncertain:counter:v2").unwrap()["pending"], 1);
     reopened
-        .uncertain_digest_day("fixture", "2099-01-02")
+        .auto_resolve_uncertain(&BTreeMap::new(), pylon::now())
         .unwrap();
     assert_eq!(reopened.get("uncertain:counter:v2").unwrap()["pending"], 0);
     let mut db = reopened.connect().unwrap();
@@ -427,7 +421,9 @@ fn rollback_counter_retirement_keeps_old_gateway_reports_from_being_repeated() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.sqlite3");
     let store = Store::new(&path).unwrap();
-    store.uncertain_digest_day("fixture", "2099-01-01").unwrap();
+    store
+        .auto_resolve_uncertain(&BTreeMap::new(), pylon::now())
+        .unwrap();
     // Freeze/stop precede this rollback transaction. Preserve the v2 aggregate,
     // while the old gateway resumes maintaining its own event watermark.
     store
@@ -457,7 +453,7 @@ fn rollback_counter_retirement_keeps_old_gateway_reports_from_being_repeated() {
     let upgraded = Store::new(&path).unwrap();
     assert_eq!(upgraded.get("uncertain:counter:v2").unwrap()["pending"], 0);
     upgraded
-        .uncertain_digest_day("fixture", "2099-01-03")
+        .auto_resolve_uncertain(&BTreeMap::new(), pylon::now())
         .unwrap();
     assert_eq!(upgraded.get("uncertain:counter:v2").unwrap()["pending"], 0);
     assert_eq!(

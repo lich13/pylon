@@ -2,6 +2,13 @@
 
 Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
+## v0.5.31 待核对投递自动重发一次
+
+- **自动重发一次**：投递结果未确认（`uncertain`，如“Telegram 回执未确认”）后，网关每分钟检查一次：目标机器人在未确认之后已有成功轮询、当前不处于失败延后或计划暂停、且距未确认已满 60 秒时，自动把它退回待发送一次（等同 `pylon deliveries resend --accept-duplicate-risk`，`resolved_by` 记为 `gateway`）。可能产生一条重复消息。
+- **不再循环**：自动或手动重发过一次的投递若再次未确认，直接按已送达处理（`resolution: assume_delivered`，状态 `delivered`），不会再次重发，也不需要人工核对。每次自动处理写一条日志 `{"event":"delivery-auto-resolved","id":…,"bot":…,"resolution":…}`，不含正文或会话 ID。
+- **待核对提醒下线**：不再发送每日“投递结果待核对”汇总；`diagnostics.metrics.new_uncertain` 保留并随自动处理归零。`pylon deliveries confirm|discard|resend` 仍可在自动处理前手动使用。
+- 支持回退至 v0.5.30（数据库结构未变）；回退前 `downgrade-check --target-version 0.5.30` 须通过。
+
 ## v0.5.30 请求锁入库、状态版本与完成缓冲下线
 
 - **请求锁改存 SQLite**：每个请求的 `run/request-<哈希>.lock`／`run/dispatch-<哈希>.lock` 改为任务库 `supervisor/task-state.sqlite3` 中 `locks` 表的一行（`request:<请求>`），持有者记为 `<boot_id>:<pid>:<进程启动时刻>`；持有进程退出即视为释放，不按时间猜测。调度器取锁后把所有权移交给 `resume` 子进程。旧的锁回收器（`lock_reaper`）移除，改为每小时（及解冻后）清理已失效的行和未被持有的空旧锁文件；`diagnostics.locks` 改为 `{held, released, legacy_files_removed, directory_entries, …}`。job、配额、准入、摘要、守护进程、运维、模块租约与部署锁仍是文件锁。`pylon drain-status` 同时检查新表与旧锁文件。

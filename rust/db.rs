@@ -365,42 +365,6 @@ impl Store {
         }
         Ok(())
     }
-    pub fn uncertain_digest(&self, target: &str) -> Result<()> {
-        let day = utc8_day(std::time::SystemTime::now());
-        self.uncertain_digest_day(target, &day)
-    }
-    pub fn uncertain_digest_day(&self, target: &str, day: &str) -> Result<()> {
-        let mut db = self.connect()?;
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        initialize_uncertain(&tx)?;
-        let value: String = tx.query_row(
-            "SELECT value FROM kv WHERE key='uncertain:counter:v2'",
-            [],
-            |r| r.get(0),
-        )?;
-        let mut counter: Value = serde_json::from_str(&value)?;
-        let key = format!("uncertain:summary:{day}");
-        let event_id = crate::digest(&key)[..32].to_owned();
-        let sent: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM kv WHERE key=?) OR EXISTS(SELECT 1 FROM events WHERE id=?)",
-            params![key, event_id], |r| r.get(0),
-        )?;
-        let pending = counter["pending"].as_u64().unwrap_or(0);
-        let inserted = pending > 0 && counter["last_day"] != day && !sent;
-        if inserted {
-            let payload = json!({"text":format!("Pylon 有 {pending} 条新增投递结果待核对。原消息未自动重发，可在状态页查看。"),"expires_at":crate::now()+600.0});
-            tx.execute("INSERT INTO events(id,profile,job_id,kind,payload,status,attempts,next_attempt,created_at,updated_at,module) VALUES(?,?,'uncertain-summary','text',?,'pending',0,0,?,?,'gateway')",params![event_id,target,payload.to_string(),crate::now(),crate::now()])?;
-            counter["pending"] = json!(0);
-            counter["last_day"] = json!(day);
-        }
-        tx.execute("INSERT INTO kv VALUES('uncertain:counter:v2',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [counter.to_string()])?;
-        tx.commit()?;
-        if inserted {
-            self.runtime
-                .delivery_ready(target, crate::optimization::Lane::Telegram);
-        }
-        Ok(())
-    }
     pub fn configuration_rejected(&self, fingerprint: &str, target: Option<&str>) -> Result<()> {
         let mut db = self.connect()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -638,51 +602,9 @@ impl Store {
     /// `confirm` marks it delivered, `discard` suppresses it, and `resend`
     /// returns it to pending once; a resend can duplicate a message.
     pub fn resolve_delivery(&self, id: &str, action: &str, actor: &str) -> Result<Value> {
-        let (status, error) = match action {
-            "confirm" => ("delivered", "operator confirmed delivered"),
-            "discard" => ("suppressed", "operator discarded"),
-            "resend" => ("pending", "operator resend"),
-            _ => anyhow::bail!("invalid delivery resolution"),
-        };
         let mut db = self.connect()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let row: Option<(String, Option<String>, String, String)> = tx
-            .query_row(
-                "SELECT status,error,profile,kind FROM events WHERE id=?",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        let (previous, previous_error, bot, kind) = row.context("unknown event")?;
-        ensure!(
-            previous == "uncertain",
-            "only uncertain deliveries can be resolved"
-        );
-        let key = format!("{RESOLUTION_PREFIX}{id}");
-        let old: Option<String> = tx
-            .query_row("SELECT value FROM kv WHERE key=?", [&key], |r| r.get(0))
-            .optional()?;
-        let old = old
-            .and_then(|v| serde_json::from_str::<Value>(&v).ok())
-            .unwrap_or(Value::Null);
-        let resends = old["resend_count"].as_u64().unwrap_or(0);
-        ensure!(
-            action != "resend" || resends == 0,
-            "delivery was already resent once"
-        );
-        let now = crate::now();
-        let changed = tx.execute(
-            "UPDATE events SET status=?,error=?,next_attempt=?,updated_at=? WHERE id=? AND status='uncertain'",
-            params![status, error, now, now, id],
-        )?;
-        ensure!(changed == 1, "delivery changed concurrently");
-        let resolution = json!({"resolution":action,"resolved_at":now,"resolved_by":actor,
-            "previous_status":previous,"previous_error":previous_error,
-            "resend_count":resends + u64::from(action == "resend")});
-        tx.execute(
-            "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![key, resolution.to_string()],
-        )?;
+        let (bot, kind) = resolve_on(&tx, id, action, actor)?;
         let mut result = self.event_on(&tx, id)?.context("unknown event")?;
         tx.commit()?;
         // Operator output carries metadata only; receipts can name chats.
@@ -695,6 +617,63 @@ impl Store {
                 .delivery_ready(&bot, crate::optimization::Lane::delivery(kind == "bark"));
         }
         Ok(result)
+    }
+    /// Automatic handling of uncertain deliveries, in one transaction. One
+    /// that was never resent returns to pending once its bot has polled
+    /// successfully after the uncertainty (`healthy` maps such bots to their
+    /// last successful poll) and at least a minute has passed. One that was
+    /// already resent is assumed delivered, so nothing loops or waits on an
+    /// operator. Returns `(id, bot, resolution)` for each change.
+    pub fn auto_resolve_uncertain(
+        &self,
+        healthy: &BTreeMap<String, f64>,
+        now: f64,
+    ) -> Result<Vec<(String, String, &'static str)>> {
+        let mut db = self.connect()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rows = {
+            let mut query = tx.prepare("SELECT e.id,e.profile,e.updated_at,COALESCE(json_extract(k.value,'$.resend_count'),0) FROM events e LEFT JOIN kv k ON k.key='delivery-resolution:'||e.id WHERE e.status='uncertain' AND e.job_id<>'uncertain-summary' ORDER BY e.updated_at,e.id")?;
+            query
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, f64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut changed = Vec::new();
+        let mut ready = BTreeSet::new();
+        for (id, bot, updated_at, resends) in rows {
+            let action = if resends > 0 {
+                "assume_delivered"
+            } else if now - updated_at >= 60.0
+                && healthy.get(&bot).is_some_and(|ok| *ok > updated_at)
+            {
+                "resend"
+            } else {
+                continue;
+            };
+            let (bot, kind) = resolve_on(&tx, &id, action, "gateway")?;
+            if action == "resend" {
+                ready.insert((bot.clone(), kind == "bark"));
+            }
+            changed.push((id, bot, action));
+        }
+        // Nothing waits for an operator any more; keep the legacy summary
+        // counter at zero so a rollback does not report resolved items.
+        tx.execute(
+            "UPDATE kv SET value=json_set(value,'$.pending',0) WHERE key='uncertain:counter:v2' AND json_extract(value,'$.pending')<>0",
+            [],
+        )?;
+        tx.commit()?;
+        for (bot, bark) in ready {
+            self.runtime
+                .delivery_ready(&bot, crate::optimization::Lane::delivery(bark));
+        }
+        Ok(changed)
     }
     /// Moves pending deliveries whose bot is no longer live (removed from
     /// configuration, or disabled) to another enabled bot, in one transaction
@@ -1400,13 +1379,6 @@ pub(crate) enum Claim {
     Discarded,
 }
 
-pub(crate) fn utc8_day(time: std::time::SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(time)
-        .with_timezone(&chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid UTC+8 offset"))
-        .format("%Y-%m-%d")
-        .to_string()
-}
-
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
@@ -1597,6 +1569,61 @@ fn internal_state_transaction(tx: &rusqlite::Transaction<'_>) -> Result<()> {
         tx.execute("INSERT INTO kv VALUES('uncertain:triggers','3') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [])?;
     }
     Ok(())
+}
+
+/// Resolves one uncertain delivery inside `tx`; returns its bot and kind.
+fn resolve_on(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    action: &str,
+    actor: &str,
+) -> Result<(String, String)> {
+    let (status, error) = match action {
+        "confirm" => ("delivered", "operator confirmed delivered"),
+        "discard" => ("suppressed", "operator discarded"),
+        "resend" if actor == "gateway" => ("pending", "automatic resend"),
+        "resend" => ("pending", "operator resend"),
+        "assume_delivered" => ("delivered", "assumed delivered after one resend"),
+        _ => anyhow::bail!("invalid delivery resolution"),
+    };
+    let row: Option<(String, Option<String>, String, String)> = tx
+        .query_row(
+            "SELECT status,error,profile,kind FROM events WHERE id=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let (previous, previous_error, bot, kind) = row.context("unknown event")?;
+    ensure!(
+        previous == "uncertain",
+        "only uncertain deliveries can be resolved"
+    );
+    let key = format!("{RESOLUTION_PREFIX}{id}");
+    let old: Option<String> = tx
+        .query_row("SELECT value FROM kv WHERE key=?", [&key], |r| r.get(0))
+        .optional()?;
+    let old = old
+        .and_then(|v| serde_json::from_str::<Value>(&v).ok())
+        .unwrap_or(Value::Null);
+    let resends = old["resend_count"].as_u64().unwrap_or(0);
+    ensure!(
+        action != "resend" || resends == 0,
+        "delivery was already resent once"
+    );
+    let now = crate::now();
+    let changed = tx.execute(
+        "UPDATE events SET status=?,error=?,next_attempt=?,updated_at=? WHERE id=? AND status='uncertain'",
+        params![status, error, now, now, id],
+    )?;
+    ensure!(changed == 1, "delivery changed concurrently");
+    let resolution = json!({"resolution":action,"resolved_at":now,"resolved_by":actor,
+        "previous_status":previous,"previous_error":previous_error,
+        "resend_count":resends + u64::from(action == "resend")});
+    tx.execute(
+        "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, resolution.to_string()],
+    )?;
+    Ok((bot, kind))
 }
 
 const UNCERTAIN_SEED: &str = "INSERT INTO kv(key,value)

@@ -7,24 +7,6 @@ fn store() -> (tempfile::TempDir, Store) {
     (temp, store)
 }
 
-#[test]
-fn date_keys_cover_utc8_midnight_month_year_and_leap_day() {
-    for (utc, expected) in [
-        ("2026-10-21T15:59:59Z", "2026-10-21"),
-        ("2026-10-21T16:00:00Z", "2026-10-22"),
-        ("2026-01-31T16:00:00Z", "2026-02-01"),
-        ("2025-12-31T16:00:00Z", "2026-01-01"),
-        ("2024-02-28T16:00:00Z", "2024-02-29"),
-        ("2024-02-29T15:59:59Z", "2024-02-29"),
-        ("2024-02-29T16:00:00Z", "2024-03-01"),
-        ("2000-02-28T16:00:00Z", "2000-02-29"),
-        ("2100-02-28T16:00:00Z", "2100-03-01"),
-    ] {
-        let time = chrono::DateTime::parse_from_rfc3339(utc).unwrap();
-        assert_eq!(crate::db::utc8_day(time.into()), expected);
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn notification_generation_survives_the_gap_before_wait_and_is_scoped() {
     let runtime = Runtime::default();
@@ -114,10 +96,15 @@ fn all_committed_event_sources_wake_their_delivery_lane() {
         .finish("event", "uncertain", None, "fixture", 0.0)
         .unwrap();
     assert!(!telegram.has_changed().unwrap());
-    store.uncertain_digest_day("fixture", "2026-10-21").unwrap();
+    let healthy = std::collections::BTreeMap::from([("fixture".to_owned(), crate::now() + 61.0)]);
+    store
+        .auto_resolve_uncertain(&healthy, crate::now() + 61.0)
+        .unwrap();
     assert!(telegram.has_changed().unwrap());
     telegram.borrow_and_update();
-    store.uncertain_digest_day("fixture", "2026-10-21").unwrap();
+    store
+        .auto_resolve_uncertain(&healthy, crate::now() + 61.0)
+        .unwrap();
     assert!(!telegram.has_changed().unwrap());
 }
 

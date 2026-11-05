@@ -31,7 +31,7 @@ fn readable_state(target: &str) -> Option<i64> {
         return None;
     }
     let patch: u32 = minor.parse().ok()?;
-    ((11..=29).contains(&patch) && patch != 18).then_some(1)
+    ((11..=30).contains(&patch) && patch != 18).then_some(1)
 }
 
 pub fn check(config: &Config, target: &str) -> Report {

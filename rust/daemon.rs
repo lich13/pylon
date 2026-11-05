@@ -834,6 +834,33 @@ fn log_deferral_exhausted(bot: &str, connection: &Value) {
     }
 }
 
+/// Uncertain deliveries resend once after their bot is healthy again (its
+/// latest poll succeeded and no planned pause) and a second uncertain
+/// outcome is assumed delivered. Each change is logged without content.
+fn auto_resolve_uncertain(
+    store: &crate::db::Store,
+    settings: &crate::config::Settings,
+) -> Result<()> {
+    let now = crate::now();
+    let mut healthy = BTreeMap::new();
+    for (id, _) in settings.bots.iter().filter(|(_, b)| b.enabled) {
+        let connection = store.get(&format!("connection:{id}"))?;
+        if connection["status"] == "ok"
+            && settings.delivery.paused_until(id, now).is_none()
+            && let Some(ok_at) = connection["last_ok_at"].as_f64()
+        {
+            healthy.insert(id.clone(), ok_at);
+        }
+    }
+    for (id, bot, resolution) in store.auto_resolve_uncertain(&healthy, now)? {
+        eprintln!(
+            "{}",
+            json!({"event":"delivery-auto-resolved","id":id,"bot":bot,"resolution":resolution})
+        );
+    }
+    Ok(())
+}
+
 pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
     // v0.5.30 writes completions directly. Records from an older mailbox
     // must be finished by that release; refuse instead of dropping them.
@@ -843,17 +870,6 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
         "{legacy} completion records from an older gateway are pending; start the previous release to reconcile them"
     );
     app.store.blocking(|s| s.recover()).await?;
-    let personal = app
-        .snapshot
-        .read()
-        .await
-        .settings
-        .effective_route(&app.store, "personal");
-    if let Some(target) = personal {
-        app.store
-            .blocking(move |s| s.uncertain_digest(&target))
-            .await?;
-    }
     let mut rpc = Child(tokio::spawn(crate::api::serve_socket(app.clone())));
     type BotWorker = (String, watch::Sender<bool>, Child<Result<()>>);
     let mut workers: BTreeMap<String, BotWorker> = BTreeMap::new();
@@ -876,7 +892,7 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
         .to_owned();
     let mut logged_rejected = String::new();
     let mut retrying: BTreeMap<String, (u32, f64)> = BTreeMap::new();
-    let mut next_digest = crate::now() + 60.0;
+    let mut next_uncertain = crate::now() + 60.0;
     let supervise = async {
         loop {
             // A malformed replacement keeps the entire last valid configuration active.
@@ -995,16 +1011,15 @@ pub async fn run(app: App, _lock: &std::fs::File) -> Result<()> {
                     (hash, tx, task)
                 });
             }
-            if crate::now() >= next_digest
-                && let Some(target) = snapshot.settings.effective_route(&app.store, "personal")
-            {
-                next_digest = crate::now() + 60.0;
+            if crate::now() >= next_uncertain {
+                next_uncertain = crate::now() + 60.0;
+                let settings = snapshot.settings.clone();
                 if let Err(error) = app
                     .store
-                    .blocking(move |s| s.uncertain_digest(&target))
+                    .blocking(move |s| auto_resolve_uncertain(&s, &settings))
                     .await
                 {
-                    crate::errors::log("uncertain-summary", &error)
+                    crate::errors::log("uncertain-auto-resolve", &error)
                 }
             }
             if let Some(age) = freeze_age_seconds(&app.config) {

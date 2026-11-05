@@ -43,7 +43,7 @@ fn current_state_is_readable_by_every_supported_target_without_writes() {
         let (_temporary, config, database_path) = home_with_state(version, false);
         let before = state_snapshot(&database_path);
         for target in [
-            "0.5.11", "0.5.12", "0.5.17", "0.5.19", "0.5.25", "0.5.28", "0.5.29",
+            "0.5.11", "0.5.12", "0.5.17", "0.5.19", "0.5.25", "0.5.28", "0.5.29", "0.5.30",
         ] {
             let report = downgrade::check(&config, target);
             assert!(report.ok, "{target}: {report:?}");
@@ -78,7 +78,7 @@ fn one_legacy_buffered_file_blocks_downgrade() {
 fn withdrawn_old_and_malformed_targets_are_unsupported() {
     let (_temporary, config, _database_path) = home_with_state(1, false);
     for target in [
-        "0.5.3", "0.5.10", "0.5.18", "0.5.30", "0.5.011", "v0.5.29", "0.5.29.0", "0.6.0", "",
+        "0.5.3", "0.5.10", "0.5.18", "0.5.31", "0.5.011", "v0.5.29", "0.5.29.0", "0.6.0", "",
     ] {
         let report = downgrade::check(&config, target);
         assert!(!report.ok, "{target}");
