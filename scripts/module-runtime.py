@@ -288,7 +288,7 @@ def main(argv=None):
     for name in ('key', 'build', 'verify'):
         command = sub.add_parser(name)
         command.add_argument('--source', type=Path, required=True, help='pylon-tasks directory')
-        command.add_argument('--python', required=True)
+        command.add_argument('--python', default=platform.python_version(), help='Python version; defaults to the current interpreter')
         command.add_argument('--cache', type=Path, default=default_cache())
     args = parser.parse_args(argv)
     if args.action == 'key':

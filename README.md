@@ -131,13 +131,13 @@ API v2 和业务记录保持兼容，仅新增通知查询索引；SDK 调用与
 
 ## 运行环境
 
-专用运行时优先使用常规 GIL Python 3.14.10；仅当其本机检查失败而相同依赖的 Python 3.12.16 全部通过时使用后者。系统 Python 保持发行版管理。Node 22.23.4、Playwright 1.64.1、certifi 2026.10.23、pip 26.2.2，保留必要依赖并排除 uvicorn、starlette。
+本机开发使用当前稳定版 Python、Node 和 Rust，依赖沿用锁文件。离线模块运行时继续记录实际 Python 版本与依赖校验信息，供缓存和部署校验使用；本仓库不再指定旧版解释器作为默认或回退版本。
 
 离线运行时在本机构建：`scripts/module-runtime.py` 在固定校验的 Ubuntu 24.04 基础镜像中（与服务器相同的 glibc，经 `sudo chroot`）调用外置目录的 `deployment/build_runtime.py`，从校验后的官方源码编译 Python，产出 `pylon-runtime.tar.gz` 和 `runtime.json`。缓存键只覆盖 Python 版本、`requirements.lock`、`deployment/bootstrap.lock`、构建脚本及 SDK／特权包的依赖声明；键不变时直接复用，复用前核对哈希、元数据和归档安全性。业务源码不进入构建根，也不上传任何位置。服务器仅离线安装，不编译 Python 或依赖。
 
 ```sh
-scripts/module-runtime.py build --source ../pylon-tasks --python 3.14.10   # 键未变时输出 "reused": true
-scripts/module-runtime.py key --source ../pylon-tasks --python 3.14.10
+scripts/module-runtime.py build --source ../pylon-tasks   # 键未变时输出 "reused": true
+scripts/module-runtime.py key --source ../pylon-tasks
 ```
 
 缓存位于 `$PYLON_RUNTIME_CACHE`，默认 `~/.cache/pylon/runtime/<键>/`，含 `pylon-runtime.tar.gz`、`runtime.json`（`source_sha256` 即缓存键，`gateway_revision` 为构建时的网关提交）和 `build.json`。只支持 Linux x86_64，需要免密 sudo 和访问 python.org、Ubuntu 软件源、PyPI、nodesource 及 Playwright 下载源。
