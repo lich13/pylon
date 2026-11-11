@@ -3,8 +3,7 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
-      day: monday
+      interval: monthly
       time: '09:00'
       timezone: Asia/Taipei
     cooldown:
@@ -24,8 +23,7 @@ updates:
   - package-ecosystem: pip
     directory: /tests/rust_contract
     schedule:
-      interval: weekly
-      day: monday
+      interval: monthly
       time: '09:00'
       timezone: Asia/Taipei
     cooldown:
@@ -44,8 +42,7 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
-      day: monday
+      interval: monthly
       time: '09:00'
       timezone: Asia/Taipei
     cooldown:
@@ -54,6 +51,8 @@ updates:
     allow:
       - dependency-type: all
         update-types: ['version-update:semver-minor', 'version-update:semver-patch']
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
     groups:
       actions-compatible:
         applies-to: version-updates
@@ -61,12 +60,3 @@ updates:
       actions-security:
         applies-to: security-updates
         patterns: ['*']
-  - package-ecosystem: rust-toolchain
-    directory: /
-    schedule:
-      interval: monthly
-      time: '09:00'
-      timezone: Asia/Taipei
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 1

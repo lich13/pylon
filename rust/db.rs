@@ -1254,7 +1254,7 @@ fn connect(path: &Path, pool: &Arc<Mutex<Vec<Connection>>>) -> Result<PooledConn
     let db = if let Some(db) = cached {
         db
     } else {
-        let db = Connection::open(path)?;
+        let mut db = Connection::open(path)?;
         db.busy_handler(Some(wait_for_writer))?;
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
         db
@@ -1307,7 +1307,7 @@ pub(crate) fn checkpoint_database(home: &Path, path: &Path, threshold: u64, forc
         );
     }
     let outcome = (|| -> Result<&'static str> {
-        let db = Connection::open(path)?;
+        let mut db = Connection::open(path)?;
         // Abandon immediately on contention; never inherit the pool's 5s writer wait.
         db.busy_handler(Some(|_| false))?;
         db.execute_batch("PRAGMA query_only=OFF;")?;
