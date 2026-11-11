@@ -2,6 +2,12 @@
 
 Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
+## v0.5.32 依赖与 SQLite 安全更新
+
+- **SQLite**：`rusqlite` 升至 0.41（内置 SQLite 3.54，修复 RUSTSEC-2026-0459）；数据库结构和 `user_version` 不变，旧数据库原样打开。
+- **依赖**：锁文件内的兼容更新一并更新。
+- 支持回退至 v0.5.31（数据库结构未变）；回退前 `downgrade-check --target-version 0.5.31` 须通过。
+
 ## v0.5.31 待核对投递自动重发一次
 
 - **自动重发一次**：投递结果未确认（`uncertain`，如“Telegram 回执未确认”）后，网关每分钟检查一次：目标机器人在未确认之后已有成功轮询、当前不处于失败延后或计划暂停、且距未确认已满 60 秒时，自动把它退回待发送一次（等同 `pylon deliveries resend --accept-duplicate-risk`，`resolved_by` 记为 `gateway`）。可能产生一条重复消息。

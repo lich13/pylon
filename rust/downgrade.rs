@@ -23,7 +23,7 @@ pub struct Report {
 
 /// Highest gateway state version (`PRAGMA user_version`) a rollback target can
 /// run on. Every supported release ignores `user_version` and `runs.result`,
-/// and names the `runs` columns it reads, so v0.5.30 state (1) stays readable.
+/// and names the `runs` columns it reads, so v0.5.31 state (1) stays readable.
 /// v0.5.18 was withdrawn; v0.5.10 and older lack retained-history support.
 fn readable_state(target: &str) -> Option<i64> {
     let minor = target.strip_prefix("0.5.")?;
@@ -31,7 +31,7 @@ fn readable_state(target: &str) -> Option<i64> {
         return None;
     }
     let patch: u32 = minor.parse().ok()?;
-    ((11..=30).contains(&patch) && patch != 18).then_some(1)
+    ((11..=31).contains(&patch) && patch != 18).then_some(1)
 }
 
 pub fn check(config: &Config, target: &str) -> Report {

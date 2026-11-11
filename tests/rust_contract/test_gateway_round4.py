@@ -283,7 +283,7 @@ def _assert_read_only_check(
 
 
 @pytest.mark.parametrize("completion_files", [None, []], ids=["missing-buffer", "empty-buffer"])
-@pytest.mark.parametrize("target", ["0.5.11", "0.5.14", "0.5.16", "0.5.17", "0.5.25", "0.5.28", "0.5.29", "0.5.30"])
+@pytest.mark.parametrize("target", ["0.5.11", "0.5.14", "0.5.16", "0.5.17", "0.5.25", "0.5.28", "0.5.29", "0.5.30", "0.5.31"])
 def test_missing_and_empty_buffer_are_safe_for_current_targets(
     round4_root, completion_files, target
 ):
@@ -365,7 +365,7 @@ def test_buffer_count_includes_json_temporary_and_corrupt_files(round4_root):
 
 @pytest.mark.parametrize(
     "target",
-    ["0.5.2", "0.5.6", "0.5.10", "0.5.18", "0.5.31", "v0.5.29", "0.5.29.0"],
+    ["0.5.2", "0.5.6", "0.5.10", "0.5.18", "0.5.32", "v0.5.29", "0.5.29.0"],
     ids=["older", "retired", "pre-lock-reclaim", "withdrawn", "newer", "prefix", "extra-component"],
 )
 def test_unknown_target_returns_fixed_json_without_creating_home(round4_root, target):
