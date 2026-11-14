@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Upgrade a CI-built gateway. A failed cutover restores the previous binary,
 # retains live databases and leaves admission frozen. Never retry a cutover here.
-# After a healthy cutover, gateway-prune.py (next to this script) keeps only the
-# new and previous gateway releases and 14 days of gateway-* backups.
+# After a healthy cutover and thaw, leftover pylon-module@ supervisors still
+# holding a previous gateway binary are restarted. gateway-prune.py (next to
+# this script) keeps the new and previous gateway releases, any release a
+# live process still holds, and 14 days of gateway-* backups.
 set -euo pipefail
 umask 077
 
@@ -58,6 +60,7 @@ HEALTH=unverified
 STOP_ATTEMPTED=0
 ROLLBACK=not_needed
 PRUNE='{"status":"not_run"}'
+MIGRATION='{"status":"not_run"}'
 SERVICES=(pylon-gateway.service pylon-executor.service pylon-broker.service)
 
 # Bound every probe by the remaining deadline, including a hung diagnose RPC.
@@ -151,19 +154,23 @@ cleanup() {
     fi
   fi
   [[ -e "$HOME_DIR/run/freeze" ]] && frozen=true
-  python3 - "$SUCCESS" "$VERSION" "$REVISION" "$ROLLBACK" "$frozen" "$code" "$HEALTH" "$OLD_VERSION" "$OLD_REVISION" "$PRUNE" <<'PY'
+  python3 - "$SUCCESS" "$VERSION" "$REVISION" "$ROLLBACK" "$frozen" "$code" "$HEALTH" "$OLD_VERSION" "$OLD_REVISION" "$PRUNE" "$MIGRATION" <<'PY'
 import json, sys
-success, version, revision, rollback, frozen, code, health, old_version, old_revision, prune = sys.argv[1:]
+success, version, revision, rollback, frozen, code, health, old_version, old_revision, prune, migration = sys.argv[1:]
 try:
     prune = json.loads(prune)
 except ValueError:
     prune = {"status": "failed"}
+try:
+    migration = json.loads(migration)
+except ValueError:
+    migration = {"status": "failed"}
 active_version = version if success == "1" else old_version if rollback == "restored" else None
 active_revision = revision if success == "1" else old_revision if rollback == "restored" else None
 print(json.dumps({"phase": "complete" if success == "1" else "failed", "version": version,
                   "revision": revision, "active_version": active_version, "active_revision": active_revision,
                   "health": health, "rollback": rollback, "freeze": frozen == "true", "exit": int(code),
-                  "prune": prune}))
+                  "migration": migration, "prune": prune}))
 PY
   rm -f "$WORK_DIR/diagnose.json" "$WORK_DIR/command.log"
   rmdir "$WORK_DIR"
@@ -210,12 +217,36 @@ if [[ $KEEP_FROZEN -eq 0 ]]; then
 fi
 SUCCESS=1
 
+# Re-exec leftover long-lived module supervisors still holding a previous
+# gateway binary. Oneshot task units are left running; their releases are
+# retained below. A frozen coordinated cutover defers the restart.
 # Retention for gateway-owned releases and backups. Never fails a healthy deploy.
 if [[ -f "$PRUNE_SCRIPT" ]]; then
-  PRUNE=$(limited 300 python3 "$PRUNE_SCRIPT" --home "$HOME_DIR" \
-    --keep "$TARGET_DIR/dist/pylon-linux-x86_64" --keep "$PREVIOUS_BIN" 2>"$WORK_DIR/command.log") ||
+  migrate_args=(--migrate --home "$HOME_DIR" --target-binary "$TARGET_DIR/dist/pylon-linux-x86_64"
+    --previous-binary "$PREVIOUS_BIN" --proc-dir "${PYLON_DEPLOY_PROC:-/proc}")
+  if [[ $KEEP_FROZEN -eq 0 ]]; then
+    migrate_args+=(--restart)
+  fi
+  MIGRATION=$(limited 120 python3 "$PRUNE_SCRIPT" "${migrate_args[@]}" 2>"$WORK_DIR/command.log") ||
+    MIGRATION=${MIGRATION:-'{"status":"failed"}'}
+  [[ -n "$MIGRATION" ]] || MIGRATION='{"status":"failed"}'
+  keep_args=(--keep "$TARGET_DIR/dist/pylon-linux-x86_64" --keep "$PREVIOUS_BIN")
+  while IFS= read -r held; do
+    [[ -n "$held" ]] && keep_args+=(--keep "$held")
+  done < <(python3 -c 'import json,sys
+try:
+    data=json.loads(sys.argv[1])
+except ValueError:
+    data={}
+for path in data.get("keep") or []:
+    if isinstance(path,str) and path:
+        print(path)
+' "$MIGRATION")
+  PRUNE=$(limited 300 python3 "$PRUNE_SCRIPT" --home "$HOME_DIR" --proc-dir "${PYLON_DEPLOY_PROC:-/proc}" \
+    "${keep_args[@]}" 2>"$WORK_DIR/command.log") ||
     PRUNE=${PRUNE:-'{"status":"failed"}'}
   [[ -n "$PRUNE" ]] || PRUNE='{"status":"failed"}'
 else
+  MIGRATION='{"status":"script_missing"}'
   PRUNE='{"status":"script_missing"}'
 fi

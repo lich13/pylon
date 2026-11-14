@@ -2,6 +2,12 @@
 
 Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人鉴权、可靠投递、任务调度、进程管理和受限管理接口。业务代码、文案、规则、模型调用与特权 helper 在独立的普通目录维护，不属于这个仓库。
 
+## v0.5.33 升级后迁走仍占用旧二进制的模块服务
+
+- **模块服务**：`deploy-gateway.sh` 在核心服务健康并解冻后，扫描仍占用旧网关发布目录的进程，只重启对应的 `pylon-module@*.service`；不重启 `pylon-task@` / `pylon-manual@` 一次性任务。重启失败或仍被占用的目录予以保留，不推翻已成功的核心切换。部署结果 JSON 的 `migration` 列出已重启单元和仍占用的目录。
+- **清理保护**：`gateway-prune.py` 除符号链接和 systemd 引用外，还保留进程 exe（及 cwd）仍指向的网关发布目录。
+- 支持回退至 v0.5.32（数据库结构未变）；回退前 `downgrade-check --target-version 0.5.32` 须通过。
+
 ## v0.5.32 依赖与 SQLite 安全更新
 
 - **SQLite**：`rusqlite` 升至 0.41（内置 SQLite 3.54，修复 RUSTSEC-2026-0459）；数据库结构和 `user_version` 不变，旧数据库原样打开。
@@ -93,7 +99,7 @@ Rust 实现的个人 Telegram 网关。核心提供多机器人连接、本人�
 
 ## v0.5.23 网关清理
 
-- 发布目录：`scripts/deploy-gateway.sh` 在新版本健康检查通过后调用同目录的 `scripts/gateway-prune.py`，`releases/` 下只保留当前版本与上一版本（`--previous-version` 回滚目标）的网关目录（`v<版本>-<提交>`、`stability-*`、`hardening-*`）。`external-*`、`privileged-*` 等非网关目录、符号链接，以及 `/srv/pylon` 顶层或 `bin/` 链接、systemd 单元仍引用的目录一律保留；无法确认上一版本所在目录时跳过发布目录清理。部署结果 JSON 的 `prune` 字段列出删除项，清理失败不影响已成功的部署。部署时须把该脚本与 `deploy-gateway.sh` 一并复制到发布目录；`--dry-run` 只列出将删除的内容。
+- 发布目录：`scripts/deploy-gateway.sh` 在新版本健康检查通过后调用同目录的 `scripts/gateway-prune.py`，`releases/` 下只保留当前版本与上一版本（`--previous-version` 回滚目标）的网关目录（`v<版本>-<提交>`、`stability-*`、`hardening-*`）。`external-*`、`privileged-*` 等非网关目录、符号链接，以及 `/srv/pylon` 顶层或 `bin/` 链接、systemd 单元或仍在运行的进程 exe／cwd 仍引用的目录一律保留；无法确认上一版本所在目录时跳过发布目录清理。健康切换并解冻后，仍占用旧网关二进制的 `pylon-module@` 服务会被重启，一次性 `pylon-task@`／`pylon-manual@` 任务不会被结束。部署结果 JSON 的 `migration` 与 `prune` 字段分别列出迁移和删除项，清理或迁移失败不影响已成功的核心切换。部署时须把该脚本与 `deploy-gateway.sh` 一并复制到发布目录；`--dry-run` 只列出将删除的内容。
 - 备份：同一步骤清理 `backups/gateway-*`，按目录名时间戳（无则按修改时间）保留 14 天，且至少保留最新一份；其他备份子目录不动。
 - 数据库：`requests_days` 默认改为 30 天（`runs_days` 已为 30 天）；行保留清理改为启动 10 分钟后首轮、此后每天一轮，每轮按 500 行事务分批完成整表扫描，结束后强制 WAL checkpoint。仅删除终态记录（runs 含历史 `no_change`），运行中、未完成或不确定的 run／request 保留，不导出。锁回收仍每小时一轮。
 
